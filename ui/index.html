@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenAI Basis Points</title>
+    <link rel="stylesheet" href="./assets/app.css" />
+  </head>
+  <body>
+    <main class="card">
+      <header class="head">
+        <h1>OpenAI Basis Points</h1>
+        <span id="state-chip" class="chip chip-idle">连接中…</span>
+      </header>
+
+      <!-- 账号路由配置。 -->
+      <form id="config-form" autocomplete="off">
+        <fieldset id="account-fields" class="field group" disabled>
+          <span class="name">走 Basis Points 的账号</span>
+          <div class="actions account-actions">
+            <button id="select-all-button" type="button" class="ghost" disabled>全选列表账号</button>
+          </div>
+          <div id="account-list" class="check-list"></div>
+          <span id="account-hint" class="hint">默认留空 = 不做限制；勾选后只有选中的账号走 Basis Points，其他账号不受影响。</span>
+        </fieldset>
+
+        <p class="hint">支持直接发送图片和截图，无需额外配置。交流群：1107265919。</p>
+
+        <div class="actions">
+          <button id="save-button" type="button" class="primary" disabled>保存</button>
+          <button id="retry-button" type="button" hidden>重新读取</button>
+        </div>
+        <p id="form-hint" class="hint" role="status"></p>
+      </form>
+
+      <footer id="version-line" class="foot">—</footer>
+    </main>
+
+    <script src="./assets/bridge-v1.js"></script>
+    <script src="./assets/app.js"></script>
+  </body>
+</html>

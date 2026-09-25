@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "local.oai-basispoints",
+  "name": "OpenAI Basis Points 传输",
+  "version": "0.5.17",
+  "description": "只把命中 OpenAI OAuth 插件灰度且符合账号白名单的 gpt-6-astra 请求转发到 bps.openai.com/basispoints/api/responses，上游模型固定为 gpt-6-astra；其他模型原样透传到宿主上游。转发前将 Codex 客户端工具目录转换为 Basis Points 原生 run_officejs 传输层，并还原响应、重放 SSE、映射错误。始终使用宿主当前调度账号的凭据与代理，账号调度、Token 生命周期、用量与计费仍由 Sub2API 负责。交流群：1107265919。",
+  "author": "wangyunjeff",
+  "requires": {
+    "sub2api": ">=0.2.8 <0.3.0",
+    "recommended_sub2api_version": "0.2.8",
+    "tested_sub2api_versions": ["0.2.8"],
+    "plugin_protocol": 1,
+    "transport_api": 1,
+    "ui_bridge": 1
+  },
+  "capabilities": [
+    {
+      "id": "openai.oauth.outbound_transport.v1",
+      "platform": "openai",
+      "account_type": "oauth"
+    }
+  ],
+  "runtimes": {},
+  "ui": {
+    "entrypoint": "ui/index.html"
+  },
+  "files": {}
+}

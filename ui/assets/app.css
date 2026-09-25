@@ -1,0 +1,257 @@
+/* 配置页样式：无外部资源，兼容明暗主题与窄屏。 */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --surface: #f7f8fa;
+  --border: #e2e5ea;
+  --text: #1c1f23;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  --ok-bg: #e7f6ec;
+  --ok-text: #17663a;
+  --warn-bg: #fdf1dc;
+  --warn-text: #8a5a10;
+  --err-text: #9b2226;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --surface: #1f222a;
+    --border: #2d313b;
+    --text: #e8eaee;
+    --muted: #9aa1ad;
+    --accent: #4f83ff;
+    --accent-text: #0b1020;
+    --ok-bg: #16311f;
+    --ok-text: #7ddca0;
+    --warn-bg: #33280f;
+    --warn-text: #e2b355;
+    --err-text: #f08a8d;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.card {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 18px 20px 20px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chip-idle {
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.chip-ok {
+  border-color: transparent;
+  background: var(--ok-bg);
+  color: var(--ok-text);
+}
+
+.chip-warn {
+  border-color: transparent;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.status {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.label {
+  flex: 0 0 72px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.row > span:last-child {
+  word-break: break-all;
+}
+
+.field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.name {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+input,
+select {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+input:focus,
+select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.group {
+  display: block;
+  min-width: 0;
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.check-list {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.check {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.check input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+.check.disabled {
+  opacity: 0.55;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0 16px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.account-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+button {
+  padding: 7px 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+button.ghost {
+  background: transparent;
+}
+
+.hint {
+  min-height: 20px;
+}
+
+.hint-ok {
+  color: var(--ok-text);
+}
+
+.hint-error {
+  color: var(--err-text);
+}
+
+.foot {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+}

@@ -1,0 +1,53 @@
+# 本地构建、发布包与测试输出
+/build/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.s2plugin
+*.s2plugin.sha256
+*.test
+coverage*.out
+coverage*.html
+*.log
+*.tmp
+*.temp
+*.bak
+__pycache__/
+*.py[cod]
+node_modules/
+
+# 发布密钥、账号导出及本地环境配置
+*.private
+*.public
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+!.env.sample
+sub2api-account-*.json
+accounts*.json
+credentials*.json
+secrets*.json
+auth.json
+*.local.json
+
+# 编辑器、助手及系统生成的本机文件
+.claude/
+.workbuddy/
+.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+
+# 已由正式沙箱浏览器测试替代的临时预览
+/tools/ui-harness.html
+/tools/ui-harness.png

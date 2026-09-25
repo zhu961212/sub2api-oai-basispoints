@@ -1,0 +1,42 @@
+name: Project checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Go regression tests
+        run: go test ./... -skip TestLive -count=1 -timeout 120s
+      - name: Static analysis
+        run: go vet ./...
+      - name: Cache and transport concurrency
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race ./internal/attachments ./internal/protocol ./internal/transport -skip TestLive -count=1 -timeout 180s
+      - name: UI syntax and behavior
+        run: |
+          node --check ui/assets/app.js
+          node --check ui/assets/bridge-v1.js
+          node --test tools/ui.test.cjs
+      - name: Check source export boundaries
+        run: python3 -m unittest discover -s tools -p 'test_export_source.py'
+      - name: Cross-build plugin
+        run: go run ./tools/packager -targets windows/amd64,linux/amd64
+      - name: Validate unsigned CI artifact
+        run: python3 tools/verify_package.py dist/local.oai-basispoints-$(python3 -c 'import json;print(json.load(open("manifest.source.json"))["version"])').s2plugin

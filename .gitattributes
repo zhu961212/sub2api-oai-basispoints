@@ -1,0 +1,12 @@
+# 契约副本 third_party/sub2api/pkg/pluginapi/v1/ 必须与宿主源码保持同内容。
+# 宿主的 checkout 行尾由 git 决定（官方 0.2.8 checkout 里 proto / schema 是 CRLF，
+# *.go 是 LF），所以逐字比对前要先归一化行尾；这里统一用 LF 存储，避免工作区
+# 行尾随 checkout 漂移，让内容比对可以重复执行。
+* text=auto eol=lf
+
+# 签名私钥是 base64 编码的密钥材料，禁止任何行尾/编码转换。
+*.private -text
+
+# 插件包与二进制产物不入库。
+dist/*.s2plugin binary
+build/ binary
