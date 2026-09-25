@@ -651,27 +651,31 @@ func TestParseFinalStreamResponseAcceptsPlainJSON(t *testing.T) {
 	}
 }
 
-func TestPrepareResponsesBodyPinsAstraDespiteLegacyOverrides(t *testing.T) {
-	legacy := DefaultConfig()
-	legacy.UpstreamModel = "gpt-5.6-sol"
-	legacy.ModelMap = map[string]string{DefaultModelID: "gpt-5.6-luna"}
-	for name, cfg := range map[string]Config{"default": DefaultConfig(), "legacy": legacy} {
+func TestPrepareResponsesBodyPreservesSupportedModel(t *testing.T) {
+	for name, cfg := range map[string]Config{"default": DefaultConfig(), "all models": {EnabledModels: AvailableModels()}} {
 		t.Run(name, func(t *testing.T) {
 			// The transport routes unsupported models away before preparation.
-			// Even direct preparation must not emit another Basis Points model.
-			for _, requested := range []string{DefaultModelID, " gpt-6-astra ", "gpt-5.6-luna-excel", ""} {
+			// Supported models stay unchanged; direct unsupported preparation keeps its default.
+			for _, test := range []struct{ requested, want string }{
+				{DefaultModelID, "gpt-6-astra"}, {" gpt-6-astra ", "gpt-6-astra"},
+				{"gpt-5.6-sol", "gpt-5.6-sol"}, {" \tgpt-5.6-sol\n", "gpt-5.6-sol"},
+				{"gpt-6-sol", "gpt-6-sol"}, {" gpt-6-luna ", "gpt-6-luna"},
+				{"gpt-5.6-terra", "gpt-5.6-terra"}, {"\tgpt-5.6-luna\n", "gpt-5.6-luna"},
+				{"gpt-5.6-luna-excel", "gpt-6-astra"}, {"gpt-5.6-sol-excel", "gpt-6-astra"},
+				{"GPT-5.6-SOL", "gpt-6-astra"}, {"", "gpt-6-astra"},
+			} {
 				source := map[string]any{
 					"input": []any{map[string]any{"role": "user", "content": "hi"}},
 				}
-				if requested != "" {
-					source["model"] = requested
+				if test.requested != "" {
+					source["model"] = test.requested
 				}
 				body, err := prepareResponsesBody(source, cfg)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if body["model"] != "gpt-6-astra" || body["model_selection"] != "explicit" {
-					t.Fatalf("request %q: model = %v, selection = %v", requested, body["model"], body["model_selection"])
+				if body["model"] != test.want || body["model_selection"] != "explicit" {
+					t.Fatalf("request %q: model = %v, want %q; selection = %v", test.requested, body["model"], test.want, body["model_selection"])
 				}
 			}
 		})

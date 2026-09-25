@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -14,12 +15,13 @@ import (
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
 
-func TestNonAstraModelsPreserveHostPassthrough(t *testing.T) {
+func TestUnsupportedModelsPreserveHostPassthrough(t *testing.T) {
 	cases := []struct{ name, body string }{}
 	for _, model := range []string{
-		"gpt-5.4", "gpt-5-codex", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
+		"gpt-5.4", "gpt-5-codex", "gpt-5.6-luna", "gpt-5.6-terra",
 		"gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol-excel", "gpt-5.6-luna-excel",
 		"gpt-6-astra-excel", "gpt-6-astra-preview", "GPT-6-ASTRA", "gpt-6-Astra",
+		"gpt-5.6-sol-preview", "GPT-5.6-SOL", "gpt-5.6-Sol",
 		"custom-alias", "future-model", "", "   ",
 	} {
 		cases = append(cases, struct{ name, body string }{model, `{ "model" : ` + string(protocol.JSONBytes(model)) + `, "input":"preserve this request", "tools":[{"type":"function","name":"demo"}], "extra":9007199254740993 }`})
@@ -27,7 +29,10 @@ func TestNonAstraModelsPreserveHostPassthrough(t *testing.T) {
 	for name, body := range map[string]string{
 		"uppercase key":             `{"MODEL":"gpt-6-astra"}`,
 		"conflicting uppercase key": `{"model":"gpt-6-sol","MODEL":"gpt-6-astra"}`,
+		"uppercase sol key":         `{"MODEL":"gpt-5.6-sol"}`,
+		"conflicting sol key":       `{"model":"gpt-6-sol","MODEL":"gpt-5.6-sol"}`,
 		"nested model":              `{"metadata":{"model":"gpt-6-astra"}}`,
+		"nested sol model":          `{"metadata":{"model":"gpt-5.6-sol"}}`,
 		"missing model":             `{}`,
 		"null model":                `{"model":null}`,
 		"numeric model":             `{"model":42}`,
@@ -68,10 +73,7 @@ func TestNonAstraModelsPreserveHostPassthrough(t *testing.T) {
 			transport := New()
 			defer transport.Shutdown()
 			applyConfig(t, transport, map[string]any{
-				"responses_url":  basisPoints.URL,
-				"models":         []string{"gpt-6-sol", "custom-alias", "GPT-6-ASTRA"},
-				"model_map":      map[string]string{"gpt-6-sol": "gpt-6-astra", "custom-alias": "gpt-6-astra"},
-				"upstream_model": "forced-model",
+				"responses_url": basisPoints.URL,
 			})
 			for _, test := range cases {
 				t.Run(test.name, func(t *testing.T) {
@@ -87,7 +89,7 @@ func TestNonAstraModelsPreserveHostPassthrough(t *testing.T) {
 						t.Fatalf("host response changed: %#v, body %s", result, result.body)
 					}
 					if basisHits.Load() != 0 {
-						t.Fatal("non-Astra request reached Basis Points")
+						t.Fatal("unsupported request reached Basis Points")
 					}
 					select {
 					case request := <-captured:
@@ -114,25 +116,56 @@ func TestNonAstraModelsPreserveHostPassthrough(t *testing.T) {
 	}
 }
 
-func TestAstraRoutingKeepsWhitelistAndFixedUpstream(t *testing.T) {
-	for _, test := range []struct {
+func TestSupportedModelRoutingKeepsWhitelistAndRequestedUpstream(t *testing.T) {
+	type routingCase struct {
 		name, model string
 		account     int64
 		whitelist   []int64
 		wantBasis   bool
-	}{
-		{"exact model", "gpt-6-astra", 7, nil, true},
-		{"trimmed model", " gpt-6-astra ", 7, nil, true},
-		{"listed account", "gpt-6-astra", 7, []int64{7}, true},
-		{"unlisted account", "gpt-6-astra", 7, []int64{42}, false},
-		{"unknown account keeps existing allowance", "gpt-6-astra", 0, []int64{42}, true},
-	} {
+		enabled     []string
+	}
+	cases := []routingCase{
+		{"exact astra", "gpt-6-astra", 7, nil, true, nil},
+		{"trimmed astra", " gpt-6-astra ", 7, nil, true, nil},
+		{"astra listed account", "gpt-6-astra", 7, []int64{7}, true, nil},
+		{"astra unlisted account", "gpt-6-astra", 7, []int64{42}, false, nil},
+		{"astra unknown account keeps existing allowance", "gpt-6-astra", 0, []int64{42}, true, nil},
+		{"exact sol", "gpt-5.6-sol", 7, nil, true, nil},
+		{"trimmed sol", " \tgpt-5.6-sol\n", 7, nil, true, nil},
+		{"sol listed account", "gpt-5.6-sol", 7, []int64{7}, true, nil},
+		{"sol unlisted account", "gpt-5.6-sol", 7, []int64{42}, false, nil},
+		{"sol unknown account keeps existing allowance", "gpt-5.6-sol", 0, []int64{42}, true, nil},
+	}
+	for _, model := range protocol.AvailableModels() {
+		others := make([]string, 0)
+		for _, other := range protocol.AvailableModels() {
+			if model != other {
+				others = append(others, other)
+			}
+		}
+		cases = append(cases,
+			routingCase{model + " enabled", model, 7, nil, true, []string{model}},
+			routingCase{model + " all enabled", model, 7, nil, true, protocol.AvailableModels()},
+			routingCase{model + " trimmed", " \t" + model + "\n", 7, nil, true, []string{model}},
+			routingCase{model + " listed account", model, 7, []int64{7}, true, []string{model}},
+			routingCase{model + " unlisted account", model, 7, []int64{42}, false, []string{model}},
+			routingCase{model + " unknown account keeps allowance", model, 0, []int64{42}, true, []string{model}},
+			routingCase{model + " unselected", model, 7, nil, false, others},
+			routingCase{model + " none selected", model, 7, nil, false, []string{}},
+			routingCase{model + " uppercase passthrough", strings.ToUpper(model), 7, nil, false, protocol.AvailableModels()},
+			routingCase{model + " legacy alias passthrough", model + "-excel", 7, nil, false, protocol.AvailableModels()},
+		)
+	}
+	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			var hostHits, basisHits atomic.Int32
 			basisModels := make(chan string, 1)
+			hostBodies := make(chan []byte, 1)
 			responseBody := []byte(`{"id":"resp_routing","status":"completed","output":[]}`)
 			hostUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				hostHits.Add(1)
+				body, _ := io.ReadAll(r.Body)
+				hostBodies <- body
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write(responseBody)
 			}))
@@ -149,8 +182,7 @@ func TestAstraRoutingKeepsWhitelistAndFixedUpstream(t *testing.T) {
 			defer transport.Shutdown()
 			applyConfig(t, transport, map[string]any{
 				"responses_url": basisPoints.URL, "account_ids": test.whitelist,
-				"upstream_model": "forced-model", "models": []string{"custom-alias"},
-				"model_map": map[string]string{"gpt-6-astra": "forced-model"},
+				"enabled_models": test.enabled,
 			})
 			body := protocol.JSONBytes(map[string]any{"model": test.model, "input": "hi"})
 			frames := requestFrames(t, hostUpstream.URL, token(t, "scheduled-account"), nil, body)
@@ -161,13 +193,15 @@ func TestAstraRoutingKeepsWhitelistAndFixedUpstream(t *testing.T) {
 			}
 			if test.wantBasis {
 				if basisHits.Load() != 1 || hostHits.Load() != 0 {
-					t.Fatal("Astra request did not exclusively reach Basis Points")
+					t.Fatal("supported request did not exclusively reach Basis Points")
 				}
-				if model := <-basisModels; model != "gpt-6-astra" {
-					t.Fatalf("upstream model changed to %q", model)
+				if model, want := <-basisModels, strings.TrimSpace(test.model); model != want {
+					t.Fatalf("upstream model changed to %q, want %q", model, want)
 				}
 			} else if basisHits.Load() != 0 || hostHits.Load() != 1 {
 				t.Fatal("whitelist did not keep the request on the host upstream")
+			} else if got := <-hostBodies; !bytes.Equal(got, body) {
+				t.Fatal("passthrough request body changed")
 			}
 		})
 	}

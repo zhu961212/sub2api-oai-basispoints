@@ -12,6 +12,9 @@ const root = path.resolve(__dirname, "..");
 const appSource = fs.readFileSync(path.join(root, "ui/assets/app.js"), "utf8");
 const bridgeSource = fs.readFileSync(path.join(root, "ui/assets/bridge-v1.js"), "utf8");
 const htmlSource = fs.readFileSync(path.join(root, "ui/index.html"), "utf8");
+const modelIDs = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+const modelCatalogIDs = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna"];
+const defaultModels = ["gpt-6-astra", "gpt-5.6-sol"];
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const deferred = () => {
   let resolve;
@@ -95,6 +98,9 @@ function createPage(options = {}) {
     "account-fields": "fieldset",
     "account-list": "div",
     "account-hint": "span",
+    "model-fields": "fieldset",
+    "model-list": "div",
+    "model-hint": "span",
     "state-chip": "span",
     "form-hint": "p",
     "version-line": "footer",
@@ -110,6 +116,9 @@ function createPage(options = {}) {
     element.hidden = /\shidden(?:\s|=|>)/.test(openingTag[0]);
   }
   ids["config-form"].appendChild(ids["account-fields"]);
+  ids["config-form"].appendChild(ids["model-fields"]);
+  ids["model-fields"].appendChild(ids["model-list"]);
+  ids["model-fields"].appendChild(ids["model-hint"]);
   ids["account-fields"].appendChild(ids["select-all-button"]);
   ids["account-fields"].appendChild(ids["account-list"]);
   ids["account-fields"].appendChild(ids["account-hint"]);
@@ -160,9 +169,17 @@ function createPage(options = {}) {
   };
   vm.runInNewContext(appSource, { window, document, console }, { filename: "ui/assets/app.js" });
   const boxes = () => ids["account-list"].children.flatMap((label) => label.children).filter((node) => node.tagName === "INPUT");
+  const modelBoxes = () => ids["model-list"].children.flatMap((label) => label.children).filter((node) => node.tagName === "INPUT");
   return {
     ids, calls, store,
     selected: () => boxes().filter((box) => box.checked).map((box) => Number(box.value)).sort((a, b) => a - b),
+    selectedModels: () => modelBoxes().filter((box) => box.checked).map((box) => box.value),
+    modelOptions: () => modelBoxes().map((box) => box.value),
+    checkModel(model, checked) {
+      const box = modelBoxes().find((item) => item.value === model);
+      assert.ok(box, "Model " + model + " must be rendered");
+      box.userCheck(checked);
+    },
     check(accountID, checked) {
       const box = boxes().find((item) => Number(item.value) === accountID);
       assert.ok(box, "Account #" + accountID + " must be rendered");
@@ -181,6 +198,140 @@ test("configuration actions work without sandboxed form submission", () => {
     assert.ok(tag, id + " exists");
     assert.match(tag[0], /\btype=["']button["']/);
   }
+});
+
+test("six model choices default to Astra and 5.6 Sol", async (t) => {
+  for (const config of [
+    { account_ids: [] },
+    { account_ids: [], enabled_models: null },
+  ]) {
+    await t.test(JSON.stringify(config), async () => {
+      const page = createPage({ store: { config } });
+      assert.equal(page.ids["model-fields"].disabled, true);
+      await flush();
+      assert.deepEqual(page.modelOptions(), modelIDs);
+      assert.deepEqual(page.selectedModels(), defaultModels);
+      assert.equal(page.ids["model-fields"].disabled, false);
+      assert.match(page.ids["model-hint"].textContent, /未选模型原样透传/);
+    });
+  }
+});
+
+test("every model subset saves and survives reopening, including none and all six", async (t) => {
+  for (let mask = 0; mask < 1 << modelIDs.length; mask++) {
+    const expected = modelIDs.filter((_, index) => mask & 1 << index);
+    await t.test("subset " + mask, async () => {
+      const store = { config: { account_ids: [2] } };
+      const page = createPage({ store });
+      await flush();
+      for (const model of modelIDs) page.checkModel(model, expected.includes(model));
+      page.save();
+      await flush();
+      assert.deepEqual(store.config.enabled_models, modelCatalogIDs.filter((model) => expected.includes(model)));
+      assert.deepEqual(store.config.account_ids, [2]);
+      assert.match(page.ids["form-hint"].textContent, /已保存/);
+      const reopened = createPage({ store });
+      await flush();
+      assert.deepEqual(reopened.selectedModels(), expected);
+      assert.deepEqual(reopened.selected(), [2]);
+      if (!mask) assert.match(reopened.ids["model-hint"].textContent, /所有模型原样透传，不走 Basis Points/);
+    });
+  }
+});
+
+test("model loading trims IDs and deduplicates in catalog order before saving", async () => {
+  const store = { config: { account_ids: [], enabled_models: [" gpt-5.6-luna ", "\tgpt-6-sol\n", "gpt-5.6-luna", null, 42] } };
+  const page = createPage({ store });
+  await flush();
+  assert.deepEqual(page.selectedModels(), ["gpt-6-sol", "gpt-5.6-luna"]);
+  page.save();
+  await flush();
+  assert.deepEqual(store.config.enabled_models, ["gpt-6-sol", "gpt-5.6-luna"]);
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
+});
+
+test("model controls stay locked while loading, saving, and verifying", async () => {
+  const initial = deferred();
+  const saving = deferred();
+  const verification = deferred();
+  const page = createPage({
+    load: (number) => number === 1 ? initial.promise : verification.promise,
+    save: () => saving.promise,
+  });
+  await flush();
+  page.checkModel("gpt-6-luna", true);
+  assert.deepEqual(page.selectedModels(), defaultModels);
+  initial.resolve({ account_ids: [], enabled_models: ["gpt-6-sol"] });
+  await flush();
+  page.checkModel("gpt-6-luna", true);
+  page.save();
+  assert.equal(page.ids["model-fields"].disabled, true);
+  page.checkModel("gpt-6-astra", true);
+  saving.resolve({ account_ids: [], enabled_models: ["gpt-6-sol", "gpt-6-luna"] });
+  await flush();
+  assert.equal(page.ids["model-fields"].disabled, true);
+  page.checkModel("gpt-6-sol", false);
+  assert.deepEqual(page.selectedModels(), ["gpt-6-sol", "gpt-6-luna"]);
+  verification.resolve({ account_ids: [], enabled_models: ["gpt-6-luna", "gpt-6-sol"] });
+  await flush();
+  assert.equal(page.ids["model-fields"].disabled, false);
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
+});
+
+test("rejected or inconsistent model saves retain local choices for retry", async (t) => {
+  for (const failure of ["rejected", "acknowledgement", "read-back", "verification failed", "empty normalized to null"]) {
+    await t.test(failure, async () => {
+      const store = { config: { account_ids: [2], enabled_models: defaultModels } };
+      let attempt = 0;
+      const page = createPage({
+        store,
+        save(config, saved) {
+          attempt++;
+          if (attempt > 1) {
+            saved.config = clone(config);
+            return Promise.resolve(clone(saved.config));
+          }
+          if (failure === "rejected") return Promise.reject(new Error("save unavailable"));
+          if (failure === "acknowledgement") return Promise.resolve(clone(saved.config));
+          if (failure === "empty normalized to null") return Promise.resolve({ ...config, enabled_models: null });
+          return Promise.resolve(config);
+        },
+        load(number, saved) {
+          return number === 2 && failure === "verification failed"
+            ? Promise.reject(new Error("verify unavailable"))
+            : Promise.resolve(clone(saved.config));
+        },
+      });
+      await flush();
+      const expected = failure === "empty normalized to null" ? [] : ["gpt-6-luna"];
+      for (const model of modelIDs) page.checkModel(model, expected.includes(model));
+      page.save();
+      await flush();
+      assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
+      assert.match(page.ids["form-hint"].textContent, /失败|不一致|未确认/);
+      assert.deepEqual(page.selectedModels(), expected);
+      assert.deepEqual(page.selected(), [2]);
+      assert.equal(page.ids["model-fields"].disabled, false);
+      page.save();
+      await flush();
+      assert.match(page.ids["form-hint"].textContent, /已保存/);
+      assert.deepEqual(store.config.enabled_models, expected);
+    });
+  }
+});
+
+test("status polling shows saved model state without overwriting unsaved model or account choices", async () => {
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }], enabled_models: defaultModels }) };
+  const page = createPage({ status });
+  await flush();
+  page.checkModel("gpt-6-luna", true);
+  page.check(1, true);
+  status.status_json = JSON.stringify({ accounts: [{ id: 1 }], enabled_models: [] });
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selectedModels(), ["gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol"]);
+  assert.deepEqual(page.selected(), [1]);
+  assert.match(page.ids["version-line"].textContent, /未启用模型（全部透传）/);
 });
 
 test("select all preserves hidden saved IDs and adds every displayed account only once", async () => {
@@ -304,7 +455,7 @@ test("status refresh enables select all for new accounts without losing unsaved 
 });
 
 test("selected accounts save on click, persist on read-back, and survive reopening", async () => {
-  const store = { config: { account_ids: [2], timeout_seconds: 123, model_map: { original: "preserved" }, obsolete_field: "remove" } };
+  const store = { config: { account_ids: [2], timeout_seconds: 123, rewrite_tools: false } };
   const page = createPage({ store });
   assert.equal(page.ids["save-button"].disabled, true);
   assert.equal(page.ids["account-fields"].disabled, true);
@@ -321,7 +472,7 @@ test("selected accounts save on click, persist on read-back, and survive reopeni
   assert.equal(page.calls.load, 2, "Saving must confirm the persisted host configuration");
   const submitted = clone(page.calls.save[0]);
   submitted.account_ids.sort((a, b) => a - b);
-  assert.deepEqual(submitted, { account_ids: [1, 2], timeout_seconds: 123, model_map: { original: "preserved" } });
+  assert.deepEqual(submitted, { account_ids: [1, 2], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false });
   assert.deepEqual(page.selected(), [1, 2]);
   assert.match(page.ids["form-hint"].textContent, /已保存/);
   assert.equal(page.ids["account-fields"].disabled, false);
@@ -456,25 +607,6 @@ test("a failed verification read never turns a save acknowledgement into success
   assert.match(page.ids["form-hint"].textContent, /verify unavailable/);
 });
 
-test("legacy account_id migrates only when account_ids is absent", async (t) => {
-  for (const [name, config, expected] of [
-    ["legacy single account", { account_id: 2 }, [2]],
-    ["explicit empty selection wins", { account_id: 2, account_ids: [] }, []],
-    ["explicit selected accounts win", { account_id: 2, account_ids: [1] }, [1]],
-  ]) {
-    await t.test(name, async () => {
-      const page = createPage({ store: { config } });
-      await flush();
-      assert.deepEqual(page.selected(), expected);
-      page.save();
-      await flush();
-      assert.deepEqual(page.calls.save[0].account_ids, expected);
-      assert.equal(Object.hasOwn(page.calls.save[0], "account_id"), false);
-      assert.match(page.ids["form-hint"].textContent, /已保存/);
-    });
-  }
-});
-
 test("automatic images need no configuration controls", async () => {
   assert.match(htmlSource, /支持直接发送图片和截图，无需额外配置/);
   assert.doesNotMatch(htmlSource, /image-relay|图片中转|公网 HTTPS|反向代理|监听地址|存储目录/);
@@ -483,59 +615,13 @@ test("automatic images need no configuration controls", async () => {
   await flush();
   page.save();
   await flush();
-  assert.deepEqual(page.calls.save[0], { account_ids: [] });
+  assert.deepEqual(page.calls.save[0], { account_ids: [], enabled_models: defaultModels });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
-const legacyImageConfig = { image_relay_enabled: true, image_relay_public_url: "https://images.example.test",
-  image_relay_listen: "0.0.0.0:8788", image_relay_storage_dir: "/srv/bps-images" };
-
-function assertNoImageSettings(config) {
-  assert.equal(Object.keys(config).some((key) => key.startsWith("image_relay_")), false);
-}
-
-test("saving legacy image settings removes all four fields and preserves account configuration", async () => {
-  const preserved = { account_ids: [2], timeout_seconds: 231, auth_mode: "chatgpt", model_map: { keep: "model" }, rewrite_tools: false };
-  const store = { config: { ...preserved, ...legacyImageConfig } };
-  const page = createPage({ store });
-  await flush();
-  assert.deepEqual(page.selected(), [2]);
-  page.check(1, true);
-  page.save();
-  await flush();
-  assert.deepEqual(store.config, { ...preserved, account_ids: [2, 1] });
-  assertNoImageSettings(page.calls.save[0]);
-  assert.equal(page.calls.load, 2);
-  assert.match(page.ids["form-hint"].textContent, /已保存/);
-  const reopened = createPage({ store });
-  await flush();
-  assert.deepEqual(reopened.selected(), [1, 2]);
-  reopened.save();
-  await flush();
-  assertNoImageSettings(reopened.calls.save[0]);
-});
-
-test("disabled and partial legacy image configurations do not block account saves", async (t) => {
-  for (const [name, legacy] of [
-    ["disabled", { ...legacyImageConfig, image_relay_enabled: false }],
-    ["enabled without an address", { image_relay_enabled: true }],
-    ["obsolete malformed values", { image_relay_enabled: "yes", image_relay_public_url: null, image_relay_listen: 8788, image_relay_storage_dir: {} }],
-  ]) {
-    await t.test(name, async () => {
-      const page = createPage({ store: { config: { account_ids: [], ...legacy } } });
-      await flush();
-      page.check(3, true);
-      page.save();
-      await flush();
-      assert.deepEqual(page.calls.save[0], { account_ids: [3] });
-      assert.match(page.ids["form-hint"].textContent, /已保存/);
-    });
-  }
-});
-
-test("migration does not save before loading or mutate stored configuration on open", async () => {
+test("opening configuration does not save before loading or mutate stored settings", async () => {
   const initial = deferred();
-  const store = { config: { account_ids: [2], ...legacyImageConfig } };
+  const store = { config: { account_ids: [2], enabled_models: ["gpt-6-sol"] } };
   const original = clone(store.config);
   const page = createPage({ store, load: () => initial.promise });
   page.save();
@@ -547,9 +633,9 @@ test("migration does not save before loading or mutate stored configuration on o
   assert.deepEqual(page.selected(), [2]);
 });
 
-test("a rejected save preserves account edits and retries without obsolete image fields", async () => {
+test("a rejected save preserves account edits for retry", async () => {
   let first = true;
-  const page = createPage({ store: { config: { account_ids: [], ...legacyImageConfig } }, save(config, store) {
+  const page = createPage({ store: { config: { account_ids: [] } }, save(config, store) {
     if (first) { first = false; return Promise.reject(new Error("write unavailable")); }
     store.config = config;
     return Promise.resolve(clone(config));
@@ -564,26 +650,8 @@ test("a rejected save preserves account edits and retries without obsolete image
   page.save();
   await flush();
   assert.equal(page.calls.save.length, 2);
-  page.calls.save.forEach(assertNoImageSettings);
-  assert.deepEqual(page.store.config, { account_ids: [1] });
+  assert.deepEqual(page.store.config, { account_ids: [1], enabled_models: defaultModels });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
-});
-
-test("legacy image fields reintroduced by an old host are never submitted again", async () => {
-  const page = createPage({ save(config, store) {
-    store.config = { ...config, ...legacyImageConfig };
-    return Promise.resolve(clone(store.config));
-  } });
-  await flush();
-  page.check(2, true);
-  page.save();
-  await flush();
-  assert.match(page.ids["form-hint"].textContent, /已保存/);
-  page.save();
-  await flush();
-  assert.equal(page.calls.save.length, 2);
-  page.calls.save.forEach(assertNoImageSettings);
-  assert.deepEqual(page.selected(), [2]);
 });
 
 function createBridgeHarness(options = {}) {

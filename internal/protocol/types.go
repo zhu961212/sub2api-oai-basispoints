@@ -27,6 +27,9 @@ type Config = config.Config
 // DefaultConfig 返回默认配置。
 func DefaultConfig() Config { return config.Default() }
 
+// AvailableModels 返回配置页可选的 Basis Points 模型目录。
+func AvailableModels() []string { return config.AvailableModels() }
+
 // ParseConfig 严格解析配置，并把解析错误包装成对宿主安全的 APIError。
 // 详细字段、默认值与范围校验见 internal/config。
 func ParseConfig(raw []byte) (Config, error) {

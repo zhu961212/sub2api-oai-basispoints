@@ -152,12 +152,56 @@ func TestLiveEffortMappingReachesXHigh(t *testing.T) {
 	}
 }
 
-// 真实请求只使用 gpt-6-astra；其他模型的透传在本地回归测试覆盖。
+// Astra 的基础请求验收；六模型完整转发验收见 TestLiveSupportedModelForwarding。
 func TestLiveAstraModelIsAcceptedUpstream(t *testing.T) {
 	source := liveMessageSource("gpt-6-astra", "reasoning", "low")
 	status, payload, _ := livePost(t, source)
 	if status != http.StatusOK {
 		t.Fatalf("上游拒绝 gpt-6-astra：HTTP %d %s", status, previewText(string(payload), 240))
+	}
+}
+
+// 通过真实 Forward 路径确认受支持的模型、认证/代理及流式终态。
+// 只发送固定测试提示，日志不输出凭据、请求头或上游原始错误体。
+func TestLiveSupportedModelForwarding(t *testing.T) {
+	accessToken, accountID, proxyURL := liveCredentials(t)
+	for _, model := range protocol.AvailableModels() {
+		t.Run(model, func(t *testing.T) {
+			transport := New()
+			defer transport.Shutdown()
+			applyConfig(t, transport, map[string]any{"enabled_models": []string{model}})
+			source := liveMessageSource(model, "reasoning", "low")
+			frames := requestFrames(t, "https://unused.invalid/responses", accessToken, map[string]string{
+				"ChatGPT-Account-ID":  accountID,
+				"X-OpenAI-Account-ID": accountID,
+			}, protocol.JSONBytes(source))
+			frames[0].GetStart().ProxyUrl = proxyURL
+			started := time.Now()
+			result := runForward(t, transport, frames)
+			t.Logf("model=%s HTTP=%d elapsed=%s bytes=%d ended=%t", model, result.status, time.Since(started).Round(time.Millisecond), len(result.body), result.ended)
+			if result.errFrame != nil {
+				t.Fatalf("forward error code=%s", result.errFrame.GetCode())
+			}
+			if result.status != http.StatusOK {
+				object, _ := protocol.RawObject(result.body)
+				upstreamError, _ := object["error"].(map[string]any)
+				t.Fatalf("upstream rejected request: HTTP=%d code=%s", result.status, protocol.StringValue(upstreamError["code"]))
+			}
+			final, err := protocol.ParseFinalStreamResponse(result.body)
+			if err != nil {
+				t.Fatal("no valid final response")
+			}
+			if !result.ended || protocol.StringValue(final["status"]) != "completed" || !strings.Contains(string(result.body), "data: [DONE]") {
+				t.Fatalf("incomplete stream: status=%s ended=%t", protocol.StringValue(final["status"]), result.ended)
+			}
+			if returned := protocol.StringValue(final["model"]); returned != model {
+				t.Fatalf("response model=%q, want %q", returned, model)
+			}
+			if !strings.Contains(string(result.body), "OK") {
+				t.Fatal("response did not contain the requested OK reply")
+			}
+			t.Logf("confirmed model=%s completed stream and OK reply", model)
+		})
 	}
 }
 

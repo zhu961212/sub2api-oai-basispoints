@@ -1092,8 +1092,8 @@ func TestForwardPassesThroughModelsThePluginDoesNotServe(t *testing.T) {
 		t.Fatalf("passthrough body = %s", result.body)
 	}
 
-	// 反向确认：唯一受支持的模型仍然走 Basis Points。
-	for _, model := range []string{"gpt-6-astra"} {
+	// 反向确认：两个受支持的模型均走 Basis Points。
+	for _, model := range []string{"gpt-6-astra", "gpt-5.6-sol"} {
 		served := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			writer.Header().Set("Content-Type", "text/event-stream")
 			_, _ = writer.Write([]byte("data: " + `{"type":"response.completed","response":{"id":"resp_served","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"hi"}]}]}}` + "\n\ndata: [DONE]\n\n"))

@@ -15,7 +15,7 @@ import (
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.5.17"
+	Version = "0.5.20"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -23,9 +23,11 @@ const (
 
 	// DefaultResponsesURL 是 Basis Points 的 Responses 端点（Excel 网关）。
 	DefaultResponsesURL = "https://bps.openai.com/basispoints/api/responses"
-	// DefaultModelID 是插件唯一接管和对外提供的模型。
+	// DefaultModelID 是插件默认的 Basis Points 模型。
 	DefaultModelID = "gpt-6-astra"
-	// DefaultUpstreamModel 固定为同一个模型，旧配置不能覆盖。
+	// SolModelID 是插件默认同时接管的 GPT-5.6 Sol 模型。
+	SolModelID = "gpt-5.6-sol"
+	// DefaultUpstreamModel 用于没有明确模型的内部协议准备。
 	DefaultUpstreamModel = DefaultModelID
 
 	// DefaultTimeoutSeconds 是单次上游请求的超时。
@@ -36,11 +38,13 @@ const (
 	DefaultAuthMode = "chatgpt"
 )
 
-// defaultModels 与实际接管范围一致，不再提供旧版 Excel 别名。
-var defaultModels = []string{DefaultModelID}
+// defaultModels 是未指定 enabled_models 时启用的模型。
+var defaultModels = []string{DefaultModelID, SolModelID}
 
-// defaultModelMap 保留空对象以兼容旧配置的字段形状。
-var defaultModelMap = map[string]string{}
+// availableModels 是上游已验证的可选模型目录，其顺序也用于配置规范化。
+var availableModels = []string{
+	DefaultModelID, SolModelID, "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna",
+}
 
 // supportedReasoningEfforts 是上游实际接受的思考等级。
 // Basis Points 的 max/ultra 请求统一使用 xhigh，none/minimal 使用 low。
@@ -50,12 +54,10 @@ var supportedReasoningEfforts = map[string]struct{}{
 
 // Config 是插件的 JSON 配置。字段名统一使用 snake_case。
 type Config struct {
-	ResponsesURL  string   `json:"responses_url"`
-	UpstreamModel string   `json:"upstream_model"`
-	Models        []string `json:"models"`
-	// ModelMap 仅为兼容旧配置保留；Normalize 会清空映射。
-	ModelMap       map[string]string `json:"model_map"`
-	TimeoutSeconds int               `json:"timeout_seconds"`
+	ResponsesURL string `json:"responses_url"`
+	// EnabledModels 控制模型接管；nil 表示默认双模型，非 nil 空切片表示全部关闭。
+	EnabledModels  []string `json:"enabled_models"`
+	TimeoutSeconds int      `json:"timeout_seconds"`
 	// AccountIDs 限定使用这些账号（在它们之间轮询）。为空表示不限制，
 	// 完全跟随宿主调度。
 	AccountIDs         []int64 `json:"account_ids"`
@@ -64,11 +66,6 @@ type Config struct {
 	ToolsVersionID     string  `json:"tools_version_id,omitempty"`
 	RewriteTools       bool    `json:"rewrite_tools"`
 	TransformResponses bool    `json:"transform_responses"`
-	// Deprecated image settings are accepted only to migrate old saved configurations.
-	ImageRelayEnabled    bool   `json:"image_relay_enabled,omitempty"`
-	ImageRelayPublicURL  string `json:"image_relay_public_url,omitempty"`
-	ImageRelayListen     string `json:"image_relay_listen,omitempty"`
-	ImageRelayStorageDir string `json:"image_relay_storage_dir,omitempty"`
 }
 
 // Default 返回一份完整可用的默认配置。宿主极少提交空对象，但空对象必须
@@ -76,9 +73,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		ResponsesURL:       DefaultResponsesURL,
-		UpstreamModel:      DefaultUpstreamModel,
-		Models:             append([]string(nil), defaultModels...),
-		ModelMap:           cloneStringMap(defaultModelMap),
+		EnabledModels:      cloneStrings(defaultModels),
 		TimeoutSeconds:     DefaultTimeoutSeconds,
 		MaxResponseBytes:   DefaultMaxResponseBytes,
 		AuthMode:           DefaultAuthMode,
@@ -87,15 +82,49 @@ func Default() Config {
 	}
 }
 
-func cloneStringMap(source map[string]string) map[string]string {
+// cloneStrings 保留 nil 与显式空列表的不同选择语义。
+func cloneStrings(source []string) []string {
 	if source == nil {
 		return nil
 	}
-	result := make(map[string]string, len(source))
-	for key, value := range source {
-		result[key] = value
-	}
+	result := make([]string, len(source))
+	copy(result, source)
 	return result
+}
+
+// AvailableModels 返回可选模型目录的独立副本。
+func AvailableModels() []string {
+	return cloneStrings(availableModels)
+}
+
+func isAvailableModel(model string) bool {
+	for _, available := range availableModels {
+		if model == available {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeEnabledModels(models []string) ([]string, error) {
+	if models == nil {
+		return cloneStrings(defaultModels), nil
+	}
+	selected := make(map[string]bool, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if !isAvailableModel(model) {
+			return nil, fmt.Errorf("enabled_models contains an unsupported model")
+		}
+		selected[model] = true
+	}
+	result := make([]string, 0, len(selected))
+	for _, model := range availableModels {
+		if selected[model] {
+			result = append(result, model)
+		}
+	}
+	return result, nil
 }
 
 // normalizeAccountIDs 去掉非法值与重复项；空结果统一为 nil（表示不限制）。
@@ -152,7 +181,6 @@ func (c *Config) Normalize() error {
 		(parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
 		return fmt.Errorf("responses_url must be an absolute HTTP(S) URL")
 	}
-	c.UpstreamModel = DefaultUpstreamModel
 	c.AuthMode = strings.TrimSpace(c.AuthMode)
 	if c.AuthMode == "" {
 		c.AuthMode = DefaultAuthMode
@@ -171,19 +199,17 @@ func (c *Config) Normalize() error {
 	}
 	c.AccountIDs = normalizeAccountIDs(c.AccountIDs)
 	c.ToolsVersionID = strings.TrimSpace(c.ToolsVersionID)
-	// Native attachments need no listener, storage directory or public origin.
-	c.ImageRelayEnabled = false
-	c.ImageRelayPublicURL, c.ImageRelayListen, c.ImageRelayStorageDir = "", "", ""
-	// 平滑迁移已保存的旧配置：保留账号与传输选项，只收敛模型相关字段。
-	c.ModelMap = cloneStringMap(defaultModelMap)
-	c.Models = append([]string(nil), defaultModels...)
+	models, err := normalizeEnabledModels(c.EnabledModels)
+	if err != nil {
+		return err
+	}
+	c.EnabledModels = models
 	return nil
 }
 
-// Clone 深复制配置，避免调用方共享 Models / ModelMap / AccountIDs 的底层结构。
+// Clone 深复制配置，并保留显式空模型选择。
 func (c Config) Clone() Config {
-	c.Models = append([]string(nil), c.Models...)
-	c.ModelMap = cloneStringMap(c.ModelMap)
+	c.EnabledModels = cloneStrings(c.EnabledModels)
 	c.AccountIDs = append([]int64(nil), c.AccountIDs...)
 	return c
 }
@@ -196,19 +222,36 @@ func (c Config) SelectedAccountIDs() []int64 {
 
 // HandlesModel 报告某个模型名是否由本插件接管（= 请求打到 Basis Points）。
 //
-// 只接管 gpt-6-astra；即使传入尚未规范化的旧配置，也不能扩大接管范围。
+// 只接管六个已知目录项中显式启用的模型；默认启用 Astra 与 5.6 Sol。
 //
 // 其余模型必须原样透传回宿主的上游：宿主会用普通 Codex 模型（默认 gpt-5.4）
 // 对账号做连通性测试，这类请求也会被交给插件，而 Basis Points 只服务它自己的
 // 模型集合，收到 gpt-5.4 会回 403 basispoints_model_access_changed —— 宿主随即
 // 把账号判成异常/限流，表现为"一启用插件账号就限流"。未知模型一律不接管。
 func (c Config) HandlesModel(model string) bool {
-	return strings.TrimSpace(model) == DefaultModelID
+	model = strings.TrimSpace(model)
+	if !isAvailableModel(model) {
+		return false
+	}
+	models := c.EnabledModels
+	if models == nil {
+		models = defaultModels
+	}
+	for _, selected := range models {
+		if model == strings.TrimSpace(selected) {
+			return true
+		}
+	}
+	return false
 }
 
-// UpstreamModelFor 固定返回唯一允许的 Basis Points 模型。
-// 调用方先用 HandlesModel 分流，旧映射和整体覆盖不能改写上游模型。
+// UpstreamModelFor 保留受支持的请求模型名，其余输入沿用默认值。
+// 调用方先用 HandlesModel 分流，选中的模型按自身名称转发。
 func (c Config) UpstreamModelFor(requested string) string {
+	requested = strings.TrimSpace(requested)
+	if isAvailableModel(requested) {
+		return requested
+	}
 	return DefaultUpstreamModel
 }
 

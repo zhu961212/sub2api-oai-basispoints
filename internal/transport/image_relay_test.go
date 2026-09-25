@@ -8,15 +8,11 @@ import (
 	"image"
 	"image/png"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
@@ -28,19 +24,6 @@ func relayTestImage(t *testing.T) ([]byte, string) {
 		t.Fatal(err)
 	}
 	return buffer.Bytes(), "data:image/png;base64," + base64.StdEncoding.EncodeToString(buffer.Bytes())
-}
-
-func relayTestListen(t *testing.T) string {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return address
 }
 
 func relayTestBody(imageURL string) []byte {
@@ -101,6 +84,13 @@ func relayTestCompletedResponse() []byte {
 }
 
 func TestImageRelayForwardMatrix(t *testing.T) {
+	for _, model := range []string{"gpt-6-astra", "gpt-5.6-sol"} {
+		t.Run(model, func(t *testing.T) { testImageRelayForwardMatrix(t, model) })
+	}
+}
+
+func testImageRelayForwardMatrix(t *testing.T, model string) {
+	t.Helper()
 	for _, rewrite := range []bool{false, true} {
 		for _, transform := range []bool{false, true} {
 			for _, streaming := range []bool{false, true} {
@@ -160,7 +150,7 @@ func TestImageRelayForwardMatrix(t *testing.T) {
 					imagePart := func() map[string]any {
 						return map[string]any{"type": "input_image", "image_url": inlineImage, "detail": "high"}
 					}
-					source := map[string]any{"model": "gpt-6-astra", "stream": streaming, "input": []any{
+					source := map[string]any{"model": model, "stream": streaming, "input": []any{
 						map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "before " + inlineImage}, imagePart(), map[string]any{"type": "input_text", "text": "after", "large_integer": json.Number("9007199254740993")}}},
 						map[string]any{"type": "function_call_output", "call_id": "call_function", "output": []any{map[string]any{"type": "input_text", "text": "function image"}, imagePart()}},
 						map[string]any{"type": "custom_tool_call_output", "call_id": "call_custom", "output": []any{imagePart(), map[string]any{"type": "input_text", "text": "custom image"}}},
@@ -183,7 +173,7 @@ func TestImageRelayForwardMatrix(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if seen["model"] != "gpt-6-astra" || seen["__bps_session_scope"] != nil {
+					if seen["model"] != model || seen["__bps_session_scope"] != nil {
 						t.Fatal("model or local scope changed on wire")
 					}
 					ids := relayTestFileIDs(seen)
@@ -354,7 +344,7 @@ func TestImageRelayExistingReferencesNeedNoUpload(t *testing.T) {
 	}
 }
 
-func TestImageRelayConfigurationLifecycle(t *testing.T) {
+func TestAutomaticAttachmentsSurviveConfigChanges(t *testing.T) {
 	imageBytes, inlineImage := relayTestImage(t)
 	var uploads atomic.Int32
 	var capturedID string
@@ -374,23 +364,9 @@ func TestImageRelayConfigurationLifecycle(t *testing.T) {
 		_, _ = w.Write(relayTestCompletedResponse())
 	}))
 	defer upstream.Close()
-	listen := relayTestListen(t)
-	storage := filepath.Join(t.TempDir(), "must-not-create")
 	transport := New()
 	defer transport.Shutdown()
-	cfg := map[string]any{"responses_url": upstream.URL + "/responses", "image_relay_enabled": true,
-		"image_relay_public_url": "https://obsolete.example.test", "image_relay_listen": listen, "image_relay_storage_dir": storage}
-	checkMigration := func() {
-		t.Helper()
-		applyConfig(t, transport, cfg)
-		if transport.cfg.ImageRelayEnabled || transport.cfg.ImageRelayPublicURL != "" || transport.cfg.ImageRelayListen != "" || transport.cfg.ImageRelayStorageDir != "" {
-			t.Fatal("legacy image configuration was not cleared")
-		}
-		relayTestListenerClosed(t, listen)
-		if _, err := os.Stat(storage); !os.IsNotExist(err) {
-			t.Fatalf("obsolete image directory was created: %v", err)
-		}
-	}
+	cfg := map[string]any{"responses_url": upstream.URL + "/responses"}
 	forward := func() {
 		t.Helper()
 		result := runForward(t, transport, requestFrames(t, upstream.URL, token(t, "acct-lifecycle"), map[string]string{"conversation_id": "host-isolated-key-lifecycle-session"}, relayTestBody(inlineImage)))
@@ -398,37 +374,20 @@ func TestImageRelayConfigurationLifecycle(t *testing.T) {
 			t.Fatalf("automatic image forward failed: %+v %s", result, result.body)
 		}
 	}
-	checkMigration()
+	applyConfig(t, transport, cfg)
 	forward()
-	checkMigration()
+	applyConfig(t, transport, cfg)
 	forward()
 	if uploads.Load() != 1 {
 		t.Fatalf("unchanged configuration lost attachment deduplication: uploads=%d", uploads.Load())
 	}
-	occupied, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer occupied.Close()
-	cfg["image_relay_listen"] = occupied.Addr().String()
-	cfg["image_relay_public_url"] = "not-a-valid-origin"
-	checkMigration()
+	cfg["enabled_models"] = protocol.AvailableModels()
+	applyConfig(t, transport, cfg)
 	forward()
-	cfg["image_relay_enabled"] = false
-	checkMigration()
+	cfg["enabled_models"] = []string{"gpt-6-astra"}
+	applyConfig(t, transport, cfg)
 	forward()
 	if uploads.Load() != 1 {
-		t.Fatalf("obsolete settings affected automatic image uploads: uploads=%d", uploads.Load())
-	}
-	transport.Shutdown()
-	relayTestListenerClosed(t, listen)
-}
-
-func relayTestListenerClosed(t *testing.T, listen string) {
-	t.Helper()
-	conn, err := net.DialTimeout("tcp", listen, 200*time.Millisecond)
-	if err == nil {
-		_ = conn.Close()
-		t.Fatal("retired download listener still accepts connections")
+		t.Fatalf("model selection changes lost attachment deduplication: uploads=%d", uploads.Load())
 	}
 }

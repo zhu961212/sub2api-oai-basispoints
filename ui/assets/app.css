@@ -175,6 +175,23 @@ select:focus {
   align-items: baseline;
 }
 
+.model-list {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  max-height: none;
+}
+
+@media (max-width: 520px) {
+  .model-list {
+    grid-template-columns: 1fr;
+  }
+
+  .model-list .check:nth-child(4) {
+    margin-top: 6px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+}
+
 .check input[type="checkbox"] {
   width: auto;
   margin: 0;

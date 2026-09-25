@@ -6,11 +6,11 @@
 
 ## 已准备的源码包
 
-在项目根目录运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.5.17-github-source.zip 和配套 SHA-256。脚本从当前工作区导出源码，包含尚未提交的新文件；不会复制 .git、build、dist、发布密钥、常见凭据文件或本地缓存。解压包后，以内层项目目录作为仓库根目录。
+在项目根目录运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.5.20-github-source.zip 和配套 SHA-256。脚本从当前工作区导出源码，包含尚未提交的新文件；不会复制 .git、build、dist、发布密钥、常见凭据文件或本地缓存。解压包后，以内层项目目录作为仓库根目录。
 
 README、插件清单介绍、配置页和本文均包含 **交流群：1107265919**；GitHub 仓库 About 或 Release 介绍也可填写：
 
-> OpenAI Basis Points 传输插件，支持自动图片上传与客户端工具适配。交流群：1107265919。
+> 适用于 Sub2API 官方版，通过 OpenAI Excel（Basis Points）官方入口使用账号可用的官方模型，六模型可选。交流群：1107265919。
 
 已提供 .github/workflows/ci.yml：检查 Go、UI、源码导出边界，并在 Linux 上运行 race 与跨平台构建。工作流只有读取仓库权限，不使用发布私钥，不自动部署或发布 Release。本地测试通过不表示 GitHub Actions 已运行；推送后应查看实际工作流结果。
 
@@ -106,15 +106,15 @@ git push -u origin main
 
 ## 6. 发布安装包
 
-源码上传与安装包发布分开进行。需要发布 0.5.17 时：
+源码上传与安装包发布分开进行。需要发布 0.5.20 时：
 
 1. 确认源码、manifest.source.json 版本、测试结果和发布记录一致。
 2. 按 [README](../README.md) 生成签名安装包，用配套公钥独立验包。
-3. 在 GitHub Releases 为审核后的提交创建 v0.5.17 标签和 Release。
-4. 上传 .s2plugin 与配套 .s2plugin.sha256，正文参考 [0.5.17 发布记录](release-0.5.17-2026-09-26.md)。
+3. 在 GitHub Releases 为审核后的提交创建 v0.5.20 标签和 Release。
+4. 上传 .s2plugin 与配套 .s2plugin.sha256，正文参考 [0.5.20 发布记录](release-0.5.20-2026-09-26.md)。
 5. 向部署者提供 key_id 和用于验签的发布公钥；**绝不发布私钥**。
 
-0.5.17 的发布正文应说明图片和截图自动通过原生附件发送、无需图片配置，并如实保留未做真实 OAuth 识图验收的边界。沿用现有发布密钥和 oai-basispoints-v1 key_id；不要用旧自托管路径的性能数字或 0.5.15 安装包哈希充当本次结果。
+0.5.20 的发布正文应说明六模型按 GPT-6 与 GPT-5.6 分两排显示，默认只启用 `gpt-6-astra` 和 `gpt-5.6-sol`；只有已选且命中灰度、符合账号白名单的模型转发到 Basis Points，上游保留请求模型名。明确区分空模型选择（全部透传）与空账号选择（不限制账号）；未选模型和旧别名原样透传。如实记录本次本地测试、构建和验签结果，未完成的真实上游验证不得写成已通过。正式发布复用原发布密钥，key_id 为 `oai-basispoints-v1`，并用配套公钥独立验签。不要用旧自托管路径的性能数字或 0.5.15 安装包哈希充当本次结果。
 
 历史发布记录中的哈希对应当次构建。重新构建后的产物应重新计算、核验，并更新实际发布附件的校验信息；不能直接套用历史哈希。
 

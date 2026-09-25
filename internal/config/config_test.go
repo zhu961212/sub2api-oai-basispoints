@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -13,58 +14,48 @@ func TestParseEmptyObjectYieldsCompleteDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.ResponsesURL != DefaultResponsesURL || c.UpstreamModel != DefaultUpstreamModel ||
+	if c.ResponsesURL != DefaultResponsesURL ||
 		c.AuthMode != DefaultAuthMode || c.TimeoutSeconds != DefaultTimeoutSeconds ||
 		c.MaxResponseBytes != DefaultMaxResponseBytes {
 		t.Fatalf("defaults = %#v", c)
 	}
-	if len(c.Models) != 1 || c.Models[0] != "gpt-6-astra" {
-		t.Fatalf("models = %#v", c.Models)
-	}
-	if c.ModelMap == nil || len(c.ModelMap) != 0 {
-		t.Fatalf("model_map = %#v", c.ModelMap)
-	}
-	// 模型固定为 gpt-6-astra，旧别名与配置不能改变上游模型。
-	if c.UpstreamModel != "gpt-6-astra" {
-		t.Fatalf("upstream_model = %q, want gpt-6-astra", c.UpstreamModel)
+	if !reflect.DeepEqual(c.EnabledModels, []string{"gpt-6-astra", "gpt-5.6-sol"}) {
+		t.Fatalf("enabled_models = %#v", c.EnabledModels)
 	}
 	if !c.RewriteTools || !c.TransformResponses {
 		t.Fatalf("rewrite/transform should default to enabled: %#v", c)
 	}
-	if c.ImageRelayEnabled || c.ImageRelayPublicURL != "" || c.ImageRelayStorageDir != "" || c.ImageRelayListen != "" {
-		t.Fatalf("image relay defaults = %#v", c)
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, removed := range []string{"models", "model_map", "upstream_model", "image_relay_enabled", "image_relay_public_url", "image_relay_listen", "image_relay_storage_dir"} {
+		if _, exists := fields[removed]; exists {
+			t.Fatalf("default configuration still contains removed field %q", removed)
+		}
 	}
 }
 
-func TestParseMigratesLegacyImageSettingsWithoutConfiguration(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		raw, _ := json.Marshal(map[string]any{
-			"image_relay_enabled": enabled, "image_relay_public_url": "invalid legacy origin",
-			"image_relay_listen": "unavailable legacy listener", "image_relay_storage_dir": "old-dir",
-			"account_ids": []int64{7}, "timeout_seconds": 120, "rewrite_tools": false,
+func TestParseRejectsRemovedConfigurationFields(t *testing.T) {
+	for field, value := range map[string]any{
+		"models": []string{"gpt-6-astra"}, "model_map": map[string]string{}, "upstream_model": "gpt-6-astra",
+		"image_relay_enabled": false, "image_relay_public_url": "", "image_relay_listen": "", "image_relay_storage_dir": "",
+	} {
+		t.Run(field, func(t *testing.T) {
+			for _, input := range []any{value, nil} {
+				raw, err := json.Marshal(map[string]any{field: input})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := Parse(raw); err == nil || !strings.Contains(err.Error(), "unknown field") {
+					t.Fatalf("removed configuration field %q should be rejected, got %v", field, err)
+				}
+			}
 		})
-		cfg, err := Parse(raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cfg.ImageRelayEnabled || cfg.ImageRelayPublicURL != "" || cfg.ImageRelayListen != "" || cfg.ImageRelayStorageDir != "" {
-			t.Fatalf("legacy image configuration not cleared: %#v", cfg)
-		}
-		if len(cfg.AccountIDs) != 1 || cfg.AccountIDs[0] != 7 || cfg.TimeoutSeconds != 120 || cfg.RewriteTools {
-			t.Fatalf("unrelated settings changed: %#v", cfg)
-		}
-		encoded, _ := json.Marshal(cfg)
-		if strings.Contains(string(encoded), "image_relay_") {
-			t.Fatal("normalized settings still expose manual image setup")
-		}
-		again, err := Parse(encoded)
-		if err != nil {
-			t.Fatal(err)
-		}
-		second, _ := json.Marshal(again)
-		if string(encoded) != string(second) {
-			t.Fatal("migration is not idempotent")
-		}
 	}
 }
 
@@ -123,8 +114,7 @@ func TestParseEnforcesBoundaries(t *testing.T) {
 	}
 }
 
-// 旧版本的单值 account_id 字段已废弃：DisallowUnknownFields 会直接拒绝，
-// 这是受控语义（升级后需要在配置页重新保存一次）。
+// 配置只接受 account_ids，已删除的 account_id 必须拒绝。
 func TestParseRejectsLegacyAccountIDField(t *testing.T) {
 	if _, err := Parse([]byte(`{"account_id":42}`)); err == nil {
 		t.Fatal("legacy account_id field should be rejected")
@@ -154,17 +144,20 @@ func TestSelectedAccountIDs(t *testing.T) {
 func TestUpstreamModelFor(t *testing.T) {
 	configs := map[string]Config{
 		"default": Default(), "zero value": {},
-		"unnormalized overrides": {
-			UpstreamModel: "forced-model", Models: []string{"custom-alias"},
-			ModelMap: map[string]string{"gpt-6-astra": "other-upstream", "custom-alias": "custom-upstream"},
-		},
+		"empty selection": {EnabledModels: []string{}},
 	}
 	for name, cfg := range configs {
 		t.Run(name, func(t *testing.T) {
-			// HandlesModel performs routing first; the resolver always uses the fixed model.
-			for _, requested := range []string{"gpt-6-astra", " gpt-6-astra ", "GPT-6-ASTRA", "gpt-5.6-sol-excel", "gpt-5.6-luna-excel", "gpt-5.6-sol", "custom-alias", "future-model-excel", "unknown-model", ""} {
+			// HandlesModel performs routing first; supported requests retain their model.
+			for _, requested := range []string{"gpt-6-astra", " gpt-6-astra ", "gpt-5.6-sol", " gpt-5.6-sol ", "\tgpt-5.6-sol\n", "gpt-6-sol", " gpt-6-luna ", "gpt-5.6-terra", "gpt-5.6-luna"} {
+				if got, want := cfg.UpstreamModelFor(requested), strings.TrimSpace(requested); got != want {
+					t.Errorf("UpstreamModelFor(%q) = %q, want %q", requested, got, want)
+				}
+			}
+			// Direct resolution of unsupported models keeps the existing default fallback.
+			for _, requested := range []string{"GPT-6-ASTRA", "GPT-5.6-SOL", "gpt-5.6-Sol", "gpt-5.6-sol-excel", "gpt-5.6-luna-excel", "custom-alias", "future-model-excel", "unknown-model", ""} {
 				if got := cfg.UpstreamModelFor(requested); got != "gpt-6-astra" {
-					t.Errorf("UpstreamModelFor(%q) = %q, want gpt-6-astra", requested, got)
+					t.Errorf("UpstreamModelFor(%q) = %q, want gpt-6-astra fallback", requested, got)
 				}
 			}
 		})
@@ -172,68 +165,122 @@ func TestUpstreamModelFor(t *testing.T) {
 }
 
 // 旧 models 清单不能启用额外模型，也不能屏蔽固定模型。
-func TestModelListCannotExpandFixedRouting(t *testing.T) {
-	for _, models := range [][]string{nil, {}, {"brand-new-model", "brand-new-model-excel", "GPT-6-ASTRA"}} {
-		cfg := Default()
-		cfg.Models = models
-		if !SupportsModel("gpt-6-astra", cfg) {
-			t.Fatalf("legacy model list %#v suppressed the fixed model", models)
+func TestAvailableModelsReturnsIndependentCatalog(t *testing.T) {
+	want := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna"}
+	models := AvailableModels()
+	if !reflect.DeepEqual(models, want) {
+		t.Fatalf("catalog = %#v, want %#v", models, want)
+	}
+	models[0] = "mutated"
+	if !reflect.DeepEqual(AvailableModels(), want) || !Default().HandlesModel(want[0]) {
+		t.Fatal("AvailableModels exposes mutable routing catalog")
+	}
+}
+
+func TestParseEnabledModelsDefaults(t *testing.T) {
+	for _, body := range []string{
+		`{}`, `{"enabled_models":null}`,
+	} {
+		cfg, err := Parse([]byte(body))
+		if err != nil {
+			t.Fatal(err)
 		}
-		for _, model := range []string{"brand-new-model", "brand-new-model-excel", "GPT-6-ASTRA", "gpt-5.4"} {
-			if SupportsModel(model, cfg) || cfg.HandlesModel(model) {
-				t.Fatalf("legacy model list %#v enabled routing for %q", models, model)
+		want := []string{"gpt-6-astra", "gpt-5.6-sol"}
+		if !reflect.DeepEqual(cfg.EnabledModels, want) {
+			t.Fatalf("configuration %s selected %#v, want %#v", body, cfg.EnabledModels, want)
+		}
+	}
+}
+
+func TestEnabledModelsAllSubsetsNormalizeAndPersist(t *testing.T) {
+	catalog := AvailableModels()
+	for mask := 0; mask < 1<<len(catalog); mask++ {
+		selected, want := make([]string, 0), make([]string, 0)
+		for index, model := range catalog {
+			if mask&(1<<index) != 0 {
+				want = append(want, model)
+			}
+		}
+		// Reverse order, duplicate, and surrounding whitespace must normalize.
+		for index := len(want) - 1; index >= 0; index-- {
+			selected = append(selected, " \t"+want[index]+"\n", want[index])
+		}
+		raw, err := json.Marshal(map[string]any{"enabled_models": selected})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for stage := 0; stage < 3; stage++ {
+			if !reflect.DeepEqual(cfg.EnabledModels, want) {
+				t.Fatalf("selection mask %d stage %d = %#v, want %#v", mask, stage, cfg.EnabledModels, want)
+			}
+			for index, model := range catalog {
+				if got, expected := cfg.HandlesModel(model), mask&(1<<index) != 0; got != expected || SupportsModel(model, cfg) != expected {
+					t.Fatalf("selection mask %d routes %s = %t, want %t", mask, model, got, expected)
+				}
+			}
+			if stage == 0 {
+				cfg = cfg.Clone()
+				if err := cfg.Normalize(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				encoded, err := json.Marshal(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cfg, err = Parse(encoded)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 	}
 }
 
-func TestParseNormalizesModelMap(t *testing.T) {
-	for _, body := range []string{
-		`{"model_map":{" alias ":" upstream ","":"x","empty":"  "}}`,
-		`{"model_map":{"gpt-6-astra":"forced-model","gpt-5.4":"gpt-6-astra"},"upstream_model":"forced-model"}`,
-		`{"model_map":null}`,
-	} {
-		cfg, err := Parse([]byte(body))
-		if err != nil {
-			t.Fatal(err)
+func TestParseRejectsUnsupportedEnabledModelsWithoutEchoingInput(t *testing.T) {
+	for _, value := range []string{"gpt-5.4", "gpt-6-astra-excel", "gpt-5.6-sol-excel", "GPT-6-ASTRA", "GPT-5.6-SOL", "gpt-6-Sol", "", " ", "sensitive-value@example.test"} {
+		raw, _ := json.Marshal(map[string]any{"enabled_models": []string{"gpt-6-astra", value}})
+		if _, err := Parse(raw); err == nil || err.Error() != "enabled_models contains an unsupported model" {
+			t.Fatalf("unsupported selection should return a safe validation error, got %v", err)
 		}
-		if cfg.ModelMap == nil || len(cfg.ModelMap) != 0 {
-			t.Fatalf("model_map = %#v, want an empty object", cfg.ModelMap)
-		}
-		if cfg.UpstreamModel != "gpt-6-astra" || cfg.UpstreamModelFor("gpt-6-astra") != "gpt-6-astra" {
-			t.Fatalf("legacy settings changed the fixed upstream model: %#v", cfg)
-		}
-		if cfg.HandlesModel("alias") || cfg.HandlesModel("gpt-5.4") {
-			t.Fatal("a legacy model mapping expanded routing")
+	}
+	for _, body := range []string{`{"enabled_models":"gpt-6-astra"}`, `{"enabled_models":[42]}`, `{"enabled_models":{}}`} {
+		if _, err := Parse([]byte(body)); err == nil {
+			t.Fatal("invalid enabled_models shape was accepted")
 		}
 	}
 }
 
-func TestCloneDeepCopiesModelMap(t *testing.T) {
-	original := Default()
-	clone := original.Clone()
-	clone.ModelMap["gpt-5.6-sol-excel"] = "mutated"
-	clone.Models[0] = "mutated"
-	if original.ModelMap["gpt-5.6-sol-excel"] == "mutated" {
-		t.Fatal("Clone shared the ModelMap backing map")
+func TestHandlesModelSelectionCannotExpandCatalog(t *testing.T) {
+	invalid := []string{"gpt-5.4", "gpt-6-astra-excel", "gpt-5.6-sol-excel", "GPT-6-ASTRA", "GPT-5.6-SOL", "future-model", ""}
+	cfg := Config{EnabledModels: append(AvailableModels(), invalid...)}
+	for _, model := range invalid {
+		if cfg.HandlesModel(model) || SupportsModel(model, cfg) {
+			t.Fatalf("unnormalized enabled_models expanded routing to %q", model)
+		}
 	}
-	if original.Models[0] == "mutated" {
-		t.Fatal("Clone shared the Models backing array")
+	for _, model := range AvailableModels() {
+		if !cfg.HandlesModel(" \t" + model + "\n") {
+			t.Fatalf("known selected model %q was not routed", model)
+		}
 	}
 }
 
-func TestParseNormalizesModelsList(t *testing.T) {
-	for _, body := range []string{
-		`{"models":[" demo ","demo","","second"]}`,
-		`{"models":[]}`, `{"models":null}`,
-		`{"models":["GPT-6-ASTRA","gpt-6-astra-excel"]}`,
-	} {
-		cfg, err := Parse([]byte(body))
-		if err != nil {
+func TestClonePreservesNilAndEmptyModelSelections(t *testing.T) {
+	for _, models := range [][]string{nil, {}} {
+		cfg := Config{EnabledModels: models}.Clone()
+		if (cfg.EnabledModels == nil) != (models == nil) {
+			t.Fatalf("Clone changed nil/empty model selection: %#v", cfg)
+		}
+		if err := cfg.Normalize(); err != nil {
 			t.Fatal(err)
 		}
-		if len(cfg.Models) != 1 || cfg.Models[0] != "gpt-6-astra" {
-			t.Fatalf("models = %#v, want [gpt-6-astra]", cfg.Models)
+		if got, want := cfg.HandlesModel(DefaultModelID), models == nil; got != want {
+			t.Fatalf("cloned selection routes Astra = %t, want %t", got, want)
 		}
 	}
 }
@@ -262,10 +309,12 @@ func TestParseIsIdempotent(t *testing.T) {
 
 func TestCloneIsDeepCopy(t *testing.T) {
 	original := Default()
+	original.AccountIDs = []int64{7}
 	clone := original.Clone()
-	clone.Models[0] = "mutated"
-	if original.Models[0] == "mutated" {
-		t.Fatal("Clone shared the Models backing array")
+	clone.EnabledModels[0] = "mutated"
+	clone.AccountIDs[0] = 42
+	if original.EnabledModels[0] == "mutated" || original.AccountIDs[0] != 7 {
+		t.Fatal("Clone shared the model or account selection backing array")
 	}
 }
 
@@ -303,22 +352,19 @@ func TestNormalizeEffortTable(t *testing.T) {
 func TestHandlesModelRouting(t *testing.T) {
 	configs := map[string]Config{
 		"default": Default(), "zero value": {},
-		"unnormalized legacy overrides": {
-			UpstreamModel: "gpt-5.6-sol", Models: []string{"custom-alias", "gpt-5.4"},
-			ModelMap: map[string]string{"custom-alias": "gpt-6-astra", "gpt-5.4": "gpt-6-astra"},
-		},
 	}
 	for name, cfg := range configs {
 		t.Run(name, func(t *testing.T) {
-			for _, model := range []string{"gpt-6-astra", " gpt-6-astra ", "\tgpt-6-astra\n"} {
+			for _, model := range []string{"gpt-6-astra", " gpt-6-astra ", "\tgpt-6-astra\n", "gpt-5.6-sol", " gpt-5.6-sol ", "\tgpt-5.6-sol\n"} {
 				if !cfg.HandlesModel(model) || !SupportsModel(model, cfg) {
 					t.Fatalf("%q should be served by the plugin", model)
 				}
 			}
 			for _, model := range []string{
-				"gpt-5.4", "gpt-5-codex", "gpt-5.6-sol", "claude-sonnet-4-5",
+				"gpt-5.4", "gpt-5-codex", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-luna", "claude-sonnet-4-5",
 				"gpt-5.6-sol-excel", "gpt-5.6-luna-excel", "gpt-5.6-terra-excel",
 				"gpt-6-astra-excel", "gpt-6-astra-preview", "GPT-6-ASTRA", "gpt-6-Astra",
+				"gpt-5.6-sol-preview", "GPT-5.6-SOL", "gpt-5.6-Sol",
 				"custom-alias", "whatever-model", "", "   ",
 			} {
 				if cfg.HandlesModel(model) || SupportsModel(model, cfg) {
