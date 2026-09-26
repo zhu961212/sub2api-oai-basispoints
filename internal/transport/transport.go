@@ -27,7 +27,9 @@ import (
 
 type Transport struct {
 	pluginv1.UnimplementedTransportPluginServer
-	mu             sync.RWMutex
+	mu sync.RWMutex
+	// cfg and its slices are immutable after publication. New/ApplyConfig
+	// own the storage; readers take a value snapshot under mu.
 	cfg            protocol.Config
 	client         *http.Client
 	closed         bool
@@ -35,6 +37,7 @@ type Transport struct {
 	host           pluginv1.HostServiceClient
 	hostConn       *grpc.ClientConn
 	accounts       accountCache
+	bpsAccounts    bpsAccountState
 	attachments    *attachments.Uploader
 	imageAdmission imageRequestAdmission
 	// proxyClients 按账号代理 URL 复用独立的 Transport。此前每个请求都会
@@ -102,6 +105,7 @@ func (t *Transport) Shutdown() {
 	client, conn := t.client, t.hostConn
 	t.hostConn = nil
 	t.host = nil
+	t.bindBPSAccountStore(nil)
 	t.accounts.invalidate()
 	proxyClients := t.detachProxyClients()
 	t.mu.Unlock()
@@ -261,6 +265,7 @@ func (t *Transport) InitHostServices(ctx context.Context, r *pluginv1.InitHostSe
 	old := t.hostConn
 	t.hostConn = conn
 	t.host = pluginv1.NewHostServiceClient(conn)
+	t.bindBPSAccountStore(t.host)
 	t.accounts.invalidate()
 	t.mu.Unlock()
 	if old != nil {
@@ -275,12 +280,12 @@ func (t *Transport) GetInfo(context.Context, *pluginv1.GetInfoRequest) (*pluginv
 
 func (t *Transport) Health(ctx context.Context, _ *pluginv1.HealthRequest) (*pluginv1.HealthResponse, error) {
 	t.mu.RLock()
-	cfg, closed := t.cfg.Clone(), t.closed
+	cfg, closed := t.cfg, t.closed
 	t.mu.RUnlock()
 	// 账号目录是只读查询：不应用配置、不访问上游，满足 status_json 的无副作用要求。
 	accounts := t.accountDirectory(ctx)
 	healthy, message := !closed, healthMessage(closed)
-	return &pluginv1.HealthResponse{Healthy: healthy, Message: message, StatusJson: healthStatusJSON(cfg, accounts)}, nil
+	return &pluginv1.HealthResponse{Healthy: healthy, Message: message, StatusJson: t.bpsAccountStatusJSON(healthStatusJSON(cfg, accounts), cfg)}, nil
 }
 
 // healthStatusJSON 生成无副作用的只读状态快照：不应用配置、不访问上游。
@@ -472,7 +477,7 @@ func (t *Transport) TestConfig(ctx context.Context, r *pluginv1.TestConfigReques
 	if c.DegradationCheck {
 		started := time.Now()
 		check, checkErr := t.runDegradationCheck(ctx, c)
-		statusJSON := mergeDegradationStatus(healthStatusJSON(c, t.accountDirectory(ctx)), check)
+		statusJSON := mergeDegradationStatus(t.bpsAccountStatusJSON(healthStatusJSON(c, t.accountDirectory(ctx)), c), check)
 		if checkErr != nil {
 			return &pluginv1.TestConfigResponse{
 				Success:    false,
@@ -497,7 +502,7 @@ func (t *Transport) TestConfig(ctx context.Context, r *pluginv1.TestConfigReques
 		Success:    reachable,
 		Message:    detail,
 		LatencyMs:  time.Since(started).Milliseconds(),
-		StatusJson: healthStatusJSON(c, t.accountDirectory(ctx)),
+		StatusJson: t.bpsAccountStatusJSON(healthStatusJSON(c, t.accountDirectory(ctx)), c),
 	}, nil
 }
 
@@ -536,7 +541,7 @@ func probeEndpoint(ctx context.Context, c protocol.Config) (bool, string) {
 
 func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 	t.mu.RLock()
-	cfg, client, host, closed := t.cfg.Clone(), t.client, t.host, t.closed
+	cfg, client, host, closed := t.cfg, t.client, t.host, t.closed
 	uploader := t.attachments
 	t.mu.RUnlock()
 	if closed {
@@ -576,6 +581,17 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	if !protocol.HandlesModel(protocol.RequestedModel(body), cfg) {
 		return t.passthrough(stream, start, body, client, cfg.MaxResponseBytes)
 	}
+	if t.isBPSAccountDisabled(start.GetAccountId(), cfg) {
+		return t.passthrough(stream, start, body, client, cfg.MaxResponseBytes)
+	}
+	if start.GetAccountId() > 0 {
+		if err := t.bpsAccountStoreError(); err != nil {
+			return sendError(stream, "bps_account_state_unavailable", safeError(err), true)
+		}
+	}
+	observeBPSStatus := newBasisPointsStatusObserver(func() {
+		t.disableBPSAccount(stream.Context(), start.GetAccountId())
+	})
 
 	requestHeaders, proxyURL, err := prepareHeaders(stream.Context(), start, host, cfg.AuthMode)
 	if err != nil {
@@ -641,10 +657,14 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		}
 		imagesRewritten, err = uploader.Rewrite(stream.Context(), requestClient, cfg.ResponsesURL, requestHeaders, prepared, relayScope(start))
 		if err != nil {
+			var upstreamStatus interface{ StatusCode() int }
+			if errors.As(err, &upstreamStatus) {
+				observeBPSStatus(upstreamStatus.StatusCode())
+			}
 			if stream.Context().Err() != nil {
 				return stream.Context().Err()
 			}
-			return sendImageRelayError(stream, err)
+			return sendImageRelayError(stream, err, observeBPSStatus)
 		}
 		if validate {
 			if err := protocol.ValidateRequestCapabilities(prepared); err != nil {
@@ -685,8 +705,15 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		return sendError(stream, "upstream_transport", safeTransportError(err), true)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return sendBasisPointsRateLimit(stream)
+	observeBPSStatus(resp.StatusCode)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return sendBasisPointsAccountStatus(stream, resp.StatusCode)
+	}
+	// The host also derives account health from quota headers and errors
+	// inside HTTP 200 streams. Isolate only the BPS response before any
+	// image conversion or optional response transformation can expose it.
+	if err := prepareBasisPointsResponse(resp, cfg.MaxResponseBytes, observeBPSStatus); err != nil {
+		return sendError(stream, errorCode(err), safeError(err), true)
 	}
 	if imagesRewritten && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
 		return sendImageUpstreamError(stream, resp, cfg.MaxResponseBytes)
@@ -703,7 +730,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	// events until the completed response can be translated safely.
 	var repair relayToolRepair
 	if cfg.RewriteTools {
-		repair = newRelayToolRepair(req, requestClient, requestBody, source, cfg.MaxResponseBytes)
+		repair = newRelayToolRepair(req, requestClient, requestBody, source, cfg.MaxResponseBytes, observeBPSStatus)
 	}
 	if wantsStream(source) && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 		return sendTransformedHTTPResponseStreamWithRepair(stream, resp, cfg.MaxResponseBytes, source, 15*time.Second, repair)
@@ -716,7 +743,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		respBody, _ = redactImageFailureJSON(respBody, "")
 	}
 	responseBody, responseContentType, transformErr := transformResponse(respBody, resp.Header, source)
-	if protocol.IsUnknownClientToolError(transformErr) && repair != nil {
+	if protocol.IsRepairableClientToolError(transformErr) && repair != nil {
 		if original, parseErr := protocol.ParseFinalStreamResponse(respBody); parseErr == nil && protocol.ToolRepairEligible(source, original) {
 			_ = resp.Body.Close()
 			var fixed map[string]any
@@ -1081,6 +1108,10 @@ func sendHTTPResponseStream(stream pluginv1.TransportPlugin_ForwardServer, resp 
 			return stream.Send(&pluginv1.ForwardResponse{Frame: &pluginv1.ForwardResponse_End{End: &pluginv1.ForwardResponseEnd{BytesReceived: received}}})
 		}
 		if err != nil {
+			var api *protocol.APIError
+			if errors.As(err, &api) {
+				return sendError(stream, api.Code(), api.Error(), true)
+			}
 			return sendError(stream, "upstream_read", "upstream response could not be read", true)
 		}
 	}
@@ -1162,8 +1193,15 @@ func safeTransportError(err error) string {
 }
 
 func readLimited(r io.Reader, max int) ([]byte, error) {
+	if prepared, ok := r.(*basisPointsBufferedBody); ok {
+		return prepared.readRemaining(max)
+	}
 	data, err := io.ReadAll(io.LimitReader(r, int64(max)+1))
 	if err != nil {
+		var api *protocol.APIError
+		if errors.As(err, &api) {
+			return nil, api
+		}
 		return nil, &protocol.APIError{Status: http.StatusBadGateway, Kind: "upstream_read", Message: safeUpstreamReadError(err)}
 	}
 	if len(data) > max {

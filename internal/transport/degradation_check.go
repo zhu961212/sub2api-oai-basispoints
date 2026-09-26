@@ -83,59 +83,115 @@ func (t *Transport) runDegradationCheckWithBudget(ctx context.Context, c protoco
 		return result, fmt.Errorf("list accounts failed")
 	}
 	accounts := make([]degradationAccount, 0)
+	seen := make(map[int64]int)
 	if accountsResponse != nil {
 		for _, account := range accountsResponse.GetAccounts() {
 			if account == nil || account.GetId() <= 0 {
 				continue
 			}
+			if index, exists := seen[account.GetId()]; exists {
+				// A duplicate row must not probe the same identity twice. If
+				// availability conflicts, honor the host's unavailable verdict.
+				accounts[index].schedulable = accounts[index].schedulable && account.GetSchedulable()
+				continue
+			}
+			seen[account.GetId()] = len(accounts)
 			accounts = append(accounts, degradationAccount{
 				id: account.GetId(), name: account.GetName(), schedulable: account.GetSchedulable(),
 			})
 		}
 		// HostService v1 only populated account_ids. Keep this fallback so the
 		// feature remains useful against an older host; such rows have no name.
-		if len(accounts) == 0 {
+		if len(accountsResponse.GetAccounts()) == 0 {
 			for _, id := range accountsResponse.GetAccountIds() {
-				if id > 0 {
+				if _, exists := seen[id]; id > 0 && !exists {
+					seen[id] = len(accounts)
 					accounts = append(accounts, degradationAccount{id: id, schedulable: true})
 				}
 			}
 		}
 	}
+	if c.DegradationCheckAccountID > 0 {
+		var selected []degradationAccount
+		for _, account := range accounts {
+			if account.id == c.DegradationCheckAccountID {
+				selected = []degradationAccount{account}
+				break
+			}
+		}
+		if len(selected) == 0 {
+			result.Results = []degradationAccountResult{{
+				AccountID: c.DegradationCheckAccountID,
+				Status:    "skipped",
+				Error:     "account is not available for degradation check",
+			}}
+			result.Completed = ctx.Err() == nil
+			return result, ctx.Err()
+		}
+		accounts = selected
+	}
 	if len(accounts) == 0 {
 		return result, fmt.Errorf("no OpenAI OAuth accounts available for degradation check")
 	}
 	result.Results = make([]degradationAccountResult, len(accounts))
-	sem := make(chan struct{}, degradationCheckParallel)
-	var wg sync.WaitGroup
+	workerCount := 0
 	for index, account := range accounts {
 		result.Results[index] = degradationAccountResult{AccountID: account.id, Name: account.name}
+		if t.isBPSAccountDisabled(account.id, c) {
+			accounts[index].schedulable = false
+			result.Results[index].Status = "skipped"
+			result.Results[index].Error = "Basis Points is disabled after HTTP 403; re-enable this account before checking"
+			continue
+		}
 		if !account.schedulable {
 			result.Results[index].Status = "skipped"
 			result.Results[index].Error = "account is not schedulable"
 			continue
 		}
-		wg.Add(1)
-		go func(index int, account degradationAccount) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-scanCtx.Done():
-				result.Results[index].Status = "error"
-				result.Results[index].Error = "degradation check deadline reached or canceled"
-				return
-			}
-			defer func() { <-sem }()
-			checkCtx, cancel := context.WithTimeout(scanCtx, degradationCheckTimeout)
-			defer cancel()
-			status, answer, checkErr := t.checkDegradationAccount(checkCtx, c, host, base, account.id, model)
-			result.Results[index].Status = status
-			result.Results[index].Answer = answer
-			if checkErr != nil {
-				result.Results[index].Error = safeError(checkErr)
-			}
-		}(index, account)
+		// Queued accounts keep a useful result when the scan budget expires.
+		result.Results[index].Status = "error"
+		result.Results[index].Error = "degradation check deadline reached or canceled"
+		if workerCount < degradationCheckParallel {
+			workerCount++
+		}
 	}
+	// Bound goroutines as well as network concurrency: large directories do
+	// not need one blocked goroutine per account while waiting for a slot.
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for worker := 0; worker < workerCount; worker++ {
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				if scanCtx.Err() != nil {
+					return
+				}
+				account := accounts[index]
+				checkCtx, cancel := context.WithTimeout(scanCtx, degradationCheckTimeout)
+				status, answer, checkErr := t.checkDegradationAccount(checkCtx, c, host, base, account.id, model)
+				cancel()
+				result.Results[index].Status = status
+				result.Results[index].Answer = answer
+				result.Results[index].Error = ""
+				if checkErr != nil {
+					result.Results[index].Error = safeError(checkErr)
+				}
+			}
+		}()
+	}
+dispatch:
+	for index, account := range accounts {
+		if !account.schedulable {
+			continue
+		}
+		select {
+		case jobs <- index:
+		case <-scanCtx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
 	wg.Wait()
 	for _, account := range result.Results {
 		if account.Status == "degraded" {
@@ -165,6 +221,16 @@ func degradationModel(c protocol.Config) string {
 }
 
 func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Config, host pluginv1.HostServiceClient, base *http.Client, accountID int64, model string) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "error", "", err
+	}
+	if t.isBPSAccountDisabled(accountID, c) {
+		return "skipped", "", fmt.Errorf("Basis Points is disabled after HTTP 403")
+	}
+	if err := t.bpsAccountStoreError(); err != nil {
+		return "error", "", err
+	}
+	observeBPSStatus := newBasisPointsStatusObserver(func() { t.disableBPSAccount(ctx, accountID) })
 	start := &pluginv1.ForwardRequestStart{AccountId: accountID}
 	headers, proxyURL, err := prepareHeaders(ctx, start, host, c.AuthMode)
 	if err != nil {
@@ -201,8 +267,12 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 		return "error", "", degradationReadError(ctx, err)
 	}
 	defer resp.Body.Close()
+	observeBPSStatus(resp.StatusCode)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "error", "", fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
+	}
+	if err := prepareBasisPointsResponse(resp, c.MaxResponseBytes, observeBPSStatus); err != nil {
+		return "error", "", err
 	}
 	responseBody, contentType, err := readDegradationResponse(ctx, resp.Body, resp.Header.Get("Content-Type"), c.MaxResponseBytes)
 	if err != nil {

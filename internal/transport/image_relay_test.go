@@ -292,6 +292,7 @@ func TestImageRelayUploadFailureStopsConversation(t *testing.T) {
 		want   int
 	}{
 		{"authentication", http.StatusUnauthorized, "PRIVATE_AUTH_BODY file-private-token", http.StatusUnauthorized},
+		{"permission", http.StatusForbidden, "PRIVATE_PERMISSION_BODY file-private-token", http.StatusForbidden},
 		{"rate_limit", http.StatusTooManyRequests, "PRIVATE_LIMIT_BODY", http.StatusTooManyRequests},
 		{"upstream_failure", http.StatusServiceUnavailable, "PRIVATE_UPSTREAM_BODY", http.StatusServiceUnavailable},
 		{"missing_file_id", http.StatusOK, string(protocol.JSONBytes(map[string]any{"secret": "PRIVATE_RESPONSE"})), http.StatusBadGateway},
@@ -318,6 +319,16 @@ func TestImageRelayUploadFailureStopsConversation(t *testing.T) {
 				assertBasisPointsRateLimit(t, result)
 				if uploads.Load() != 1 || conversations.Load() != 0 {
 					t.Fatalf("upload rate limit was retried: uploads=%d conversations=%d", uploads.Load(), conversations.Load())
+				}
+				return
+			}
+			if tt.status == http.StatusUnauthorized || tt.status == http.StatusForbidden {
+				if result.status != 0 || len(result.body) != 0 || result.errFrame == nil || result.errFrame.GetCode() != "PLUGIN_UPSTREAM_REJECTED" || !result.errFrame.GetRequestSent() || result.ended {
+					t.Fatalf("BPS upload rejection must not become host account authentication failure: %+v", result)
+				}
+				message := result.errFrame.GetMessage()
+				if message != basisPointsAccountStatusMessage(tt.status) || strings.Contains(message, "PRIVATE") || uploads.Load() != 1 || conversations.Load() != 0 {
+					t.Fatalf("unsafe or replayed upload rejection: message=%q uploads=%d conversations=%d", message, uploads.Load(), conversations.Load())
 				}
 				return
 			}

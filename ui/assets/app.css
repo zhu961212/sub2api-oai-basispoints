@@ -202,6 +202,93 @@ select:focus {
   opacity: 0.55;
 }
 
+.account-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 84px 84px;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.account-row:last-child {
+  border-bottom: 0;
+}
+
+.account-identity {
+  min-width: 0;
+  align-items: center;
+}
+
+.account-copy {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.account-name {
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
+
+.account-availability {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.account-availability.bps-disabled {
+  color: var(--warn-text);
+}
+
+.account-check-result {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.account-check-result.result-ok {
+  color: var(--ok-text);
+}
+
+.account-check-result.result-degraded {
+  color: var(--err-text);
+}
+
+.account-check-result.result-error,
+.account-check-result.result-skipped {
+  color: var(--warn-text);
+}
+
+button.account-check-button {
+  width: 84px;
+  min-height: 32px;
+  padding: 4px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+@media (max-width: 420px) {
+  .account-row {
+    grid-template-columns: minmax(0, 1fr) 84px;
+    column-gap: 12px;
+    row-gap: 2px;
+  }
+
+  .account-check-result {
+    grid-column: 1;
+    padding-left: 21px;
+    text-align: left;
+  }
+
+  .account-check-button {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+}
+
 .muted {
   color: var(--muted);
 }

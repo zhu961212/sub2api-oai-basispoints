@@ -69,10 +69,10 @@ func TestDegradationAnswerRejectsUnfinishedOrEmptyReplies(t *testing.T) {
 
 func TestDegradationCheckNeverClassifiesHTTPFailures(t *testing.T) {
 	host := &degradationTestHost{fakeHost: &fakeHost{token: token(t, "test-account")}}
-	transport := New()
-	defer transport.Shutdown()
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			transport := New()
+			defer transport.Shutdown()
 			client := &http.Client{Transport: degradationRoundTripper(func(*http.Request) (*http.Response, error) {
 				body := protocol.JSONBytes(map[string]any{"output_text": "苹果16"})
 				return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body)))}, nil
@@ -80,6 +80,38 @@ func TestDegradationCheckNeverClassifiesHTTPFailures(t *testing.T) {
 			verdict, answer, err := transport.checkDegradationAccount(context.Background(), protocol.DefaultConfig(), host, client, 1, protocol.DefaultModelID)
 			if verdict != "error" || answer != "" || err == nil {
 				t.Fatalf("HTTP failure classified: status=%s answer=%q err=%v", verdict, answer, err)
+			}
+			if blocked := transport.isBPSAccountDisabled(1, protocol.DefaultConfig()); blocked != (status == http.StatusForbidden) {
+				t.Fatalf("HTTP %d disabled BPS=%t", status, blocked)
+			}
+		})
+	}
+}
+
+func TestDegradationForbiddenSignalDisablesFutureChecks(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint(stream), func(t *testing.T) {
+			transport := New()
+			defer transport.Shutdown()
+			host := &degradationTestHost{fakeHost: &fakeHost{token: token(t, "test-account")}}
+			calls := 0
+			client := &http.Client{Transport: degradationRoundTripper(func(*http.Request) (*http.Response, error) {
+				calls++
+				object := map[string]any{"error": map[string]any{"status_code": 403, "code": "arbitrary_code"}}
+				body, contentType := string(protocol.JSONBytes(object)), "application/json"
+				if stream {
+					body = "event: error\ndata: " + body + "\n\n"
+					contentType = "text/event-stream"
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {contentType}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}
+			verdict, _, err := transport.checkDegradationAccount(context.Background(), protocol.DefaultConfig(), host, client, 1, protocol.DefaultModelID)
+			if verdict != "error" || err == nil || !transport.isBPSAccountDisabled(1, protocol.DefaultConfig()) {
+				t.Fatalf("first forbidden response: verdict=%s err=%v", verdict, err)
+			}
+			verdict, _, err = transport.checkDegradationAccount(context.Background(), protocol.DefaultConfig(), host, client, 1, protocol.DefaultModelID)
+			if verdict != "skipped" || err == nil || calls != 1 {
+				t.Fatalf("disabled account was probed again: verdict=%s calls=%d err=%v", verdict, calls, err)
 			}
 		})
 	}

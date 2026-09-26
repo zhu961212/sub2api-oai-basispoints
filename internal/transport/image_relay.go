@@ -37,7 +37,7 @@ func relayScope(start *pluginv1.ForwardRequestStart) string {
 	return fmt.Sprintf("account:%d/session:%s", start.GetAccountId(), scope)
 }
 
-func sendImageRelayError(stream pluginv1.TransportPlugin_ForwardServer, err error) error {
+func sendImageRelayError(stream pluginv1.TransportPlugin_ForwardServer, err error, observers ...func(int)) error {
 	status, code, kind := http.StatusBadRequest, "invalid_image", "invalid_request_error"
 	var api interface {
 		error
@@ -50,8 +50,9 @@ func sendImageRelayError(stream pluginv1.TransportPlugin_ForwardServer, err erro
 			kind = "server_error"
 		}
 	}
-	if status == http.StatusTooManyRequests {
-		return sendBasisPointsRateLimit(stream)
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusTooManyRequests {
+		reportBasisPointsStatus(status, observers)
+		return sendBasisPointsAccountStatus(stream, status)
 	}
 	headers := make(http.Header)
 	if status == http.StatusServiceUnavailable {

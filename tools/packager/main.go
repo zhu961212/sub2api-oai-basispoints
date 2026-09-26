@@ -175,8 +175,7 @@ func readManifest(sourcePath string) (*Manifest, error) {
 		return nil, fmt.Errorf("读取清单源文件: %w", err)
 	}
 	var manifest Manifest
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
-	if err := decoder.Decode(&manifest); err != nil {
+	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil, fmt.Errorf("解析清单源文件: %w", err)
 	}
 	if manifest.Runtimes == nil {
@@ -247,6 +246,7 @@ func buildRuntime(distDir, packagePath string, item target) error {
 
 func fillHashes(distDir, uiSource string, manifest *Manifest, targets []target) error {
 	files := map[string]string{}
+	manifest.Runtimes = make(map[string]RuntimeEntry, len(targets))
 	for _, item := range targets {
 		path := item.binaryPath()
 		hash, err := hashFile(filepath.Join(distDir, filepath.FromSlash(path)))
@@ -282,6 +282,9 @@ func collectUIFiles(root string) (map[string]string, error) {
 		}
 		if entry.IsDir() {
 			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("UI entry must be a regular file: %s", path)
 		}
 		relative, err := filepath.Rel(root, path)
 		if err != nil {
@@ -341,6 +344,10 @@ func signManifest(manifestBytes []byte, keyPath, keyID string) ([]byte, error) {
 }
 
 func writePackage(outputPath, distDir, uiSource string, manifestBytes, signatureBytes []byte) error {
+	members, err := listArchiveMembers(distDir, uiSource, manifestBytes)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
 		return fmt.Errorf("创建输出目录: %w", err)
 	}
@@ -360,7 +367,7 @@ func writePackage(outputPath, distDir, uiSource string, manifestBytes, signature
 		}
 	}
 	now := time.Now()
-	for _, member := range listArchiveMembers(distDir, uiSource) {
+	for _, member := range members {
 		mode := os.FileMode(0o644)
 		if strings.HasPrefix(member.archivePath, runtimesDir+"/") {
 			mode = 0o755
@@ -384,36 +391,33 @@ type archiveMember struct {
 	diskPath    string
 }
 
-// listArchiveMembers 列出要打进包的成员：runtimes/ 取自构建产物目录，ui/ 取自 UI 源目录。
-func listArchiveMembers(distDir, uiSource string) []archiveMember {
-	members := []archiveMember{}
-	roots := []struct {
-		prefix string
-		root   string
-	}{
-		{runtimesDir, filepath.Join(distDir, runtimesDir)},
-		{uiDir, uiSource},
+// Archive exactly the hashed manifest members. Reused build directories may
+// contain other architectures or stale files that must not enter a release.
+func listArchiveMembers(distDir, uiSource string, manifestBytes []byte) ([]archiveMember, error) {
+	var manifest Manifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return nil, fmt.Errorf("read package member list: %w", err)
 	}
-	for _, item := range roots {
-		_ = filepath.WalkDir(item.root, func(path string, entry fs.DirEntry, walkErr error) error {
-			if walkErr != nil || entry == nil || entry.IsDir() {
-				return nil
-			}
-			relative, err := filepath.Rel(item.root, path)
-			if err != nil {
-				return nil
-			}
-			members = append(members, archiveMember{
-				archivePath: item.prefix + "/" + filepath.ToSlash(relative),
-				diskPath:    path,
-			})
-			return nil
-		})
+	members := make([]archiveMember, 0, len(manifest.Files))
+	for name := range manifest.Files {
+		if !fs.ValidPath(name) || strings.Contains(name, ":") || strings.ContainsRune(name, 92) {
+			return nil, fmt.Errorf("invalid package member: %q", name)
+		}
+		var diskPath string
+		switch {
+		case strings.HasPrefix(name, runtimesDir+"/"):
+			diskPath = filepath.Join(distDir, filepath.FromSlash(name))
+		case strings.HasPrefix(name, uiDir+"/"):
+			diskPath = filepath.Join(uiSource, filepath.FromSlash(strings.TrimPrefix(name, uiDir+"/")))
+		default:
+			return nil, fmt.Errorf("unexpected package member: %q", name)
+		}
+		members = append(members, archiveMember{archivePath: name, diskPath: diskPath})
 	}
 	sort.Slice(members, func(left, right int) bool {
 		return members[left].archivePath < members[right].archivePath
 	})
-	return members
+	return members, nil
 }
 
 func addZipEntry(archive *zip.Writer, name string, contents []byte, mode os.FileMode) error {
@@ -443,6 +447,9 @@ func verifyPackage(outputPath string, manifestBytes []byte) error {
 
 	entries := map[string]*zip.File{}
 	for _, file := range reader.File {
+		if _, exists := entries[file.Name]; exists {
+			return fmt.Errorf("duplicate package member: %s", file.Name)
+		}
 		entries[file.Name] = file
 	}
 	storedManifest, err := readZipEntry(entries[manifestFile])
@@ -455,6 +462,11 @@ func verifyPackage(outputPath string, manifestBytes []byte) error {
 	var manifest Manifest
 	if err := json.Unmarshal(storedManifest, &manifest); err != nil {
 		return fmt.Errorf("自检解析清单: %w", err)
+	}
+	for name := range entries {
+		if _, declared := manifest.Files[name]; !declared && name != manifestFile && name != signatureFile {
+			return fmt.Errorf("undeclared package member: %s", name)
+		}
 	}
 	for path, expected := range manifest.Files {
 		file := entries[path]

@@ -314,13 +314,7 @@ func stripClientMetadata(item map[string]any) map[string]any {
 }
 
 func cloneObject(object map[string]any) map[string]any {
-	if object == nil {
-		return nil
-	}
-	raw, _ := json.Marshal(object)
-	var copy map[string]any
-	_ = json.Unmarshal(raw, &copy)
-	return copy
+	return objectValue(cloneJSONValue(object))
 }
 
 func nativeCacheKey(namespace, callID string) string {
@@ -852,7 +846,9 @@ func parseArguments(value any) map[string]any {
 	if !ok || strings.TrimSpace(text) == "" {
 		return nil
 	}
-	value, _, valid := recoveryJSONValue(text, true)
+	// Function payload strings have the same ambiguity rules as the outer
+	// relay. Do not silently choose the last duplicate argument key.
+	value, _, valid := relayJSONValue(text, true)
 	if !valid {
 		return nil
 	}
@@ -863,7 +859,7 @@ func transportEnvelope(native map[string]any) map[string]any {
 	if stringValue(native["type"]) != "function_call" || !isTransportName(stringValue(native["name"])) {
 		return nil
 	}
-	arguments := parseArguments(native["arguments"])
+	arguments := parseTransportArguments(native["arguments"])
 	if arguments == nil {
 		return nil
 	}
@@ -873,7 +869,7 @@ func transportEnvelope(native map[string]any) map[string]any {
 		if !ok {
 			return nil
 		}
-		nestedArguments := parseArguments(payload)
+		nestedArguments := parseTransportArguments(payload)
 		if nestedArguments == nil {
 			return nil
 		}
@@ -1151,13 +1147,13 @@ func decodeNativeClientToolCallFromItem(native, source map[string]any, remember 
 	allowedName := clientToolKey(native)
 	inner := transportEnvelope(native)
 	if isTransportName(allowedName) && inner == nil {
-		return nil, "Basis Points returned a malformed or ambiguous client tool relay envelope"
+		return nil, malformedClientToolMessage
 	}
 	if inner != nil {
 		allowedName = recoveryEnvelopeName(inner)
 	}
 	if allowedName == "" || isTransportName(allowedName) {
-		return nil, "Basis Points returned a malformed or ambiguous client tool relay envelope"
+		return nil, malformedClientToolMessage
 	}
 	spec, exists := resolveClientTool(specs, allowedName)
 	if !exists {

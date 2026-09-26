@@ -32,6 +32,7 @@
     "account_ids",
     "auto_select_new_accounts",
     "excluded_account_ids",
+    "bps_reenabled_accounts",
     "max_response_bytes",
     "auth_mode",
     "tools_version_id",
@@ -44,10 +45,12 @@
   var bridge = bridgeFactory.create({});
   var loaded = {};
   var selectedIDs = [];
+  var selectedIDSet = new Set();
   var excludedIDs = [];
   var autoSelectNewAccounts = false;
   var accountDirectoryReady = false;
   var knownAccountIDs = [];
+  var knownAccountIDSet = new Set();
   var statusRequestID = 0;
   var statusAppliedID = 0;
   var selectedModels = DEFAULT_MODELS.slice();
@@ -58,21 +61,35 @@
   var configReady = false;
   var loading = false;
   var degradationChecking = false;
+  var checkingAccountID = 0;
+  var accountChecks = Object.create(null);
+  var accountCheckButtons = [];
+  var renderedAccountSignature = null;
+  var renderedDegradationSignature = null;
+  var disposed = false;
+  var resizeObserver = null;
+  var lastResizeHeight = null;
+  var statusInFlight = null;
+  var bpsDisabledAccounts = new Map();
+  var pendingBpsReenabled = new Map();
 
   function id(name) {
     return document.getElementById(name);
   }
 
   function scheduleResize() {
-    if (resizeScheduled) {
+    if (resizeScheduled || disposed) {
       return;
     }
     resizeScheduled = true;
     global.requestAnimationFrame(function () {
       resizeScheduled = false;
-      bridge.resize(
-        Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
-      );
+      if (disposed) return;
+      var height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+      if (height !== lastResizeHeight) {
+        lastResizeHeight = height;
+        bridge.resize(height);
+      }
     });
   }
 
@@ -99,6 +116,10 @@
     if (degradationButton) {
       degradationButton.disabled = locked || !accounts.some(isSelectableAccount);
     }
+    accountCheckButtons.forEach(function (entry) {
+      entry.button.disabled = locked || !entry.account.schedulable;
+      entry.button.textContent = checkingAccountID === entry.account.id ? "检测中…" : "降智检测";
+    });
     updateAccountActions();
   }
 
@@ -108,7 +129,97 @@
       parts.push(account.name);
     }
     parts.push(account.schedulable ? "可用" : (account.status || "暂停"));
+    if (bpsDisabledAccounts.has(account.id)) parts.push(bpsAvailabilityLabel(account));
     return parts.join(" · ");
+  }
+
+  function hasPendingBpsRestore(accountID) {
+    var blockID = bpsDisabledAccounts.get(accountID);
+    return !!blockID && pendingBpsReenabled.get(accountID) === blockID;
+  }
+
+  function bpsAvailabilityLabel(account) {
+    if (hasPendingBpsRestore(account.id)) return "BPS 待恢复（保存生效）";
+    if (bpsDisabledAccounts.has(account.id)) return "BPS 已禁用（HTTP 403）";
+    return account.schedulable ? "可用" : (account.status || "暂停");
+  }
+
+  function validBpsBlockID(value) {
+    return typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+  }
+
+  function configBpsAcknowledgements(config) {
+    var source = config.bps_reenabled_accounts;
+    var acknowledgements = {};
+    if (!source || typeof source !== "object" || Array.isArray(source)) return acknowledgements;
+    Object.keys(source).forEach(function (key) {
+      var accountID = Number(key);
+      if (Number.isSafeInteger(accountID) && accountID > 0 && validBpsBlockID(source[key])) {
+        acknowledgements[String(accountID)] = source[key];
+      }
+    });
+    return acknowledgements;
+  }
+
+  function applyBpsDisabledSelection() {
+    if (!bpsDisabledAccounts.size) return;
+    var excluded = new Set(excludedIDs);
+    var blocked = new Set();
+    bpsDisabledAccounts.forEach(function (_blockID, accountID) {
+      if (!hasPendingBpsRestore(accountID)) {
+        excluded.add(accountID);
+        blocked.add(accountID);
+      }
+    });
+    selectedIDs = selectedIDs.filter(function (accountID) { return !blocked.has(accountID); });
+    selectedIDSet = new Set(selectedIDs);
+    excludedIDs = Array.from(excluded);
+  }
+
+  function updateBpsDisabledAccounts(details) {
+    if (!Array.isArray(details.bps_disabled_accounts) && !Array.isArray(details.bps_disabled_account_ids)) return;
+    var next = new Map();
+    configAccountIDs(details, "bps_disabled_account_ids").forEach(function (accountID) { next.set(accountID, ""); });
+    (Array.isArray(details.bps_disabled_accounts) ? details.bps_disabled_accounts : []).forEach(function (entry) {
+      if (!entry || !Number.isSafeInteger(entry.account_id) || entry.account_id <= 0) return;
+      next.set(entry.account_id, validBpsBlockID(entry.block_id) ? entry.block_id : "");
+    });
+    pendingBpsReenabled.forEach(function (blockID, accountID) {
+      if (next.get(accountID) !== blockID) pendingBpsReenabled.delete(accountID);
+    });
+    bpsDisabledAccounts = next;
+    applyBpsDisabledSelection();
+  }
+
+  // Status reads never write configuration. Only a deliberate ordinary save
+  // acknowledges the exact 403 version the user chose to restore.
+  function mergeBpsAccountPolicy(config, includePendingRestores) {
+    var result = Object.assign({}, config);
+    var excluded = new Set(configAccountIDs(config, "excluded_account_ids"));
+    var acknowledgements = configBpsAcknowledgements(config);
+    var blocked = new Set();
+    bpsDisabledAccounts.forEach(function (blockID, accountID) {
+      if (includePendingRestores && hasPendingBpsRestore(accountID) && isSelected(accountID)) {
+        acknowledgements[String(accountID)] = blockID;
+        excluded.delete(accountID);
+      } else {
+        excluded.add(accountID);
+        blocked.add(accountID);
+      }
+    });
+    result.account_ids = configAccountIDs(config).filter(function (accountID) { return !blocked.has(accountID); });
+    // With no usable directory, preserve a legacy whitelist's boundary. An
+    // empty legacy list would unintentionally allow every other host account.
+    if (result.auto_select_new_accounts !== true && !accountDirectoryReady && result.account_ids.length === 0) {
+      result.account_ids = configAccountIDs(loaded).filter(function (accountID) { return blocked.has(accountID); });
+    }
+    if (excluded.size || Object.prototype.hasOwnProperty.call(config, "excluded_account_ids")) {
+      result.excluded_account_ids = Array.from(excluded);
+    }
+    if (Object.keys(acknowledgements).length || Object.prototype.hasOwnProperty.call(config, "bps_reenabled_accounts")) {
+      result.bps_reenabled_accounts = acknowledgements;
+    }
+    return result;
   }
 
   function degradationStatusLabel(status) {
@@ -117,6 +228,7 @@
       case "degraded": return "疑似降智";
       case "skipped": return "跳过";
       case "error": return "检测失败";
+      case "running": return "检测中…";
       default: return status || "未知";
     }
   }
@@ -124,15 +236,44 @@
   function confirmedDegradedIDs(check) {
     var results = Array.isArray(check.results) ? check.results : [];
     var ids = Array.isArray(check.degraded_account_ids) ? check.degraded_account_ids : [];
-    return ids.filter(function (value, index, values) {
-      return Number.isSafeInteger(value) && value > 0 && values.indexOf(value) === index &&
-        results.some(function (result) {
-          return result && result.account_id === value && result.status === "degraded" &&
-            typeof result.answer === "string" && result.answer.trim() !== "";
-        }) && !results.some(function (result) {
-          return result && result.account_id === value && result.status !== "degraded";
-        });
+    var confirmed = new Set();
+    var conflicting = new Set();
+    var seen = new Set();
+    results.forEach(function (result) {
+      if (!result) return;
+      if (result.status !== "degraded") conflicting.add(result.account_id);
+      else if (typeof result.answer === "string" && result.answer.trim() !== "") confirmed.add(result.account_id);
     });
+    return ids.filter(function (value) {
+      if (!Number.isSafeInteger(value) || value <= 0 || seen.has(value)) return false;
+      seen.add(value);
+      return confirmed.has(value) && !conflicting.has(value);
+    });
+  }
+
+  function accountDisplayName(account) {
+    return Array.from(String(account.name || account.id)).slice(0, 6).join("");
+  }
+
+  function rememberAccountChecks(check) {
+    (Array.isArray(check.results) ? check.results : []).forEach(function (result) {
+      if (!result || !Number.isSafeInteger(result.account_id) || result.account_id <= 0) return;
+      var status = result.status;
+      var detail = result.answer || result.error || "";
+      if (["ok", "degraded", "error", "skipped"].indexOf(status) < 0 ||
+          ((status === "ok" || status === "degraded") &&
+           (typeof result.answer !== "string" || !result.answer.trim()))) {
+        status = "error";
+        detail = "未获得有效检测回答";
+      }
+      accountChecks[result.account_id] = { status: status, detail: String(detail).slice(0, 160) };
+    });
+  }
+
+  function clearDegradationTrigger(config) {
+    var clean = Object.assign({}, config, { degradation_check: false });
+    delete clean.degradation_check_account_id;
+    return clean;
   }
 
   function answeredDegradationCount(check) {
@@ -147,6 +288,11 @@
     if (!container) {
       return;
     }
+    var signature = JSON.stringify([check, (check && Array.isArray(check.results) ? check.results : []).map(function (result) {
+      return result && accountChecks[result.account_id];
+    })]);
+    if (signature === renderedDegradationSignature) return;
+    renderedDegradationSignature = signature;
     container.textContent = "";
     if (!check || typeof check !== "object") {
       return;
@@ -171,11 +317,12 @@
         return;
       }
       var line = document.createElement("span");
-      var status = String(result.status || "");
+      var remembered = accountChecks[result.account_id];
+      var status = String(remembered ? remembered.status : result.status || "");
       line.className = status === "degraded" ? "result-degraded" :
         (status === "ok" ? "result-ok" : "result-error");
-      var accountID = Number.isSafeInteger(result.account_id) ? "#" + result.account_id : "账号";
-      var detail = result.answer || result.error || "";
+      var accountID = Number.isSafeInteger(result.account_id) ? "#" + String(result.account_id).slice(0, 6) : "账号";
+      var detail = remembered ? remembered.detail : result.answer || result.error || "";
       line.textContent = accountID + " · " + degradationStatusLabel(status) +
         (detail ? " · " + String(detail).slice(0, 160) : "");
       container.appendChild(line);
@@ -193,6 +340,10 @@
       }
     }
     var check = snapshot.degradation_check;
+    // TestConfig returns a fresh runtime snapshot. A poll issued before this
+    // result must not erase a newly observed 403 while cleanup is saving.
+    statusAppliedID = ++statusRequestID;
+    updateBpsDisabledAccounts(snapshot);
     if (!check || typeof check !== "object" || Array.isArray(check)) {
       throw new Error("宿主未返回降智检测结果，请确认插件已更新");
     }
@@ -200,7 +351,7 @@
   }
 
   function isSelected(accountID) {
-    return selectedIDs.indexOf(accountID) >= 0;
+    return selectedIDSet.has(accountID);
   }
 
   function isSelectableAccount(account) {
@@ -208,17 +359,31 @@
   }
 
   function setAccountSelected(accountID, selected) {
+    if (selected && bpsDisabledAccounts.has(accountID)) {
+      var blockID = bpsDisabledAccounts.get(accountID);
+      if (!blockID) return;
+      pendingBpsReenabled.set(accountID, blockID);
+    } else {
+      pendingBpsReenabled.delete(accountID);
+    }
     selectedIDs = selectedIDs.filter(function (value) { return value !== accountID; });
     excludedIDs = excludedIDs.filter(function (value) { return value !== accountID; });
     if (selected) selectedIDs.push(accountID);
     else excludedIDs.push(accountID);
+    selectedIDSet = new Set(selectedIDs);
   }
 
   function syncAutomaticAccounts() {
+    applyBpsDisabledSelection();
     if (!autoSelectNewAccounts) return;
-    selectedIDs = selectedIDs.filter(function (value) { return excludedIDs.indexOf(value) < 0; });
+    var excluded = new Set(excludedIDs);
+    selectedIDs = selectedIDs.filter(function (value) { return !excluded.has(value); });
+    selectedIDSet = new Set(selectedIDs);
     accounts.forEach(function (account) {
-      if (excludedIDs.indexOf(account.id) < 0 && !isSelected(account.id)) selectedIDs.push(account.id);
+      if (!excluded.has(account.id) && !isSelected(account.id)) {
+        selectedIDs.push(account.id);
+        selectedIDSet.add(account.id);
+      }
     });
   }
 
@@ -231,7 +396,8 @@
 
   function updateAccountActions() {
     var hasUnselectedAccount = accounts.some(function (account) {
-      return isSelectableAccount(account) && !isSelected(account.id);
+      return isSelectableAccount(account) && !isSelected(account.id) &&
+        (!bpsDisabledAccounts.has(account.id) || !!bpsDisabledAccounts.get(account.id));
     });
     id("select-all-button").disabled = !configReady || saving || loading || !hasUnselectedAccount;
   }
@@ -241,20 +407,39 @@
       return;
     }
     // 只补选当前列表中的账号；保留已保存但暂未出现在状态列表里的账号。
+    var visibleIDs = new Set();
     accounts.forEach(function (account) {
+      if (bpsDisabledAccounts.has(account.id) && !bpsDisabledAccounts.get(account.id)) return;
+      if (isSelectableAccount(account)) visibleIDs.add(account.id);
       if (isSelectableAccount(account) && !isSelected(account.id)) {
-        setAccountSelected(account.id, true);
+        if (bpsDisabledAccounts.has(account.id)) pendingBpsReenabled.set(account.id, bpsDisabledAccounts.get(account.id));
+        selectedIDs.push(account.id);
+        selectedIDSet.add(account.id);
       }
     });
+    excludedIDs = excludedIDs.filter(function (accountID) { return !visibleIDs.has(accountID); });
     renderAccountList();
     renderAccountHint();
     scheduleResize();
   }
 
+  function accountListSignature() {
+    return JSON.stringify(accounts.map(function (account) {
+      var check = accountChecks[account.id];
+      return [account.id, account.name || "", !!account.schedulable, account.status || "",
+        isSelected(account.id), check ? check.status : "", check ? check.detail : "",
+        bpsDisabledAccounts.get(account.id), hasPendingBpsRestore(account.id)];
+    }));
+  }
+
   function renderAccountList() {
+    updateAccountActions();
+    var signature = accountListSignature();
+    if (signature === renderedAccountSignature) return;
+    renderedAccountSignature = signature;
     var list = id("account-list");
     list.textContent = "";
-    updateAccountActions();
+    accountCheckButtons = [];
 
     if (!accounts.length) {
       var empty = document.createElement("p");
@@ -268,12 +453,16 @@
       if (!isSelectableAccount(account)) {
         return;
       }
+      var row = document.createElement("div");
+      row.className = "account-row";
       var label = document.createElement("label");
-      label.className = "check";
+      label.className = "check account-identity";
+      label.title = statusLabel(account);
       var box = document.createElement("input");
       box.type = "checkbox";
       box.value = String(account.id);
       box.checked = isSelected(account.id);
+      box.disabled = bpsDisabledAccounts.has(account.id) && !bpsDisabledAccounts.get(account.id);
       box.addEventListener("change", function () {
         if (!configReady || saving || loading) {
           box.checked = isSelected(account.id);
@@ -281,13 +470,44 @@
         }
         var value = Number.parseInt(box.value, 10);
         setAccountSelected(value, box.checked);
+        if (bpsDisabledAccounts.has(value)) renderAccountList();
+        else renderedAccountSignature = accountListSignature();
         renderAccountHint();
       });
+      var copy = document.createElement("span");
+      copy.className = "account-copy";
       var text = document.createElement("span");
-      text.textContent = statusLabel(account);
+      text.className = "account-name";
+      text.textContent = accountDisplayName(account);
+      text.title = String(account.name || account.id);
+      var availability = document.createElement("span");
+      availability.className = "account-availability" + (bpsDisabledAccounts.has(account.id) ? " bps-disabled" : "");
+      availability.textContent = bpsAvailabilityLabel(account);
+      if (bpsDisabledAccounts.has(account.id)) availability.title = "仅停用此账号的 BPS 转发，宿主账号保留。重新勾选并保存可尝试恢复；再次收到一次 BPS 403 会重新停用。";
+      copy.appendChild(text);
+      copy.appendChild(availability);
       label.appendChild(box);
-      label.appendChild(text);
-      list.appendChild(label);
+      label.appendChild(copy);
+      row.appendChild(label);
+      var result = document.createElement("span");
+      var check = accountChecks[account.id];
+      result.className = "account-check-result" + (check ? " result-" + check.status : "");
+      result.textContent = check ? degradationStatusLabel(check.status) : "未检测";
+      result.title = check ? check.detail || "" : "";
+      result.setAttribute("role", "status");
+      row.appendChild(result);
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost account-check-button";
+      button.value = String(account.id);
+      button.textContent = checkingAccountID === account.id ? "检测中…" : "降智检测";
+      button.disabled = !configReady || saving || loading || degradationChecking || !account.schedulable;
+      button.title = account.schedulable ? "检测账号 #" + account.id + "：" + String(account.name || account.id) : "账号不可调度，暂不能检测";
+      button.setAttribute("aria-label", "检测账号 #" + account.id + "：" + String(account.name || account.id));
+      button.addEventListener("click", function (event) { handleDegradationCheck(event, account.id); });
+      accountCheckButtons.push({ account: account, button: button });
+      row.appendChild(button);
+      list.appendChild(row);
     });
   }
 
@@ -302,6 +522,9 @@
         : (!autoSelectNewAccounts && !accountDirectoryReady
           ? "尚未成功获取账号目录，暂时保留旧白名单；获取目录后保存一次即可启用新增账号自动使用 BPS。"
           : "请保存一次以启用新增账号自动使用 BPS，之后无需再次打开配置页。"));
+    if (bpsDisabledAccounts.size) {
+      hint.textContent += " " + bpsDisabledAccounts.size + " 个账号因一次 BPS HTTP 403 已停用 BPS，宿主账号仍保留；重新勾选并保存可恢复。";
+    }
   }
 
   function renderModelHint() {
@@ -340,7 +563,7 @@
     renderModelHint();
   }
 
-  function readForm() {
+  function readForm(includePendingRestores) {
     var config = {};
     CONFIG_KEYS.forEach(function (key) {
       // null/undefined 代表缺省值。
@@ -354,11 +577,12 @@
       config.auto_select_new_accounts = true;
       config.excluded_account_ids = excludedIDs.slice();
       if (!autoSelectNewAccounts) {
+        var exclusions = new Set(config.excluded_account_ids);
         knownAccountIDs.forEach(function (accountID) {
-          var at = config.excluded_account_ids.indexOf(accountID);
-          if (isSelected(accountID) && at >= 0) config.excluded_account_ids.splice(at, 1);
-          if (!isSelected(accountID) && at < 0) config.excluded_account_ids.push(accountID);
+          if (isSelected(accountID)) exclusions.delete(accountID);
+          else exclusions.add(accountID);
         });
+        config.excluded_account_ids = Array.from(exclusions);
       }
     }
     config.enabled_models = MODEL_IDS.filter(function (model) {
@@ -369,17 +593,20 @@
     if (Object.prototype.hasOwnProperty.call(loaded, "degradation_check")) {
       config.degradation_check = false;
     }
-    return config;
+    delete config.degradation_check_account_id;
+    return mergeBpsAccountPolicy(config, includePendingRestores === true);
   }
 
   function configAccountIDs(config, key) {
     var ids = Array.isArray(config[key || "account_ids"]) ? config[key || "account_ids"] : [];
     var normalized = [];
+    var seen = new Set();
     ids.forEach(function (value) {
       if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
         return;
       }
-      if (normalized.indexOf(value) < 0) {
+      if (!seen.has(value)) {
+        seen.add(value);
         normalized.push(value);
       }
     });
@@ -388,8 +615,9 @@
 
   function sameAccountIDs(config, expected) {
     var actual = configAccountIDs(config);
+    var actualSet = new Set(actual);
     return actual.length === expected.length && expected.every(function (value) {
-      return actual.indexOf(value) >= 0;
+      return actualSet.has(value);
     });
   }
 
@@ -414,14 +642,32 @@
     if ((config.auto_select_new_accounts === true) !== (expected.auto_select_new_accounts === true)) return false;
     var actual = configAccountIDs(config, "excluded_account_ids");
     var excluded = configAccountIDs(expected, "excluded_account_ids");
-    return actual.length === excluded.length && excluded.every(function (value) { return actual.indexOf(value) >= 0; });
+    var actualSet = new Set(actual);
+    if (actual.length !== excluded.length || !excluded.every(function (value) { return actualSet.has(value); })) return false;
+    var actualAcks = configBpsAcknowledgements(config);
+    var expectedAcks = configBpsAcknowledgements(expected);
+    var keys = Object.keys(expectedAcks);
+    return Object.keys(actualAcks).length === keys.length && keys.every(function (key) { return actualAcks[key] === expectedAcks[key]; });
   }
 
   function applyConfig(config) {
     loaded = config && typeof config === "object" && !Array.isArray(config) ? Object.assign({}, config) : {};
     selectedIDs = configAccountIDs(loaded);
+    selectedIDSet = new Set(selectedIDs);
     excludedIDs = configAccountIDs(loaded, "excluded_account_ids");
     autoSelectNewAccounts = loaded.auto_select_new_accounts === true || selectedIDs.length === 0;
+    // A diagnostic save preserves confirmed acknowledgements only. Keep a
+    // user's still-unsaved restore choice local until an ordinary save.
+    var pendingRestores = new Set();
+    pendingBpsReenabled.forEach(function (_blockID, accountID) {
+      if (!hasPendingBpsRestore(accountID)) return;
+      pendingRestores.add(accountID);
+      if (!selectedIDSet.has(accountID)) {
+        selectedIDs.push(accountID);
+        selectedIDSet.add(accountID);
+      }
+    });
+    excludedIDs = excludedIDs.filter(function (value) { return !pendingRestores.has(value); });
     syncAutomaticAccounts();
     selectedModels = configModels(loaded);
     renderModelList();
@@ -445,24 +691,29 @@
     }
     // 每个账号只渲染一个复选框，避免重复状态行显示不同的勾选状态。
     // 过滤后再判断空列表，保留已保存但当前不可见的账号选择。
-    var seenIDs = [];
+    var seenIDs = new Set();
     var directory = Array.isArray(details.accounts) ? details.accounts : [];
     // 旧宿主把目录查询失败也显示成 []；空列表不能作为白名单迁移依据。
     if (directory.some(isSelectableAccount)) accountDirectoryReady = true;
     accounts = directory.filter(function (account) {
-      if (!isSelectableAccount(account) || seenIDs.indexOf(account.id) >= 0) {
+      if (!isSelectableAccount(account) || seenIDs.has(account.id)) {
         return false;
       }
-      seenIDs.push(account.id);
-      if (knownAccountIDs.indexOf(account.id) < 0) knownAccountIDs.push(account.id);
+      seenIDs.add(account.id);
+      if (!knownAccountIDSet.has(account.id)) {
+        knownAccountIDSet.add(account.id);
+        knownAccountIDs.push(account.id);
+      }
       return true;
     });
+    updateBpsDisabledAccounts(details);
     syncAutomaticAccounts();
-    renderAccountList();
-    renderAccountHint();
-    if (details.degradation_check) {
+    if (details.degradation_check && !degradationChecking) {
+      rememberAccountChecks(details.degradation_check);
       renderDegradationResult(details.degradation_check);
     }
+    renderAccountList();
+    renderAccountHint();
     updateControls();
 
     var line = [];
@@ -478,27 +729,38 @@
     } else if (Array.isArray(details.account_ids) && details.account_ids.length) {
       line.push("固定 #" + details.account_ids.join(" #"));
     }
+    if (typeof details.bps_account_persistence_error === "string" && details.bps_account_persistence_error) {
+      line.push("BPS 账号状态存储警告：" + details.bps_account_persistence_error);
+    }
     line.push(snapshot.message || (healthy ? "ready" : "未运行"));
     id("version-line").textContent = line.join(" · ");
     scheduleResize();
   }
 
-  function refreshStatus() {
+  function refreshStatus(force) {
+    if (disposed) return Promise.resolve();
+    // Polls share an outstanding read. A verified save needs its own newer
+    // snapshot so a pre-save response cannot hide the applied configuration.
+    if (statusInFlight && !force) return statusInFlight;
     var requestID = ++statusRequestID;
-    return bridge
+    var pending = bridge
       .status()
       .then(function (status) {
-        if (requestID < statusAppliedID) return;
+        if (disposed || requestID < statusAppliedID) return;
         statusAppliedID = requestID;
         renderStatus(status);
       })
       .catch(function (error) {
-        if (requestID < statusAppliedID) return;
+        if (disposed || requestID < statusAppliedID) return;
         statusAppliedID = requestID;
         setChip("宿主未响应", "warn");
         id("version-line").textContent = error.message + "。" + diagnosis();
         scheduleResize();
       });
+    statusInFlight = pending;
+    return pending.then(function () {
+      if (statusInFlight === pending) statusInFlight = null;
+    });
   }
 
   // 读不到宿主响应时给出可操作的诊断，而不是只报"超时"。
@@ -546,7 +808,7 @@
     if (saving || loading || !configReady) {
       return;
     }
-    var submitted = readForm();
+    var submitted = readForm(true);
     adoptSubmittedAccountPolicy(submitted);
     saving = true;
     updateControls();
@@ -561,6 +823,9 @@
         if (!sameModels(normalized, submitted.enabled_models)) {
           throw new Error("宿主返回的模型选择与提交内容不一致");
         }
+        if (normalized.degradation_check === true || normalized.degradation_check_account_id) {
+          throw new Error("宿主未清除降智检测标记，请重新保存配置");
+        }
         writeAcknowledged = true;
         setHint("正在重新读取配置，确认保存结果…");
         return bridge.loadConfig();
@@ -572,9 +837,12 @@
         if (!sameModels(persisted, submitted.enabled_models)) {
           throw new Error("重新读取的模型选择与提交内容不一致，请重试或检查宿主日志");
         }
+        if (persisted.degradation_check === true || persisted.degradation_check_account_id) {
+          throw new Error("重新读取的配置仍有降智检测标记，请重新保存配置");
+        }
         applyConfig(persisted);
         setHint("已保存，并已重新读取确认。", "ok");
-        return refreshStatus();
+        return refreshStatus(true);
       })
       .catch(function (error) {
         var prefix = writeAcknowledged ? "保存结果未确认：" : "保存失败：";
@@ -590,13 +858,16 @@
   // 通过宿主已有的 config.save/config.test 通道触发一次性账号检测。
   // config.test 的请求本身没有可选参数，因此触发位先随配置保存，再由插件
   // 在 TestConfig 中执行真实请求并把结果放进 status_json；检测完成后立即清零。
-  function handleDegradationCheck(event) {
+  function handleDegradationCheck(event, accountID) {
     if (event) {
       event.preventDefault();
     }
     if (saving || loading || degradationChecking || !configReady) {
       return;
     }
+    var targeted = Number.isSafeInteger(accountID) && accountID > 0;
+    if (typeof accountID !== "undefined" && !targeted) return;
+    if (targeted && !accounts.some(function (account) { return account.id === accountID && account.schedulable; })) return;
     if (typeof bridge.testConfig !== "function") {
       setHint("当前宿主不支持账号降智检测，请升级插件管理页。", "error");
       return;
@@ -604,18 +875,20 @@
     var trigger = readForm();
     adoptSubmittedAccountPolicy(trigger);
     trigger.degradation_check = true;
+    if (targeted) trigger.degradation_check_account_id = accountID;
     var triggerSaved = false;
     var finalSaved = false;
     var check;
     var finalConfig;
     // 只调整检测启动时已知账号，检测和保存途中新增账号继续自动接入。
-    var checkedAccountIDs = knownAccountIDs.concat(trigger.account_ids).filter(function (value, index, values) {
-      return values.indexOf(value) === index;
-    });
+    var checkedAccountIDs = Array.from(new Set(knownAccountIDs.concat(trigger.account_ids)));
     degradationChecking = true;
+    checkingAccountID = targeted ? accountID : 0;
+    if (targeted) accountChecks[accountID] = { status: "running", detail: "" };
     saving = true;
+    renderAccountList();
     updateControls();
-    setHint("正在逐个账号发送检测问题，请稍候…");
+    setHint(targeted ? "正在向当前账号发送检测问题，请稍候…" : "正在逐个账号发送检测问题，请稍候…");
     bridge
       .saveConfig(trigger)
       .then(function (normalized) {
@@ -623,43 +896,59 @@
         if (!sameAccountPolicy(normalized, trigger) || !sameModels(normalized, trigger.enabled_models)) {
           throw new Error("宿主返回的账号路由或模型选择与检测前不一致");
         }
+        if (normalized.degradation_check !== true ||
+            (targeted ? normalized.degradation_check_account_id !== accountID : !!normalized.degradation_check_account_id)) {
+          throw new Error("宿主未确认检测账号，请确认插件已更新");
+        }
         setHint("检测请求已启动，正在等待账号回答…");
         return bridge.testConfig();
       })
       .then(function (result) {
         check = degradationCheckFromResult(result);
-        renderDegradationResult(check);
         if (check.completed !== true && check.state !== "done") {
           throw new Error("降智检测尚未完成，请稍后重试");
         }
+        if (targeted && (!Array.isArray(check.results) || check.results.length !== 1 ||
+            !check.results[0] || check.results[0].account_id !== accountID)) {
+          throw new Error("宿主返回的检测结果与当前账号不匹配");
+        }
+        rememberAccountChecks(check);
+        renderAccountList();
+        renderDegradationResult(check);
         var degraded = confirmedDegradedIDs(check);
-        finalConfig = Object.assign({}, trigger, { degradation_check: false });
+        finalConfig = clearDegradationTrigger(trigger);
         // 没有有效疑似账号时保持原有选择；检测失败不代表降智。
-        if (degraded.length > 0) {
+        if (!targeted && degraded.length > 0) {
           finalConfig.account_ids = degraded.slice();
           if (trigger.auto_select_new_accounts === true) {
-            finalConfig.excluded_account_ids = trigger.excluded_account_ids.filter(function (value) {
-              return degraded.indexOf(value) < 0;
-            });
+            var degradedIDs = new Set(degraded);
+            var checkedIDs = new Set(checkedAccountIDs);
+            var finalSelectedIDs = new Set(degraded);
+            var finalExcludedIDs = new Set(trigger.excluded_account_ids.filter(function (value) {
+              return !degradedIDs.has(value);
+            }));
             checkedAccountIDs.forEach(function (accountID) {
-              if (degraded.indexOf(accountID) < 0 && finalConfig.excluded_account_ids.indexOf(accountID) < 0) {
-                finalConfig.excluded_account_ids.push(accountID);
-              }
+              if (!degradedIDs.has(accountID)) finalExcludedIDs.add(accountID);
             });
             selectedIDs.forEach(function (accountID) {
-              if (checkedAccountIDs.indexOf(accountID) < 0 && finalConfig.account_ids.indexOf(accountID) < 0 &&
-                  finalConfig.excluded_account_ids.indexOf(accountID) < 0) finalConfig.account_ids.push(accountID);
+              if (!checkedIDs.has(accountID) && !finalExcludedIDs.has(accountID)) finalSelectedIDs.add(accountID);
             });
+            finalConfig.account_ids = Array.from(finalSelectedIDs);
+            finalConfig.excluded_account_ids = Array.from(finalExcludedIDs);
           }
         }
+        finalConfig = mergeBpsAccountPolicy(finalConfig, false);
         setHint(
-          degraded.length > 0
+          targeted ? "当前账号检测结束，正在保留原账号选择并清除检测标记…" : degraded.length > 0
             ? "检测完成，正在保存 " + degraded.length + " 个降智账号…"
             : "没有可自动选择的检测结果，正在保留原账号选择并清除检测标记…"
         );
         return bridge.saveConfig(finalConfig).then(function (normalized) {
           if (!sameAccountPolicy(normalized, finalConfig) || !sameModels(normalized, finalConfig.enabled_models)) {
             throw new Error("宿主返回的降智账号路由或模型选择与检测结果不一致");
+          }
+          if (normalized.degradation_check === true || normalized.degradation_check_account_id) {
+            throw new Error("宿主未清除降智检测标记，请重新保存配置");
           }
           finalSaved = true;
           return bridge.loadConfig();
@@ -676,21 +965,24 @@
         if (!sameModels(persisted, selectedModels)) {
           throw new Error("重新读取的模型选择与检测前不一致");
         }
+        if (persisted.degradation_check === true || persisted.degradation_check_account_id) {
+          throw new Error("重新读取的配置仍有降智检测标记，请重新保存配置");
+        }
         applyConfig(persisted);
         setHint(
-          degraded.length > 0
+          targeted ? "当前账号：" + degradationStatusLabel(accountChecks[accountID].status) + "，已保留原账号选择。" : degraded.length > 0
             ? "检测完成，已自动选择 " + degraded.length + " 个降智账号。"
             : (answeredDegradationCount(check) > 0
               ? "检测完成，已回答账号未发现降智，已保留原账号选择。"
               : "检测结束，未获得有效回答，已保留原账号选择；失败或跳过不等于降智。"),
           answeredDegradationCount(check) > 0 ? "ok" : "error"
         );
-        return refreshStatus();
+        return refreshStatus(true);
       })
       .catch(function (error) {
         // 检测或收尾失败时也清除触发位，避免下次宿主启动重复检测。
         if (triggerSaved && !finalSaved) {
-          var cleanup = Object.assign({}, trigger, { degradation_check: false });
+          var cleanup = mergeBpsAccountPolicy(clearDegradationTrigger(trigger), false);
           return bridge.saveConfig(cleanup).catch(function () {}).then(function () {
             throw error;
           });
@@ -698,11 +990,16 @@
         throw error;
       })
       .catch(function (error) {
+        if (targeted && accountChecks[accountID].status === "running") {
+          accountChecks[accountID] = { status: "error", detail: error.message };
+        }
         setHint("降智检测失败：" + error.message + "。" + diagnosis(), "error");
       })
       .then(function () {
         degradationChecking = false;
+        checkingAccountID = 0;
         saving = false;
+        renderAccountList();
         updateControls();
         scheduleResize();
       });
@@ -725,10 +1022,12 @@
     id("retry-button").addEventListener("click", loadConfig);
     global.addEventListener("resize", scheduleResize);
     if (typeof global.ResizeObserver === "function") {
-      new global.ResizeObserver(scheduleResize).observe(document.body);
+      resizeObserver = new global.ResizeObserver(scheduleResize);
+      resizeObserver.observe(document.body);
     }
     void loadConfig();
     refreshStatus().then(function () {
+      if (disposed) return;
       pollTimer = global.setInterval(function () {
         if (document.visibilityState === "visible") {
           refreshStatus();
@@ -739,9 +1038,11 @@
   }
 
   global.addEventListener("beforeunload", function () {
+    disposed = true;
     if (pollTimer !== null) {
       global.clearInterval(pollTimer);
     }
+    if (resizeObserver) resizeObserver.disconnect();
     bridge.dispose();
   });
 

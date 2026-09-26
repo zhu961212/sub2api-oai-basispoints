@@ -24,7 +24,7 @@ func normalizeRelayFailure(event string, payload map[string]any) string {
 		failure = make(map[string]any)
 	}
 	upstream := relayObject(payload["error"])
-	for _, field := range []string{"code", "message"} {
+	for _, field := range []string{"code", "message", "type"} {
 		if protocol.StringValue(failure[field]) == "" {
 			if value := protocol.StringValue(upstream[field]); value != "" {
 				failure[field] = value

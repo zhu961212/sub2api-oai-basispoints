@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -107,10 +106,11 @@ func SupportedReasoningEfforts() []string { return config.SupportedReasoningEffo
 
 // RawObject 把请求体解析为 JSON 对象，数字保留原始字面量。
 func RawObject(raw []byte) (map[string]any, error) {
-	var object map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&object); err != nil || object == nil {
+	// Reject duplicate keys before they can disappear into maps, and require
+	// exactly one value so trailing data cannot alter protocol interpretation.
+	value, _, valid := relayJSONValue(string(raw), true)
+	object := objectValue(value)
+	if !valid || object == nil {
 		return nil, fail(http.StatusBadRequest, "invalid_request", "request body must be a JSON object")
 	}
 	return object, nil

@@ -12,6 +12,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+$KeyId = $KeyId.Trim()
 
 Write-Host "==> go test ./... -skip TestLive -count=1 -timeout 120s"
 go test ./... -skip TestLive -count=1 -timeout 120s
@@ -46,15 +47,19 @@ go @arguments
 if ($LASTEXITCODE -ne 0) { throw "Plugin packaging failed." }
 
 # 独立校验：不复用打包器的自检逻辑，重新算哈希并（在有公钥时）验证签名。
-$version = (Get-Content manifest.source.json -Raw | ConvertFrom-Json).version
-$package = Join-Path "dist" "local.oai-basispoints-$version.s2plugin"
+$manifest = Get-Content manifest.source.json -Raw | ConvertFrom-Json
+$package = if ($Output) { $Output } else { Join-Path "dist" "$($manifest.id)-$($manifest.version).s2plugin" }
 $python = Get-Command python -ErrorAction SilentlyContinue
-if ($python -and (Test-Path $package)) {
+if ($SigningKey -and -not $python) { throw "Python is required for independent signature verification." }
+if (-not (Test-Path -LiteralPath $package)) { throw "Expected plugin package was not created: $package" }
+if ($python) {
     $verifyArgs = @("tools/verify_package.py", $package)
     $verifyKey = "build/keys/publisher.public"
     if ($SigningKey) {
         $matchingKey = [System.IO.Path]::ChangeExtension($SigningKey, "public")
-        if (Test-Path -LiteralPath $matchingKey) { $verifyKey = $matchingKey }
+        if (-not (Test-Path -LiteralPath $matchingKey)) { throw "Matching publisher public key is required: $matchingKey" }
+        $verifyKey = $matchingKey
+        $verifyArgs += @("--require-signature", "--expected-key-id", $KeyId)
     }
     if (Test-Path -LiteralPath $verifyKey) {
         $verifyArgs += @("--public-key", $verifyKey)

@@ -37,6 +37,7 @@ class Element {
     this.children = [];
     this.parentNode = null;
     this.listeners = new Map();
+    this.attributes = new Map();
     this.disabled = false;
     this.hidden = false;
     this.checked = false;
@@ -56,6 +57,12 @@ class Element {
     child.parentNode = this;
     this.children.push(child);
     return child;
+  }
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+  }
+  getAttribute(name) {
+    return this.attributes.has(name) ? this.attributes.get(name) : null;
   }
   addEventListener(type, listener) {
     if (!this.listeners.has(type)) this.listeners.set(type, []);
@@ -88,6 +95,14 @@ class Element {
     this.value = value;
     this.emit("input");
   }
+}
+
+function descendants(element) {
+  return element.children.flatMap((child) => [child, ...descendants(child)]);
+}
+
+function hasClass(element, className) {
+  return element.className.split(/\s+/).includes(className);
 }
 
 function createPage(options = {}) {
@@ -128,7 +143,7 @@ function createPage(options = {}) {
   ids["account-fields"].appendChild(ids["degradation-result"]);
   ids["config-form"].appendChild(ids["save-button"]);
   ids["config-form"].appendChild(ids["retry-button"]);
-  const calls = { load: 0, save: [], test: 0, status: 0, ready: 0 };
+  const calls = { load: 0, save: [], test: 0, status: 0, ready: 0, elements: 0, resize: [], intervals: 0, clearedIntervals: 0, disposed: 0, observerDisconnected: 0 };
   const status = options.status || {
     healthy: true,
     message: "ready",
@@ -141,8 +156,8 @@ function createPage(options = {}) {
   const bridge = {
     hasToken: true,
     ready() { calls.ready++; },
-    resize() {},
-    dispose() {},
+    resize(height) { calls.resize.push(height); },
+    dispose() { calls.disposed++; },
     status() { calls.status++; return options.getStatus ? options.getStatus(calls.status, store) : Promise.resolve(clone(status)); },
     loadConfig() {
       calls.load++;
@@ -168,21 +183,40 @@ function createPage(options = {}) {
     Sub2APIPluginBridge: { create: () => bridge },
     requestAnimationFrame(callback) { callback(); },
     addEventListener(type, listener) { windowListeners.set(type, listener); },
-    setInterval(callback) { pollStatus = callback; return 1; },
-    clearInterval() {},
+    setInterval(callback) { calls.intervals++; pollStatus = callback; return 1; },
+    clearInterval() { calls.clearedIntervals++; pollStatus = null; },
+    ResizeObserver: class {
+      observe() {}
+      disconnect() { calls.observerDisconnected++; }
+    },
   };
   const document = {
     getElementById: (id) => ids[id] || null,
-    createElement: (tagName) => new Element(tagName),
+    createElement: (tagName) => { calls.elements++; return new Element(tagName); },
     body: new Element("body"),
     documentElement: new Element("html"),
     visibilityState: "visible",
   };
   vm.runInNewContext(appSource, { window, document, console }, { filename: "ui/assets/app.js" });
-  const boxes = () => ids["account-list"].children.flatMap((label) => label.children).filter((node) => node.tagName === "INPUT");
-  const modelBoxes = () => ids["model-list"].children.flatMap((label) => label.children).filter((node) => node.tagName === "INPUT");
+  const boxes = () => descendants(ids["account-list"]).filter((node) => node.tagName === "INPUT");
+  const modelBoxes = () => descendants(ids["model-list"]).filter((node) => node.tagName === "INPUT");
+  const accountRow = (accountID) => {
+    const row = ids["account-list"].children.find((element) => descendants(element).some((node) =>
+      node.tagName === "INPUT" && Number(node.value) === accountID));
+    assert.ok(row, "Account #" + accountID + " must have a row");
+    const nodes = descendants(row);
+    return {
+      row,
+      checkbox: nodes.find((node) => node.tagName === "INPUT"),
+      name: nodes.find((node) => hasClass(node, "account-name")),
+      availability: nodes.find((node) => hasClass(node, "account-availability")),
+      result: nodes.find((node) => hasClass(node, "account-check-result")),
+      button: nodes.find((node) => hasClass(node, "account-check-button")),
+    };
+  };
   return {
     ids, calls, store,
+    accountRow,
     selected: () => boxes().filter((box) => box.checked).map((box) => Number(box.value)).sort((a, b) => a - b),
     selectedModels: () => modelBoxes().filter((box) => box.checked).map((box) => box.value),
     modelOptions: () => modelBoxes().map((box) => box.value),
@@ -199,7 +233,13 @@ function createPage(options = {}) {
     save: () => ids["save-button"].click(),
     selectAll: () => ids["select-all-button"].click(),
     degradationCheck: () => ids["degradation-check-button"].click(),
-    pollStatus: () => pollStatus(),
+    checkAccount: (accountID) => {
+      const button = accountRow(accountID).button;
+      assert.ok(button, "Account #" + accountID + " must have its own diagnostic button");
+      return button.click();
+    },
+    pollStatus: () => { if (pollStatus) pollStatus(); },
+    unload: () => windowListeners.get("beforeunload")(),
     retry: () => ids["retry-button"].click(),
   };
 }
@@ -384,6 +424,261 @@ test("select all is disabled when the list is empty and preserves hidden saved I
   page.save();
   await flush();
   assert.deepEqual(page.calls.save[0].account_ids, [99]);
+});
+
+test("account rows show six Unicode characters and keep diagnostic controls outside the label", async () => {
+  const names = ["shared-first@example.com", "shared-second@example.com", "短名", "😀一二三四五六七"];
+  const page = createPage({ accounts: names.map((name, index) => ({ id: index + 1, name, schedulable: true })) });
+  await flush();
+  for (let index = 0; index < names.length; index++) {
+    const { row, name, availability, result, button, checkbox } = page.accountRow(index + 1);
+    assert.ok(hasClass(row, "account-row"));
+    assert.equal(name.textContent, Array.from(names[index]).slice(0, 6).join(""));
+    assert.equal(name.title, names[index]);
+    assert.ok(availability);
+    assert.ok(result);
+    assert.equal(button.textContent, "降智检测");
+    assert.equal(button.type, "button");
+    assert.equal(button.value, String(index + 1));
+    assert.equal(checkbox.parentNode.tagName, "LABEL");
+    assert.ok(!descendants(checkbox.parentNode).includes(button), "Diagnostic clicks cannot toggle the checkbox label");
+  }
+  assert.equal(page.accountRow(1).name.textContent, page.accountRow(2).name.textContent);
+});
+
+test("account rows have a short identifier fallback when names are missing", async () => {
+  const page = createPage({ accounts: [{ id: 123456789, schedulable: true }] });
+  await flush();
+  const { name, button } = page.accountRow(123456789);
+  assert.ok(name.textContent.length > 0);
+  assert.ok(Array.from(name.textContent).length <= 6);
+  assert.match(name.title, /123456789/);
+  assert.equal(button.value, "123456789");
+});
+
+test("single-account diagnostics use the real ID and preserve selection models and exclusions", async () => {
+  const config = {
+    account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2, 88],
+    enabled_models: ["gpt-6-astra"], timeout_seconds: 123,
+  };
+  const page = createPage({
+    store: { config: clone(config) },
+    accounts: [
+      { id: 1, name: "shared-first@example.com", schedulable: true },
+      { id: 2, name: "shared-second@example.com", schedulable: true },
+      { id: 3, name: "Third", schedulable: true },
+    ],
+    test: (_number, store) => {
+      assert.equal(store.config.degradation_check, true);
+      assert.equal(store.config.degradation_check_account_id, 2);
+      return Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
+        completed: true, degraded_account_ids: [2],
+        results: [{ account_id: 2, status: "degraded", answer: "苹果16" }],
+      } }) });
+    },
+  });
+  await flush();
+  page.checkAccount(2);
+  await flush();
+  assert.equal(page.calls.test, 1);
+  assert.equal(page.calls.save.length, 2);
+  assert.equal(page.calls.save[0].degradation_check_account_id, 2);
+  assert.equal(page.calls.save[0].degradation_check, true);
+  assert.equal(page.store.config.degradation_check, false);
+  assert.ok(!page.store.config.degradation_check_account_id);
+  for (const saved of page.calls.save) {
+    for (const key of Object.keys(config)) assert.deepEqual(saved[key], config[key], key + " must survive diagnostics");
+  }
+  assert.deepEqual(page.selected(), [1, 3]);
+  assert.deepEqual(page.selectedModels(), ["gpt-6-astra"]);
+  assert.match(page.accountRow(2).result.textContent, /疑似降智/);
+  assert.doesNotMatch(page.ids["form-hint"].textContent, /已自动选择/);
+});
+
+test("single-account diagnostics render each outcome without treating failures as degradation", async (t) => {
+  for (const fixture of [
+    { status: "ok", answer: "苹果17", label: /符合检测规则|正常/ },
+    { status: "degraded", answer: "苹果16", label: /疑似降智/ },
+    { status: "error", error: "HTTP 429", label: /检测失败/ },
+    { status: "skipped", error: "account is not schedulable", label: /跳过/ },
+  ]) {
+    await t.test(fixture.status, async () => {
+      const result = { account_id: 2, status: fixture.status };
+      if (fixture.answer) result.answer = fixture.answer;
+      if (fixture.error) result.error = fixture.error;
+      const page = createPage({
+        store: { config: { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3] } },
+        test: () => Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
+          completed: true, degraded_account_ids: fixture.status === "degraded" ? [2] : [], results: [result],
+        } }) }),
+      });
+      await flush();
+      page.checkAccount(2);
+      await flush();
+      assert.deepEqual(page.selected(), [1]);
+      assert.deepEqual(page.store.config.excluded_account_ids, [2, 3]);
+      assert.match(page.accountRow(2).result.textContent, fixture.label);
+      assert.equal(page.store.config.degradation_check, false);
+      assert.ok(!page.store.config.degradation_check_account_id);
+      assert.equal(page.accountRow(2).button.isDisabled(), false);
+    });
+  }
+});
+
+test("single-account diagnostics clear both transient fields when requests fail", async () => {
+  const page = createPage({
+    store: { config: { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3] } },
+    test: () => Promise.reject(new Error("test timed out")),
+  });
+  await flush();
+  page.checkAccount(2);
+  await flush();
+  assert.equal(page.calls.save.length, 2);
+  assert.equal(page.calls.save[0].degradation_check_account_id, 2);
+  assert.equal(page.calls.save[1].degradation_check, false);
+  assert.ok(!page.calls.save[1].degradation_check_account_id);
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.deepEqual(page.store.config.excluded_account_ids, [2, 3]);
+  assert.deepEqual(page.selected(), [1]);
+  assert.match(page.accountRow(2).result.textContent, /检测失败/);
+  assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
+  assert.equal(page.accountRow(2).button.isDisabled(), false);
+});
+
+test("single-account diagnostics reject malformed and unrelated results", async (t) => {
+  const badResults = [
+    { title: "invalid JSON", result: { status_json: "{" } },
+    { title: "missing report", result: {} },
+    { title: "incomplete report", check: { state: "running", results: [] } },
+    { title: "missing target", check: { completed: true, results: [] } },
+    { title: "another account", check: { completed: true, results: [{ account_id: 1, status: "degraded", answer: "苹果16" }] } },
+    { title: "empty normal answer", check: { completed: true, results: [{ account_id: 2, status: "ok", answer: "   " }] } },
+    { title: "empty degraded answer", check: { completed: true, results: [{ account_id: 2, status: "degraded", answer: "" }] } },
+    { title: "conflicting target verdicts", check: { completed: true, results: [
+      { account_id: 2, status: "degraded", answer: "苹果16" }, { account_id: 2, status: "error", error: "HTTP 429" },
+    ] } },
+  ];
+  for (const fixture of badResults) {
+    await t.test(fixture.title, async () => {
+      const page = createPage({
+        store: { config: { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3] } },
+        test: () => Promise.resolve(fixture.result || { status_json: JSON.stringify({ degradation_check: fixture.check }) }),
+      });
+      await flush();
+      page.checkAccount(2);
+      await flush();
+      assert.deepEqual(page.selected(), [1]);
+      assert.deepEqual(page.store.config.excluded_account_ids, [2, 3]);
+      assert.equal(page.store.config.degradation_check, false);
+      assert.ok(!page.store.config.degradation_check_account_id);
+      assert.match(page.accountRow(2).result.textContent, /检测失败/);
+      assert.doesNotMatch(page.accountRow(1).result.textContent, /疑似降智/);
+      assert.match(page.ids["form-hint"].textContent, /检测失败/);
+    });
+  }
+});
+
+test("single-account diagnostics reject dropped or changed target acknowledgement before probing", async (t) => {
+  for (const target of [undefined, 0, 1]) {
+    await t.test(String(target), async () => {
+      const page = createPage({ save(config, store) {
+        store.config = clone(config);
+        const reply = clone(config);
+        if (config.degradation_check) {
+          if (target === undefined) delete reply.degradation_check_account_id;
+          else reply.degradation_check_account_id = target;
+        }
+        return Promise.resolve(reply);
+      } });
+      await flush();
+      page.checkAccount(2);
+      await flush();
+      assert.equal(page.calls.test, 0, "A lost target must never run a bulk check");
+      assert.equal(page.store.config.degradation_check, false);
+      assert.ok(!page.store.config.degradation_check_account_id);
+      assert.match(page.accountRow(2).result.textContent, /检测失败/);
+      assert.equal(page.accountRow(2).button.isDisabled(), false);
+    });
+  }
+});
+
+test("account diagnostics disable unavailable accounts and prevent overlapping checks", async () => {
+  const pending = deferred();
+  const page = createPage({
+    accounts: [
+      { id: 1, name: "First", schedulable: true },
+      { id: 2, name: "Second", schedulable: true },
+      { id: 3, name: "Paused", schedulable: false, status: "paused" },
+    ],
+    test: () => pending.promise,
+  });
+  await flush();
+  assert.equal(page.accountRow(3).button.isDisabled(), true);
+  page.checkAccount(3);
+  assert.equal(page.calls.save.length, 0);
+  const selected = page.selected();
+  page.checkAccount(1);
+  await flush();
+  assert.equal(page.calls.test, 1);
+  assert.match(page.accountRow(1).result.textContent, /检测中|正在检测/);
+  assert.equal(page.accountRow(2).button.isDisabled(), true);
+  page.checkAccount(2);
+  page.checkAccount(1);
+  page.degradationCheck();
+  page.check(2, false);
+  page.save();
+  page.selectAll();
+  assert.equal(page.calls.save.length, 1);
+  assert.equal(page.calls.test, 1);
+  assert.deepEqual(page.selected(), selected);
+  pending.resolve({ status_json: JSON.stringify({ degradation_check: {
+    completed: true, results: [{ account_id: 1, status: "ok", answer: "苹果17" }], degraded_account_ids: [],
+  } }) });
+  await flush();
+  assert.equal(page.accountRow(1).button.isDisabled(), false);
+  assert.equal(page.accountRow(2).button.isDisabled(), false);
+  assert.equal(page.accountRow(3).button.isDisabled(), true);
+});
+
+test("per-account verdicts remain attached to real IDs after status polling and row reorder", async () => {
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [
+    { id: 1, name: "shared-one", schedulable: true }, { id: 2, name: "shared-two", schedulable: true },
+  ] }) };
+  const page = createPage({ status, test: (_number, store) => {
+    const accountID = store.config.degradation_check_account_id;
+    return Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
+      completed: true, degraded_account_ids: accountID === 1 ? [1] : [],
+      results: [{ account_id: accountID, status: accountID === 1 ? "degraded" : "ok", answer: accountID === 1 ? "苹果16" : "苹果17" }],
+    } }) });
+  } });
+  await flush();
+  page.checkAccount(1);
+  await flush();
+  page.checkAccount(2);
+  await flush();
+  status.status_json = JSON.stringify({ accounts: [
+    { id: 2, name: "renamed-two", schedulable: true },
+    { id: 3, name: "new-account", schedulable: true },
+    { id: 1, name: "renamed-one", schedulable: true },
+  ] });
+  page.pollStatus();
+  await flush();
+  assert.match(page.accountRow(1).result.textContent, /疑似降智/);
+  assert.match(page.accountRow(2).result.textContent, /符合检测规则|正常/);
+  assert.doesNotMatch(page.accountRow(3).result.textContent, /疑似降智|符合检测规则|正常/);
+  assert.equal(page.accountRow(1).name.textContent, "rename");
+  assert.equal(page.accountRow(2).name.title, "renamed-two");
+  assert.deepEqual(page.selected(), [1, 2, 3]);
+});
+
+test("ordinary saves discard a stale single-account diagnostic selector", async () => {
+  const page = createPage({ store: { config: { account_ids: [1], degradation_check: true, degradation_check_account_id: 2 } } });
+  await flush();
+  page.save();
+  await flush();
+  assert.equal(page.calls.test, 0);
+  assert.equal(page.store.config.degradation_check, false);
+  assert.ok(!page.store.config.degradation_check_account_id);
 });
 
 test("degradation check selects returned degraded accounts and clears its trigger", async () => {
@@ -922,7 +1217,7 @@ test("late initial configuration respects existing exclusions after status arriv
   assert.deepEqual(page.selected(), [1, 3]);
 });
 
-test("out-of-order status polls cannot undo newly observed accounts or unsaved exclusions", async () => {
+test("status polls share an outstanding request while preserving unsaved exclusions", async () => {
   const older = deferred();
   const newer = deferred();
   const page = createPage({ getStatus: (number) => number === 1
@@ -932,11 +1227,90 @@ test("out-of-order status polls cannot undo newly observed accounts or unsaved e
   page.check(1, false);
   page.pollStatus();
   page.pollStatus();
+  assert.equal(page.calls.status, 2, "A pending poll must not create another host request");
+  older.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }] }) });
+  await flush();
+  assert.deepEqual(page.selected(), [2]);
+  page.pollStatus();
+  assert.equal(page.calls.status, 3, "The next completed interval must fetch fresh accounts");
+  newer.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }] }) });
+  await flush();
+  assert.deepEqual(page.selected(), [2, 3]);
+});
+
+test("a verified save obtains a newer status without waiting for an older poll", async () => {
+  const older = deferred();
+  const newer = deferred();
+  const page = createPage({ getStatus: (number) => number === 1
+    ? Promise.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }] }) })
+    : number === 2 ? older.promise : newer.promise });
+  await flush();
+  page.check(1, false);
+  page.pollStatus();
+  page.save();
+  await flush();
+  assert.equal(page.calls.status, 3, "The save must not reuse a stale poll");
   newer.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }] }) });
   await flush();
   older.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }] }) });
   await flush();
   assert.deepEqual(page.selected(), [2]);
+});
+
+test("unchanged status polls create zero account nodes or resize messages for a large directory", async () => {
+  const accounts = Array.from({ length: 1000 }, (_, index) => ({ id: index + 1, name: "Account " + (index + 1), schedulable: true }));
+  const page = createPage({ accounts });
+  await flush();
+  page.check(1, false);
+  const rows = [1, 500, 1000].map((accountID) => page.accountRow(accountID).row);
+  const created = page.calls.elements;
+  const resized = page.calls.resize.length;
+  for (let poll = 0; poll < 5; poll++) { page.pollStatus(); await flush(); }
+  assert.equal(page.calls.elements, created, "Unchanged polls must reuse every existing account row");
+  assert.equal(page.calls.resize.length, resized, "Unchanged content height must not notify the host again");
+  [1, 500, 1000].forEach((accountID, index) => assert.equal(page.accountRow(accountID).row, rows[index]));
+  assert.equal(page.accountRow(1).checkbox.checked, false);
+  assert.equal(page.selected().length, 999);
+});
+
+test("unchanged diagnostic summaries reuse their DOM and account results", async () => {
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1, schedulable: true }], degradation_check: {
+    completed: true, degraded_account_ids: [1], results: [{ account_id: 1, status: "degraded", answer: "苹果16" }],
+  } }) };
+  const page = createPage({ status });
+  await flush();
+  const summary = page.ids["degradation-result"].children[0];
+  const created = page.calls.elements;
+  page.pollStatus();
+  await flush();
+  assert.equal(page.calls.elements, created);
+  assert.equal(page.ids["degradation-result"].children[0], summary);
+  assert.match(page.accountRow(1).result.textContent, /疑似降智/);
+});
+
+test("closing during initial status loading does not start a late polling timer", async () => {
+  const pending = deferred();
+  const page = createPage({ getStatus: () => pending.promise });
+  await flush();
+  page.unload();
+  pending.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }] }) });
+  await flush();
+  assert.equal(page.calls.intervals, 0);
+  assert.equal(page.calls.disposed, 1);
+  assert.equal(page.calls.observerDisconnected, 1);
+  assert.equal(page.calls.status, 1);
+});
+
+test("closing an initialized page releases its polling timer and resize observer", async () => {
+  const page = createPage();
+  await flush();
+  page.unload();
+  page.pollStatus();
+  assert.equal(page.calls.intervals, 1);
+  assert.equal(page.calls.clearedIntervals, 1);
+  assert.equal(page.calls.observerDisconnected, 1);
+  assert.equal(page.calls.disposed, 1);
+  assert.equal(page.calls.status, 1);
 });
 
 test("accounts added during a migrating save stay selected through failure and retry", async () => {
@@ -1077,6 +1451,358 @@ test("failed degradation cleanup never reselects locally excluded accounts", asy
   assert.deepEqual(page.selected(), [2, 3]);
   assert.deepEqual(page.calls.save[1].excluded_account_ids, [1]);
   assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
+});
+
+const bpsBlockA = "a".repeat(32);
+const bpsBlockB = "b".repeat(32);
+function bpsStatus(blocks = [], accounts = [{ id: 1, schedulable: true }, { id: 2, schedulable: true }, { id: 3, schedulable: true }]) {
+  return { healthy: true, status_json: JSON.stringify({
+    accounts, bps_disabled_account_ids: blocks.map(([accountID]) => accountID),
+    bps_disabled_accounts: blocks.map(([accountID, blockID]) => ({ account_id: accountID, block_id: blockID })),
+  }) };
+}
+
+test("BPS persistence warning is visible as text and clears after status recovery", async () => {
+  const status = bpsStatus();
+  const details = JSON.parse(status.status_json);
+  const warning = "write failed <storage unavailable>";
+  details.bps_account_persistence_error = warning;
+  status.status_json = JSON.stringify(details);
+  const page = createPage({ status });
+  await flush();
+  assert.ok(page.ids["version-line"].textContent.includes("BPS 账号状态存储警告：" + warning));
+  assert.equal(page.ids["version-line"].children.length, 0);
+  assert.equal(page.ids["state-chip"].textContent, "运行中");
+  assert.equal(page.calls.save.length, 0);
+
+  Object.assign(status, bpsStatus());
+  page.pollStatus();
+  await flush();
+  assert.ok(!page.ids["version-line"].textContent.includes("BPS 账号状态存储警告"));
+  assert.ok(!page.ids["version-line"].textContent.includes(warning));
+  assert.equal(page.ids["state-chip"].textContent, "运行中");
+  assert.equal(page.calls.save.length, 0);
+});
+
+test("one reported BPS 403 deselects only that account without saving during polls", async () => {
+  const status = bpsStatus();
+  const page = createPage({ status });
+  await flush();
+  page.check(3, false);
+  Object.assign(status, bpsStatus([[2, bpsBlockA]]));
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1]);
+  assert.equal(page.calls.save.length, 0);
+  assert.match(page.accountRow(2).availability.textContent, /BPS.*403/);
+  assert.match(page.ids["account-hint"].textContent, /一次 BPS HTTP 403/);
+  assert.doesNotMatch(page.ids["account-hint"].textContent, /basispoints_upstream_error/);
+  const row = page.accountRow(2).row;
+  const elements = page.calls.elements;
+  page.pollStatus();
+  await flush();
+  assert.equal(page.accountRow(2).row, row);
+  assert.equal(page.calls.elements, elements);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.deepEqual(page.store.config.excluded_account_ids.sort(), [2, 3]);
+  assert.ok(!Object.hasOwn(page.store.config, "bps_reenabled_accounts"));
+});
+
+test("a late config load cannot reselect an account already disabled in status", async () => {
+  const initial = deferred();
+  const page = createPage({ status: bpsStatus([[1, bpsBlockA]]), load: () => initial.promise });
+  await flush();
+  initial.resolve({ account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3] });
+  await flush();
+  assert.deepEqual(page.selected(), [2]);
+  assert.match(page.accountRow(1).availability.textContent, /403/);
+  assert.equal(page.calls.save.length, 0);
+});
+
+test("same-version 403 polls preserve an explicit restore until ordinary save confirms it", async () => {
+  const status = bpsStatus([[2, bpsBlockA]]);
+  const page = createPage({ status, save(config, store) {
+    store.config = clone(config);
+    if (config.bps_reenabled_accounts && config.bps_reenabled_accounts[2] === bpsBlockA) Object.assign(status, bpsStatus());
+    return Promise.resolve(clone(config));
+  } });
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+  page.check(2, true);
+  assert.match(page.accountRow(2).availability.textContent, /待恢复/);
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 2, 3]);
+  assert.equal(page.calls.save.length, 0);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.bps_reenabled_accounts, { 2: bpsBlockA });
+  assert.deepEqual(page.store.config.excluded_account_ids, []);
+  assert.deepEqual(page.selected(), [1, 2, 3]);
+  assert.equal(page.accountRow(2).availability.textContent, "可用");
+  page.save();
+  await flush();
+  assert.deepEqual(page.calls.save[1].bps_reenabled_accounts, { 2: bpsBlockA }, "Confirmed acknowledgement remains persisted");
+});
+
+test("a new 403 version cancels an unsaved restore and keeps old acknowledgements ineffective", async () => {
+  const status = bpsStatus([[2, bpsBlockA]]);
+  const page = createPage({ status, store: { config: { account_ids: [1, 2, 3], auto_select_new_accounts: true, bps_reenabled_accounts: { 88: bpsBlockA } } } });
+  await flush();
+  page.check(2, true);
+  Object.assign(status, bpsStatus([[2, bpsBlockB]]));
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+  assert.doesNotMatch(page.accountRow(2).availability.textContent, /待恢复/);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.bps_reenabled_accounts, { 88: bpsBlockA });
+  assert.deepEqual(page.store.config.excluded_account_ids, [2]);
+  page.check(2, true);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.bps_reenabled_accounts, { 2: bpsBlockB, 88: bpsBlockA });
+});
+
+test("403 status arriving during save acknowledgement or verification remains excluded", async (t) => {
+  for (const stage of ["acknowledgement", "verification"]) {
+    await t.test(stage, async () => {
+      const pending = deferred();
+      const status = bpsStatus();
+      const page = createPage({ status, save(config, store) {
+        store.config = clone(config);
+        return stage === "acknowledgement" ? pending.promise : Promise.resolve(clone(config));
+      }, load(number, store) {
+        return number > 1 && stage === "verification" ? pending.promise : Promise.resolve(clone(store.config));
+      } });
+      await flush();
+      page.save();
+      await flush();
+      Object.assign(status, bpsStatus([[1, bpsBlockA]]));
+      page.pollStatus();
+      await flush();
+      assert.deepEqual(page.selected(), [2, 3]);
+      pending.resolve(clone(page.store.config));
+      await flush();
+      assert.deepEqual(page.selected(), [2, 3]);
+      assert.equal(page.calls.save.length, 1, "Status must not start a second config write");
+      assert.match(page.accountRow(1).availability.textContent, /403/);
+    });
+  }
+});
+
+test("a repeated 403 during restore saving invalidates the submitted acknowledgement", async () => {
+  const pending = deferred();
+  const status = bpsStatus([[2, bpsBlockA]]);
+  const page = createPage({ status, save(config, store) { store.config = clone(config); return pending.promise; } });
+  await flush();
+  page.check(2, true);
+  page.save();
+  await flush();
+  Object.assign(status, bpsStatus([[2, bpsBlockB]]));
+  page.pollStatus();
+  await flush();
+  pending.resolve(clone(page.store.config));
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+  assert.deepEqual(page.store.config.bps_reenabled_accounts, { 2: bpsBlockA });
+  assert.match(page.accountRow(2).availability.textContent, /403/);
+  assert.doesNotMatch(page.accountRow(2).availability.textContent, /待恢复/);
+});
+
+test("restoration requires acknowledgement persistence at save and read-back", async (t) => {
+  for (const stage of ["acknowledgement", "verification"]) {
+    await t.test(stage, async () => {
+      const page = createPage({ status: bpsStatus([[2, bpsBlockA]]), save(config, store) {
+        const dropped = clone(config);
+        delete dropped.bps_reenabled_accounts;
+        store.config = stage === "verification" ? dropped : clone(config);
+        return Promise.resolve(stage === "acknowledgement" ? dropped : clone(config));
+      } });
+      await flush();
+      page.check(2, true);
+      page.save();
+      await flush();
+      assert.match(page.ids["form-hint"].textContent, /失败|未确认/);
+      assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
+    });
+  }
+});
+
+test("diagnostic saves preserve existing acknowledgements but never submit a pending restore", async () => {
+  const status = bpsStatus([[2, bpsBlockA]]);
+  const page = createPage({ status, store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2], bps_reenabled_accounts: { 88: bpsBlockB } } }, test: () => Promise.resolve({
+    status_json: JSON.stringify({ bps_disabled_account_ids: [2], bps_disabled_accounts: [{ account_id: 2, block_id: bpsBlockA }],
+      degradation_check: { completed: true, results: [{ account_id: 1, status: "ok", answer: "苹果17" }], degraded_account_ids: [] } }),
+  }) });
+  await flush();
+  page.check(2, true);
+  page.checkAccount(1);
+  await flush();
+  assert.equal(page.calls.save.length, 2);
+  for (const saved of page.calls.save) {
+    assert.deepEqual(saved.bps_reenabled_accounts, { 88: bpsBlockB });
+    assert.deepEqual(saved.excluded_account_ids, [2]);
+    assert.ok(!saved.account_ids.includes(2));
+  }
+  assert.deepEqual(page.selected(), [1, 2, 3], "The manual restore remains an unsaved local choice");
+  assert.match(page.accountRow(2).availability.textContent, /待恢复/);
+});
+
+test("403 state returned by diagnostics is excluded before cleanup is saved", async () => {
+  const status = bpsStatus();
+  const page = createPage({ status, test: () => {
+    Object.assign(status, bpsStatus([[2, bpsBlockA]]));
+    const details = JSON.parse(status.status_json);
+    details.degradation_check = { completed: true, results: [{ account_id: 2, status: "error", error: "upstream returned HTTP 403" }], degraded_account_ids: [] };
+    return Promise.resolve({ status_json: JSON.stringify(details) });
+  } });
+  await flush();
+  page.checkAccount(2);
+  await flush();
+  assert.equal(page.calls.save.length, 2);
+  assert.deepEqual(page.calls.save[1].excluded_account_ids, [2]);
+  assert.deepEqual(page.calls.save[1].account_ids, [1, 3]);
+  assert.deepEqual(page.selected(), [1, 3]);
+  assert.match(page.accountRow(2).availability.textContent, /403/);
+  assert.match(page.accountRow(2).result.textContent, /失败/);
+});
+
+test("failed diagnostics cleanup merges a concurrent 403 and preserves confirmed acknowledgements", async () => {
+  const pending = deferred();
+  const status = bpsStatus();
+  const page = createPage({ status, store: { config: { account_ids: [1, 2, 3], auto_select_new_accounts: true, bps_reenabled_accounts: { 88: bpsBlockA } } }, test: () => pending.promise });
+  await flush();
+  page.checkAccount(1);
+  await flush();
+  Object.assign(status, bpsStatus([[2, bpsBlockB]]));
+  page.pollStatus();
+  await flush();
+  pending.reject(new Error("diagnostic unavailable"));
+  await flush();
+  assert.equal(page.calls.save.length, 2);
+  assert.deepEqual(page.calls.save[1].account_ids, [1, 3]);
+  assert.deepEqual(page.calls.save[1].excluded_account_ids, [2]);
+  assert.deepEqual(page.calls.save[1].bps_reenabled_accounts, { 88: bpsBlockA });
+  assert.deepEqual(page.selected(), [1, 3]);
+  const reopened = createPage({ status, store: page.store });
+  await flush();
+  assert.deepEqual(reopened.selected(), [1, 3]);
+  assert.equal(reopened.calls.save.length, 0);
+  assert.match(reopened.accountRow(2).availability.textContent, /403/);
+});
+
+test("unchecking a pending restore discards its unsaved acknowledgement", async () => {
+  const page = createPage({ status: bpsStatus([[2, bpsBlockA]]) });
+  await flush();
+  page.check(2, true);
+  page.check(2, false);
+  page.save();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+  assert.deepEqual(page.store.config.excluded_account_ids, [2]);
+  assert.ok(!Object.hasOwn(page.store.config, "bps_reenabled_accounts"));
+  assert.doesNotMatch(page.accountRow(2).availability.textContent, /待恢复/);
+});
+
+test("a disabled sole legacy account keeps its original boundary without a directory", async () => {
+  const page = createPage({ status: bpsStatus([[7, bpsBlockA]], []), store: { config: { account_ids: [7] } } });
+  await flush();
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [7], "An empty legacy list would incorrectly allow all accounts");
+  assert.deepEqual(page.store.config.excluded_account_ids, [7]);
+  assert.notEqual(page.store.config.auto_select_new_accounts, true);
+  assert.ok(!Object.hasOwn(page.store.config, "bps_reenabled_accounts"));
+});
+
+test("a disabled sole legacy account migrates to explicit exclusions after reading a directory", async () => {
+  const page = createPage({ status: bpsStatus([[1, bpsBlockA]]), store: { config: { account_ids: [1] } } });
+  await flush();
+  assert.deepEqual(page.selected(), []);
+  page.save();
+  await flush();
+  assert.equal(page.store.config.auto_select_new_accounts, true);
+  assert.deepEqual(page.store.config.account_ids, []);
+  assert.deepEqual(page.store.config.excluded_account_ids.sort(), [1, 2, 3]);
+});
+
+test("missing block tokens cannot implicitly restore a 403-disabled account", async () => {
+  const page = createPage({ status: { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }], bps_disabled_account_ids: [1] }) } });
+  await flush();
+  assert.deepEqual(page.selected(), []);
+  assert.equal(page.accountRow(1).checkbox.isDisabled(), true);
+  page.selectAll();
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.excluded_account_ids, [1]);
+  assert.ok(!Object.hasOwn(page.store.config, "bps_reenabled_accounts"));
+});
+
+test("select all records explicit versioned restores only when the user saves", async () => {
+  const page = createPage({ status: bpsStatus([[1, bpsBlockA], [2, bpsBlockB]]) });
+  await flush();
+  page.selectAll();
+  assert.deepEqual(page.selected(), [1, 2, 3]);
+  assert.equal(page.calls.save.length, 0);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.bps_reenabled_accounts, { 1: bpsBlockA, 2: bpsBlockB });
+});
+
+test("ordinary saves never confirm retained diagnostic command markers", async (t) => {
+  for (const phase of ["acknowledgement", "read-back"]) {
+    for (const marker of [{ degradation_check: true }, { degradation_check_account_id: 2 }]) {
+      await t.test(phase + " / " + Object.keys(marker)[0], async () => {
+        const page = createPage({
+          save: (config, store) => {
+            store.config = clone(config);
+            return Promise.resolve(Object.assign(clone(config), phase === "acknowledgement" ? marker : {}));
+          },
+          load: (count, store) => Promise.resolve(Object.assign(clone(store.config), count > 1 && phase === "read-back" ? marker : {})),
+        });
+        await flush();
+        page.save();
+        await flush();
+        assert.match(page.ids["form-hint"].textContent, /检测标记/);
+        assert.match(page.ids["form-hint"].className, /hint-error/);
+        assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存，并已重新读取确认/);
+        assert.equal(page.ids["save-button"].disabled, false);
+      });
+    }
+  }
+});
+
+test("diagnostic 403 snapshots supersede status polls started before their result", async () => {
+  const stalePoll = deferred();
+  const finalSave = deferred();
+  let statusCalls = 0;
+  let saveCalls = 0;
+  const page = createPage({
+    getStatus: () => ++statusCalls === 2 ? stalePoll.promise : Promise.resolve(bpsStatus()),
+    save: (config, store) => {
+      store.config = clone(config);
+      return ++saveCalls === 2 ? finalSave.promise : Promise.resolve(clone(config));
+    },
+    test: () => Promise.resolve({ status_json: JSON.stringify({
+      bps_disabled_accounts: [{ account_id: 2, block_id: bpsBlockA }],
+      degradation_check: { completed: true, degraded_account_ids: [], results: [{ account_id: 2, status: "error", error: "HTTP 403" }] },
+    }) }),
+  });
+  await flush();
+  page.pollStatus();
+  page.checkAccount(2);
+  await flush();
+  assert.match(page.accountRow(2).availability.textContent, /403/);
+  stalePoll.resolve(bpsStatus());
+  await flush();
+  assert.match(page.accountRow(2).availability.textContent, /403/, "An earlier status response must not erase the diagnostic block");
+  assert.equal(page.accountRow(2).checkbox.checked, false);
+  finalSave.resolve(clone(page.store.config));
+  await flush();
 });
 
 function createBridgeHarness(options = {}) {

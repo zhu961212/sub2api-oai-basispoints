@@ -17,7 +17,7 @@ func recoverTransportEnvelope(raw string) map[string]any {
 	}
 	for depth := 0; depth < 4; depth++ {
 		raw = strings.TrimSpace(raw)
-		value, _, ok := recoveryJSONValue(raw, true)
+		value, _, ok := relayJSONValue(raw, true)
 		if ok {
 			switch value := value.(type) {
 			case map[string]any:
@@ -115,7 +115,7 @@ func recoverEmbeddedEnvelope(raw string) map[string]any {
 			// object out of a batch or an otherwise malformed outer value.
 			return nil
 		case '{':
-			value, consumed, ok := recoveryJSONValue(raw[index:], false)
+			value, consumed, ok := relayJSONValue(raw[index:], false)
 			if !ok || found != nil {
 				return nil
 			}
@@ -137,7 +137,7 @@ func recoverEmbeddedEnvelope(raw string) map[string]any {
 			if opening == len(raw) || raw[opening] != '(' {
 				continue
 			}
-			value, consumed, ok := recoveryJSONValue(raw[opening+1:], false)
+			value, consumed, ok := relayJSONValue(raw[opening+1:], false)
 			if !ok || found != nil {
 				return nil
 			}

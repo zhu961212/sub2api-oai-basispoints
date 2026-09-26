@@ -75,6 +75,16 @@ func TestParseRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestParseRejectsNonObjectPayloads(t *testing.T) {
+	for _, input := range []string{"null", " null ", "[]", "[{}]", "true", "false", "42", string([]byte{'"', 'c', '"'})} {
+		t.Run(input, func(t *testing.T) {
+			if _, err := Parse([]byte(input)); err == nil {
+				t.Fatal("non-object configuration was accepted")
+			}
+		})
+	}
+}
+
 func TestParseRejectsTrailingContent(t *testing.T) {
 	if _, err := Parse([]byte(`{"auth_mode":"chatgpt"} {"auth_mode":"chatgpt"}`)); err == nil {
 		t.Fatal("multi-object config was accepted")

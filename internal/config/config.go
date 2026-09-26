@@ -6,16 +6,19 @@
 package config
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.5.25"
+	Version = "0.5.26"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -65,17 +68,22 @@ type Config struct {
 	// 缺省 false 保留旧白名单，配置页保存时迁移为自动模式。
 	AutoSelectNewAccounts bool    `json:"auto_select_new_accounts,omitempty"`
 	ExcludedAccountIDs    []int64 `json:"excluded_account_ids,omitempty"`
+	// Acknowledging one block never clears a newer persisted BPS 403.
+	BPSReenabledAccounts map[string]string `json:"bps_reenabled_accounts,omitempty"`
 	// DegradationCheck is a one-shot request marker consumed by TestConfig.
 	// The UI sets it immediately before config.test and clears it after the
 	// result has been applied. It is deliberately persisted by the host for the
 	// duration of that two-step bridge operation because TestConfig receives the
 	// saved configuration, not arbitrary UI payload.
-	DegradationCheck   bool   `json:"degradation_check,omitempty"`
-	MaxResponseBytes   int    `json:"max_response_bytes"`
-	AuthMode           string `json:"auth_mode"`
-	ToolsVersionID     string `json:"tools_version_id,omitempty"`
-	RewriteTools       bool   `json:"rewrite_tools"`
-	TransformResponses bool   `json:"transform_responses"`
+	DegradationCheck bool `json:"degradation_check,omitempty"`
+	// DegradationCheckAccountID narrows the one-shot check to one account.
+	// Zero keeps the bulk scan; the UI clears both command fields afterwards.
+	DegradationCheckAccountID int64  `json:"degradation_check_account_id,omitempty"`
+	MaxResponseBytes          int    `json:"max_response_bytes"`
+	AuthMode                  string `json:"auth_mode"`
+	ToolsVersionID            string `json:"tools_version_id,omitempty"`
+	RewriteTools              bool   `json:"rewrite_tools"`
+	TransformResponses        bool   `json:"transform_responses"`
 }
 
 // Default 返回一份完整可用的默认配置。宿主极少提交空对象，但空对象必须
@@ -160,8 +168,14 @@ func normalizeAccountIDs(ids []int64) []int64 {
 // Parse 严格解析配置 JSON：拒绝未知字段、拒绝多对象、拒绝非法范围。
 func Parse(raw []byte) (Config, error) {
 	c := Default()
-	if len(strings.TrimSpace(string(raw))) != 0 {
-		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	input := strings.TrimSpace(string(raw))
+	if len(input) != 0 {
+		// Decoding JSON null into a struct succeeds without changing defaults,
+		// which would silently reset saved routing instead of rejecting input.
+		if input[0] != '{' {
+			return Config{}, fmt.Errorf("configuration JSON must contain one object")
+		}
+		decoder := json.NewDecoder(strings.NewReader(input))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&c); err != nil {
 			return Config{}, fmt.Errorf("configuration JSON is invalid: %w", err)
@@ -207,8 +221,24 @@ func (c *Config) Normalize() error {
 	if c.MaxResponseBytes < 64<<10 || c.MaxResponseBytes > 128<<20 {
 		return fmt.Errorf("max_response_bytes must be between 64 KiB and 128 MiB")
 	}
+	if c.DegradationCheckAccountID < 0 {
+		return fmt.Errorf("degradation_check_account_id must be a positive account ID or zero")
+	}
+	if c.DegradationCheckAccountID != 0 && !c.DegradationCheck {
+		return fmt.Errorf("degradation_check_account_id requires degradation_check")
+	}
 	c.AccountIDs = normalizeAccountIDs(c.AccountIDs)
 	c.ExcludedAccountIDs = normalizeAccountIDs(c.ExcludedAccountIDs)
+	for key, blockID := range c.BPSReenabledAccounts {
+		id, err := strconv.ParseInt(key, 10, 64)
+		if err != nil || id <= 0 || strconv.FormatInt(id, 10) != key || len(blockID) != 32 || strings.ToLower(blockID) != blockID {
+			return fmt.Errorf("bps_reenabled_accounts must map positive account IDs to block IDs")
+		}
+		if _, err := hex.DecodeString(blockID); err != nil {
+			return fmt.Errorf("bps_reenabled_accounts contains an invalid block ID")
+		}
+	}
+	c.BPSReenabledAccounts = maps.Clone(c.BPSReenabledAccounts)
 	c.ToolsVersionID = strings.TrimSpace(c.ToolsVersionID)
 	models, err := normalizeEnabledModels(c.EnabledModels)
 	if err != nil {
@@ -223,6 +253,7 @@ func (c Config) Clone() Config {
 	c.EnabledModels = cloneStrings(c.EnabledModels)
 	c.AccountIDs = append([]int64(nil), c.AccountIDs...)
 	c.ExcludedAccountIDs = append([]int64(nil), c.ExcludedAccountIDs...)
+	c.BPSReenabledAccounts = maps.Clone(c.BPSReenabledAccounts)
 	return c
 }
 
@@ -246,16 +277,20 @@ func (c Config) HandlesAccount(accountID int64) bool {
 		}
 		return true
 	}
-	ids := c.SelectedAccountIDs()
-	if len(ids) == 0 {
-		return true
-	}
-	for _, selected := range ids {
+	// Routing only needs membership. Normalizing here allocated a map and
+	// copied the entire account list for every request. Keep invalid-only
+	// legacy selections equivalent to an empty (unrestricted) selection.
+	hasSelection := false
+	for _, selected := range c.AccountIDs {
+		if selected <= 0 {
+			continue
+		}
+		hasSelection = true
 		if selected == accountID {
 			return true
 		}
 	}
-	return false
+	return !hasSelection
 }
 
 // HandlesModel 报告某个模型名是否由本插件接管（= 请求打到 Basis Points）。

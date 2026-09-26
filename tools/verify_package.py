@@ -6,12 +6,16 @@
 用法：
     python tools/verify_package.py dist/package.s2plugin
     python tools/verify_package.py pkg.s2plugin --public-key ../basispoints-private/publisher.public
+    python tools/verify_package.py pkg.s2plugin --require-signature --public-key publisher.public --expected-key-id publisher-v1
 """
 import argparse
 import base64
 import hashlib
 import json
 import os
+import posixpath
+import re
+import stat
 import sys
 import zipfile
 
@@ -67,11 +71,17 @@ def _scalar_mult(point, scalar):
 
 
 def _decode_point(encoded):
+    if len(encoded) != 32:
+        raise ValueError("invalid point length")
     value = int.from_bytes(encoded, "little")
     y = value & ((1 << 255) - 1)
+    if y >= _P:
+        raise ValueError("non-canonical point")
     x = _x_recover(y)
     if x & 1 != (value >> 255) & 1:
         x = _P - x
+    if x >= _P or (y*y - x*x - 1 - _D*x*x*y*y) % _P:
+        raise ValueError("invalid curve point")
     return [x, y]
 
 
@@ -82,6 +92,8 @@ def verify_ed25519(public_key, signature, message):
     try:
         public_point = _decode_point(public_key)
         r_point = _decode_point(signature[:32])
+        if _scalar_mult(public_point, 8) == [0, 1]:
+            return False
     except (ValueError, ZeroDivisionError):
         return False
     scalar = int.from_bytes(signature[32:], "little")
@@ -108,24 +120,122 @@ def self_test():
 # --- 包校验 -----------------------------------------------------------------
 
 
-def verify(package_path, public_key_path=""):
-    problems = []
-    archive = zipfile.ZipFile(package_path)
-    names = archive.namelist()
-    manifest = json.loads(archive.read("manifest.json"))
+def _safe_path(path):
+    return (isinstance(path, str) and bool(path) and path == path.strip()
+            and not path.startswith("/") and ":" not in path and "\\" not in path
+            and not any(ord(char) < 32 for char in path)
+            and path not in (".", "..") and not path.startswith("../")
+            and posixpath.normpath(path) == path)
 
-    unknown = set(manifest) - MANIFEST_KEYS
-    if unknown:
-        problems.append("清单含未知字段（宿主解析会失败）: %s" % sorted(unknown))
-    unknown_requires = set(manifest.get("requires", {})) - REQUIRES_KEYS
-    if unknown_requires:
-        problems.append("requires 含未知字段: %s" % sorted(unknown_requires))
+
+def _object(value, allowed, required, label):
+    if not isinstance(value, dict):
+        raise ValueError("%s 必须是 JSON 对象" % label)
+    if set(value) - allowed:
+        raise ValueError("%s 含未知字段: %s" % (label, sorted(set(value) - allowed)))
+    if required - set(value):
+        raise ValueError("%s 缺少字段: %s" % (label, sorted(required - set(value))))
+
+
+def _validate_manifest(manifest):
+    _object(manifest, MANIFEST_KEYS, MANIFEST_KEYS - {"description", "author"}, "manifest")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise ValueError("schema_version 必须是整数 1")
+    for key in ("id", "name", "version", "description", "author"):
+        if key in manifest and not isinstance(manifest[key], str):
+            raise ValueError("%s 必须是字符串" % key)
+    if not re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)+", manifest["id"]) or len(manifest["id"]) > 160:
+        raise ValueError("插件 ID 无效")
+    if not manifest["name"].strip() or len(manifest["name"].encode("utf-8")) > 160:
+        raise ValueError("插件名称为空或超过宿主 160 字节限制")
+    version = manifest["version"]
+    if not re.fullmatch(r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?", version):
+        raise ValueError("插件版本不是有效的语义化版本")
+    prerelease = version.split("+", 1)[0].partition("-")[2]
+    if any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in prerelease.split(".")):
+        raise ValueError("插件预发布版本包含非法的前导零")
+    requires = manifest["requires"]
+    _object(requires, REQUIRES_KEYS, {"sub2api", "plugin_protocol", "transport_api", "ui_bridge"}, "requires")
+    if not isinstance(requires["sub2api"], str) or not requires["sub2api"].strip():
+        raise ValueError("requires.sub2api 不能为空")
+    for key in ("plugin_protocol", "transport_api", "ui_bridge"):
+        if type(requires[key]) is not int or requires[key] != 1:
+            raise ValueError("%s 必须是整数 1" % key)
+    if "recommended_sub2api_version" in requires and not isinstance(requires["recommended_sub2api_version"], str):
+        raise ValueError("recommended_sub2api_version 必须是字符串")
+    if "tested_sub2api_versions" in requires and (not isinstance(requires["tested_sub2api_versions"], list) or not all(isinstance(v, str) for v in requires["tested_sub2api_versions"])):
+        raise ValueError("tested_sub2api_versions 必须是字符串数组")
+    capabilities = manifest["capabilities"]
+    if not isinstance(capabilities, list) or not capabilities:
+        raise ValueError("capabilities 不能为空")
+    for capability in capabilities:
+        fields = {"id", "platform", "account_type"}
+        _object(capability, fields, fields, "capability")
+        if capability != {"id": "openai.oauth.outbound_transport.v1", "platform": "openai", "account_type": "oauth"}:
+            raise ValueError("能力声明不受宿主支持")
+    runtimes = manifest["runtimes"]
+    if not isinstance(runtimes, dict) or not runtimes:
+        raise ValueError("runtimes 不能为空")
+    for key, entry in runtimes.items():
+        if not re.fullmatch(r"[a-z0-9]+-[a-z0-9]+", key):
+            raise ValueError("运行时平台键无效: %s" % key)
+        _object(entry, {"path"}, {"path"}, "runtime")
+        if not _safe_path(entry["path"]):
+            raise ValueError("运行时路径无效")
+    _object(manifest["ui"], {"entrypoint"}, {"entrypoint"}, "ui")
+    entrypoint = manifest["ui"]["entrypoint"]
+    if not _safe_path(entrypoint) or not entrypoint.startswith("ui/"):
+        raise ValueError("UI 入口必须位于 ui/ 目录")
+    files = manifest["files"]
+    if not isinstance(files, dict) or not files:
+        raise ValueError("files 不能为空")
+    for path, digest in files.items():
+        if not _safe_path(path) or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError("插件文件声明无效: %s" % path)
+    for path in [entrypoint] + [entry["path"] for entry in runtimes.values()]:
+        if path not in files:
+            raise ValueError("运行时或 UI 入口未包含在文件哈希声明中: %s" % path)
+
+
+def verify(package_path, public_key_path="", require_signature=False, expected_key_id=""):
+    try:
+        with zipfile.ZipFile(package_path) as archive:
+            return _verify_archive(archive, package_path, public_key_path, require_signature, expected_key_id)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, zipfile.BadZipFile, NotImplementedError) as error:
+        return "校验结果: 失败\n  - %s" % error, False
+
+
+def _verify_archive(archive, package_path, public_key_path, require_signature, expected_key_id):
+    problems = []
+    names = archive.namelist()
+    if not names or len(names) > 512:
+        raise ValueError("插件包文件数量必须为 1–512")
+    if len(set(names)) != len(names):
+        raise ValueError("插件包包含重复路径")
+    for entry in archive.infolist():
+        # ZipInfo normalizes backslashes on Windows and truncates NULs. Check
+        # the original archive name so neither transformation hides bad input.
+        path = entry.orig_filename[:-1] if entry.is_dir() else entry.orig_filename
+        if not _safe_path(path):
+            raise ValueError("插件包包含不安全路径: %s" % entry.filename)
+        if stat.S_ISLNK(entry.external_attr >> 16):
+            raise ValueError("插件包不允许符号链接: %s" % entry.filename)
+    if sum(entry.file_size for entry in archive.infolist()) > 2 * 1024**3:
+        raise ValueError("插件包解压体积超过宿主允许的最大配置上限")
+    if archive.getinfo("manifest.json").file_size > 2 * 1024**2:
+        raise ValueError("manifest.json 超过宿主 2 MiB 限制")
+    manifest = json.loads(archive.read("manifest.json"))
+    _validate_manifest(manifest)
 
     for path, expected in manifest["files"].items():
         if path not in names:
             problems.append("缺少已声明文件: %s" % path)
             continue
-        actual = hashlib.sha256(archive.read(path)).hexdigest()
+        digest = hashlib.sha256()
+        with archive.open(path) as source:
+            for chunk in iter(lambda: source.read(64 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
         if actual != expected:
             problems.append("哈希不匹配: %s" % path)
 
@@ -139,25 +249,37 @@ def verify(package_path, public_key_path=""):
             problems.append("运行时缺失: %s -> %s" % (key, entry["path"]))
     if manifest["ui"]["entrypoint"] not in names:
         problems.append("UI 入口缺失: %s" % manifest["ui"]["entrypoint"])
-    for capability in manifest["capabilities"]:
-        if capability.get("id") != "openai.oauth.outbound_transport.v1" or capability.get("platform") != "openai" or capability.get("account_type") != "oauth":
-            problems.append("能力声明不受宿主支持: %s" % capability)
-    requires = manifest["requires"]
-    if requires.get("plugin_protocol") != 1 or requires.get("transport_api") != 1 or requires.get("ui_bridge") != 1:
-        problems.append("协议版本不是 1/1/1: %s" % requires)
-
     signature_line = "签名: 无（未签名，仅限本地调试）"
+    if "signature.json" not in names and (require_signature or public_key_path or expected_key_id):
+        problems.append("发布校验要求有效签名，但包中没有 signature.json")
     if "signature.json" in names:
+        if archive.getinfo("signature.json").file_size > 64 * 1024:
+            raise ValueError("signature.json 超过宿主 64 KiB 限制")
         signature = json.loads(archive.read("signature.json"))
+        _object(signature, {"algorithm", "key_id", "signature"}, {"algorithm", "key_id", "signature"}, "signature")
         key_id = signature.get("key_id", "")
+        if not isinstance(key_id, str) or not key_id.strip():
+            problems.append("签名密钥 ID 无效")
+        if expected_key_id and key_id != expected_key_id:
+            problems.append("签名密钥 ID 与指定发布者不一致")
+        try:
+            raw_signature = base64.b64decode(signature.get("signature", ""), validate=True)
+            if len(raw_signature) != 64:
+                raise ValueError("invalid length")
+        except (ValueError, TypeError):
+            problems.append("签名不是合法的 64 字节 base64 Ed25519 签名")
+            raw_signature = b""
         if signature.get("algorithm") != "ed25519":
             problems.append("签名算法不是 ed25519: %s" % signature.get("algorithm"))
         if not public_key_path:
             signature_line = "签名: 存在（key_id=%s，未提供公钥，未验证）" % key_id
+            if require_signature or expected_key_id:
+                problems.append("发布验签必须提供 --public-key")
         elif not os.path.exists(public_key_path):
             problems.append("公钥文件不存在: %s" % public_key_path)
         else:
-            text = open(public_key_path, "r", encoding="utf-8").read().strip()
+            with open(public_key_path, "r", encoding="utf-8") as key_file:
+                text = key_file.read().strip()
             try:
                 public_key = base64.b64decode(text, validate=True)
                 raw_signature = base64.b64decode(signature.get("signature", ""), validate=True)
@@ -188,13 +310,15 @@ def main():
     parser = argparse.ArgumentParser(description="独立校验 Sub2API 插件包")
     parser.add_argument("package", help="path/to/plugin.s2plugin")
     parser.add_argument("--public-key", default="", help="base64 Ed25519 公钥文件，用于验签")
+    parser.add_argument("--require-signature", action="store_true", help="发布校验：要求已签名并用 --public-key 验证通过")
+    parser.add_argument("--expected-key-id", default="", help="要求 signature.key_id 与宿主 trusted_publishers 的键一致")
     args = parser.parse_args()
     try:
         self_test()
     except RuntimeError as error:
         print(str(error))
         return 2
-    report, ok = verify(args.package, args.public_key)
+    report, ok = verify(args.package, args.public_key, args.require_signature, args.expected_key_id)
     print(report)
     return 0 if ok else 1
 

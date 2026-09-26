@@ -266,6 +266,8 @@ func sendTransformedHTTPResponseStreamWithKeepalive(stream pluginv1.TransportPlu
 }
 
 func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin_ForwardServer, resp *http.Response, max int, source map[string]any, interval time.Duration, repair relayToolRepair) error {
+	observers := basisPointsResponseStatusObservers(resp)
+	isolateBasisPoints := consumeBasisPointsSSEInPlace(resp, max)
 	ctx := stream.Context()
 	type readResult struct {
 		data []byte
@@ -388,6 +390,9 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 		} else if event.event != "" {
 			payload["type"] = event.event
 		}
+		if isolateBasisPoints {
+			isolateBasisPointsFailureObject(payload, event.event, observers...)
+		}
 		if relayToolEvent(event) && !terminal {
 			pending = append(pending, event)
 			return nil
@@ -425,7 +430,7 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 			}
 			_, translated, _, err := protocol.TransformResponseBody(protocol.JSONBytes(response), source)
 			repairStart := -1
-			if protocol.IsUnknownClientToolError(err) && repair != nil && protocol.ToolRepairEligible(source, response) {
+			if protocol.IsRepairableClientToolError(err) && repair != nil && protocol.ToolRepairEligible(source, response) {
 				repairStart = len(response["output"].([]any)) - 1
 				// The original tool records remain withheld. Keep the existing
 				// response lifecycle and keepalives while requesting correction.
@@ -527,11 +532,15 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 	fail := func(code, message string) error {
 		pending = nil
 		if sent > 0 {
+			failure := map[string]any{"code": code, "message": message}
+			if code == "bps_service_rejected" {
+				failure["type"] = "invalid_request_error"
+			}
 			if err := sendJSON("response.failed", map[string]any{
 				"response": map[string]any{
 					"status": "failed",
 					"output": []any{},
-					"error":  map[string]any{"code": code, "message": message},
+					"error":  failure,
 				},
 			}); err != nil {
 				return err
@@ -595,6 +604,10 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 			return finishStream()
 		}
 		if result.err != nil {
+			var api *protocol.APIError
+			if errors.As(result.err, &api) {
+				return fail(api.Code(), api.Error())
+			}
 			return fail("upstream_read", safeUpstreamReadError(result.err))
 		}
 		nextRead <- struct{}{}

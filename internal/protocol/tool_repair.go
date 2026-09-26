@@ -3,30 +3,91 @@ package protocol
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"math/big"
 	"strings"
 )
 
 const unknownClientToolMessage = "Basis Points returned an unknown client tool absent from the active catalog"
+const malformedClientToolMessage = "Basis Points returned a malformed or ambiguous client tool relay envelope"
 
 func IsUnknownClientToolError(err error) bool {
 	var api *APIError
 	return errors.As(err, &api) && api.Kind == "invalid_tool_call" && api.Message == unknownClientToolMessage
 }
 
-// ToolRepairEligible permits regeneration of only one unexecuted relay on
-// the first client turn. Description-only helpers never become client tools.
+// The message identifies a candidate only; ToolRepairEligible must separately
+// establish that the unexecuted relay can be regenerated without ambiguity.
+func IsRepairableClientToolError(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.Kind == "invalid_tool_call" && (api.Message == unknownClientToolMessage || api.Message == malformedClientToolMessage)
+}
+
+func completeToolHistory(items []any) bool {
+	pending, seen := map[string]string{}, map[string]bool{}
+	for _, value := range items {
+		item := objectValue(value)
+		kind, callID := stringValue(item["type"]), stringValue(item["call_id"])
+		if kind == "compaction" {
+			return false
+		}
+		if clientCallableItem(item) {
+			if (kind != "function_call" && kind != "custom_tool_call") || callID == "" || seen[callID] {
+				return false
+			}
+			pending[callID], seen[callID] = kind+"_output", true
+		} else if strings.HasSuffix(kind, "_call_output") {
+			if callID == "" || pending[callID] != kind {
+				return false
+			}
+			delete(pending, callID)
+		} else if strings.HasSuffix(kind, "_call") {
+			return false
+		}
+	}
+	return len(pending) == 0
+}
+
+func truncatedRelayCanRegenerate(native, source map[string]any) bool {
+	if stringValue(native["type"]) != "function_call" || !isTransportName(stringValue(native["name"])) {
+		return false
+	}
+	arguments := parseTransportArguments(native["arguments"])
+	raw, ok := arguments["code"].(string)
+	if !ok || len(raw) > maxRecoveredEnvelopeBytes {
+		return false
+	}
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "{") {
+		return false
+	}
+	value, _, err := strictRelayJSONValue(raw, true)
+	var syntax *json.SyntaxError
+	truncated := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &syntax) && syntax.Error() == "unexpected end of JSON input"
+	if !truncated {
+		return false
+	}
+	envelope := unambiguousEnvelope(objectValue(value))
+	if envelope == nil {
+		return false
+	}
+	name := recoveryEnvelopeName(envelope)
+	if isTransportName(name) {
+		return false
+	}
+	_, exists := resolveClientTool(clientToolSpecs(source), name)
+	return exists
+}
+
+// Regenerate only the final unexecuted relay. Explicit prior tool history must
+// be complete; opaque server-side history and unfinished calls stay ineligible.
 func ToolRepairEligible(source, response map[string]any) bool {
-	if source == nil || response == nil || source["previous_response_id"] != nil || source["conversation"] != nil || len(clientToolSpecs(source)) == 0 {
+	if source == nil || response == nil || source["previous_response_id"] != nil || source["previousResponseId"] != nil || source["conversation"] != nil || len(clientToolSpecs(source)) == 0 {
 		return false
 	}
 	items, _ := source["input"].([]any)
-	for _, value := range items {
-		item := objectValue(value)
-		kind := stringValue(item["type"])
-		if clientCallableItem(item) || strings.HasSuffix(kind, "_call_output") || kind == "compaction" {
-			return false
-		}
+	if !completeToolHistory(items) {
+		return false
 	}
 	if status := stringValue(response["status"]); status != "" && status != "completed" {
 		return false
@@ -42,11 +103,16 @@ func ToolRepairEligible(source, response map[string]any) bool {
 		}
 		// Earlier output positions may already have been streamed. Replace
 		// only the last, still-withheld tool position.
-		if index != len(output)-1 || transportEnvelope(item) == nil || stringValue(item["call_id"]) == "" {
+		if index != len(output)-1 || stringValue(item["call_id"]) == "" {
 			return false
 		}
+		for _, prior := range items {
+			if stringValue(objectValue(prior)["call_id"]) == stringValue(item["call_id"]) {
+				return false
+			}
+		}
 		_, reason := decodeNativeClientToolCallFromItem(item, source, false)
-		return reason == unknownClientToolMessage
+		return reason == unknownClientToolMessage && transportEnvelope(item) != nil || reason == malformedClientToolMessage && truncatedRelayCanRegenerate(item, source)
 	}
 	return false
 }
@@ -65,6 +131,9 @@ func PrepareToolRepairBody(prepared, source, response map[string]any) (map[strin
 	output := response["output"].([]any)
 	call := objectValue(output[len(output)-1])
 	feedback := "The proxy rejected the preceding relay because its inner tool name is absent from the active client catalog. No client tool was executed. A helper documented inside an executor is callable only from that executor's raw input. Regenerate exactly one tool call using an explicitly declared client tool. Do not repeat commentary or change the task, model, account, scope, or input."
+	if transportEnvelope(call) == nil {
+		feedback = "The proxy rejected the preceding relay because its code contains incomplete JSON. No client tool was executed. Regenerate exactly one complete relay for the declared client tool. Serialize the entire inner object as the code string, preserving quotes and backslashes. Do not guess missing arguments, repeat commentary, or change the task, model, account, scope, or input."
+	}
 	added := append([]any{}, cloneJSONValue(output).([]any)...)
 	added = append(added, map[string]any{"type": "function_call_output", "call_id": call["call_id"], "output": feedback}, messageItem("developer", feedback+" "+clientToolProtocolReminder(source)))
 	body["input"] = appendBeforeCompaction(items, added)
@@ -97,6 +166,13 @@ func MergeToolRepairResponse(source, original, repaired map[string]any) (map[str
 	prefix := merged["output"].([]any)
 	merged["output"] = append(prefix[:len(prefix)-1], cloneJSONValue(output).([]any)...)
 	ids, calls := map[string]bool{}, map[string]bool{}
+	if history, ok := source["input"].([]any); ok {
+		for _, value := range history {
+			if id := stringValue(objectValue(value)["call_id"]); id != "" {
+				calls[id] = true
+			}
+		}
+	}
 	for _, value := range merged["output"].([]any) {
 		item := objectValue(value)
 		id, callID := stringValue(item["id"]), stringValue(item["call_id"])

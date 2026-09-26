@@ -50,6 +50,13 @@ func redactImageFailureFields(object map[string]any, failure bool) {
 }
 
 func redactImageFailureJSON(raw []byte, event string) ([]byte, bool) {
+	return redactImageFailureJSONWithIsolation(raw, event, false)
+}
+
+func redactImageFailureJSONWithIsolation(raw []byte, event string, isolateBasisPoints bool, observers ...func(int)) ([]byte, bool) {
+	if !mayContainResponseFailure(raw, event) {
+		return raw, false
+	}
 	if !json.Valid(raw) {
 		return raw, false
 	}
@@ -58,6 +65,9 @@ func redactImageFailureJSON(raw []byte, event string) ([]byte, bool) {
 		return raw, false
 	}
 	before := protocol.JSONBytes(object)
+	if isolateBasisPoints {
+		isolateBasisPointsFailureObject(object, event, observers...)
+	}
 	redactImageFailureFields(object, imageFailureKind(event))
 	after := protocol.JSONBytes(object)
 	if bytes.Equal(before, after) {
@@ -67,7 +77,11 @@ func redactImageFailureJSON(raw []byte, event string) ([]byte, bool) {
 }
 
 func redactImageFailureEvent(event sseRelayEvent) []byte {
-	data, changed := redactImageFailureJSON([]byte(event.data), event.event)
+	return redactImageFailureEventWithIsolation(event, false)
+}
+
+func redactImageFailureEventWithIsolation(event sseRelayEvent, isolateBasisPoints bool, observers ...func(int)) []byte {
+	data, changed := redactImageFailureJSONWithIsolation([]byte(event.data), event.event, isolateBasisPoints, observers...)
 	if !changed {
 		if !imageFailureKind(event.event) || json.Valid([]byte(event.data)) {
 			return event.raw
@@ -120,6 +134,8 @@ func sendImageSafeHTTPResponse(stream pluginv1.TransportPlugin_ForwardServer, re
 // Decode records incrementally so an error can be scrubbed before any part of
 // its data is forwarded, without waiting for the upstream response to finish.
 func sendImageSafeHTTPResponseStream(stream pluginv1.TransportPlugin_ForwardServer, resp *http.Response, max int) error {
+	observers := basisPointsResponseStatusObservers(resp)
+	isolateBasisPoints := consumeBasisPointsSSEInPlace(resp, max)
 	defer resp.Body.Close()
 	stopClose := context.AfterFunc(stream.Context(), func() { _ = resp.Body.Close() })
 	defer stopClose()
@@ -137,7 +153,7 @@ func sendImageSafeHTTPResponseStream(stream pluginv1.TransportPlugin_ForwardServ
 		if len(event.raw) > eventLimit {
 			return errImageResponseLimit
 		}
-		body := redactImageFailureEvent(event)
+		body := redactImageFailureEventWithIsolation(event, isolateBasisPoints, observers...)
 		if sent+int64(len(body)) > int64(max) {
 			return errImageResponseLimit
 		}

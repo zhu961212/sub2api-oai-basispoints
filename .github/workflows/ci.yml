@@ -34,8 +34,8 @@ jobs:
           node --check ui/assets/app.js
           node --check ui/assets/bridge-v1.js
           node --test tools/ui.test.cjs
-      - name: Check source export boundaries
-        run: python3 -m unittest discover -s tools -p 'test_export_source.py'
+      - name: Check source export and package trust boundaries
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
       - name: Cross-build plugin
         run: go run ./tools/packager -targets windows/amd64,linux/amd64
       - name: Validate unsigned CI artifact

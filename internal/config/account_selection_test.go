@@ -73,6 +73,23 @@ func TestAccountSelectionNormalizationAndCloneOwnTheirSlices(t *testing.T) {
 	}
 }
 
+func TestAccountSelectionUnnormalizedLegacyCompatibility(t *testing.T) {
+	for _, ids := range [][]int64{nil, {}, {0, -1, -2}, {7, 7, 0, -1, 9}} {
+		cfg := Default()
+		cfg.AccountIDs = ids
+		normalized := cfg.SelectedAccountIDs()
+		for _, id := range []int64{-1, 0, 7, 9, 11} {
+			want := id == 0 || len(normalized) == 0
+			for _, selected := range normalized {
+				want = want || selected == id
+			}
+			if got := cfg.HandlesAccount(id); got != want {
+				t.Errorf("selection %v account %d: got %t, want %t", ids, id, got, want)
+			}
+		}
+	}
+}
+
 func TestAccountSelectionPolicySurvivesPersistedJSON(t *testing.T) {
 	cfg, err := Parse([]byte(`{"auto_select_new_accounts":true,"account_ids":[7,9],"excluded_account_ids":[9,11]}`))
 	if err != nil {
