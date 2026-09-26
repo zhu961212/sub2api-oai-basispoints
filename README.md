@@ -4,11 +4,18 @@
 
 [GitHub 仓库](https://github.com/zhu961212/sub2api-oai-basispoints) · [发布下载](https://github.com/zhu961212/sub2api-oai-basispoints/releases)
 
-当前版本：**0.5.24** · 插件 ID：**local.oai-basispoints**
+当前版本：**0.5.25** · 插件 ID：**local.oai-basispoints**
 
 适用于 Sub2API 官方版的插件，通过 OpenAI Excel（Basis Points）官方入口使用账号可用的官方模型。插件为 OpenAI OAuth 出站请求提供传输适配：改写客户端工具目录，还原工具调用与 Responses/SSE 响应。账号调度、Token 生命周期、用量统计及计费仍由宿主负责；插件不刷新或持久化令牌。
 
 本项目为第三方适配代码，不代表 OpenAI 或 Sub2API 的官方发布、授权或支持。
+
+## 0.5.25 更新
+
+- BPS Responses 返回 HTTP 500/502/503/504 时，在向客户端转发响应之前最多重试两次；复用已准备的正文、账号、代理和图片附件，重试与初次响应读取共用原有超时预算。
+- 尊重 Retry-After 和上游禁止重试提示；429、确定性请求错误、网络中断和已开始的流不自动重放。持续上游故障仍如实返回。
+- 超时、连接截断和响应体积超限分别诊断；图片上游错误保留脱敏的 HTTP 状态、错误码和字段路径，历史图片超限明确提示累计数量与大小。
+- 两条通用报错的定位依据、300 秒默认总超时及升级验收见 [0.5.25 修复记录](docs/release-0.5.25-2026-09-26.md)。该记录区分本地回归与尚未完成的生产验证。
 
 ## 0.5.24 更新
 
@@ -117,7 +124,7 @@ TestLive 系列属于可选真实上游测试，设置 BASISPOINTS_LIVE_TOKEN �
 
 ## GitHub 源码准备
 
-运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.5.24-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
+运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.5.25-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
 
 ## 构建、签名与验包
 
@@ -139,12 +146,12 @@ Linux：
 bash ./build.sh -signing-key ../basispoints-private/publisher.private -key-id my-publisher-v1
 ~~~
 
-构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.5.24.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
+构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.5.25.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
 
 显式传入配套公钥进行独立验包：
 
 ~~~powershell
-python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.5.24.s2plugin --public-key ../basispoints-private/publisher.public
+python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.5.25.s2plugin --public-key ../basispoints-private/publisher.public
 ~~~
 
 校验器检查包内容、文件哈希及 manifest 原始字节的 Ed25519 签名。构建脚本发现 Python 时会自动验包，但自动验签取决于其默认公钥路径；使用仓库外密钥时仍应执行上面的显式验签命令。
@@ -158,7 +165,7 @@ plugins:
     my-publisher-v1: BASE64_ED25519_PUBLIC_KEY
 ~~~
 
-在 Sub2API 插件管理页安装 0.5.24，打开配置页选择模型和账号并保存，再配置灰度并启用插件。详细步骤见 [使用说明](docs/使用说明.md)。
+在 Sub2API 插件管理页安装 0.5.25，打开配置页选择模型和账号并保存，再配置灰度并启用插件。详细步骤见 [使用说明](docs/使用说明.md)。
 
 ## 配置页与全选
 
@@ -196,7 +203,7 @@ Basis Points returned an unknown client tool absent from the active catalog
 
 该错误表示返回的调用无法匹配本轮客户端声明的工具目录。部分客户端的提示仍用 exec_command 固定示例，但本轮可能只声明 functions.exec 执行器。0.5.15 按实际目录生成调用格式指引，区分执行器与其内部 helper、自定义工具的原始 input 与中转信封中的 args。
 
-更新后需在宿主重新加载插件，确认运行版本为 0.5.24，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
+更新后需在宿主重新加载插件，确认运行版本为 0.5.25，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
 
 首次工具交互若上游仍返回一个目录外的中转调用，并且尚未向客户端发出任何工具，0.5.15 最多追加一次带当前目录与拒绝原因的纠正请求。它沿用原账号、模型、历史和图片引用；错误工具不会执行。纠正后的结果仍须通过原有目录和参数校验，两次请求的用量合并记录。
 
@@ -225,6 +232,7 @@ third_party/sub2api 被 go.mod 的本地 replace 引用，是构建所需项目�
 ## 文档与发布
 
 - [完整使用说明](docs/使用说明.md)：安装、配置、客户端使用和排查。
+- [0.5.25 修复记录](docs/release-0.5.25-2026-09-26.md)：临时上游错误重试、超时诊断与图片历史限制。
 - [0.5.24 发布记录](docs/release-0.5.24-2026-09-26.md)：新账号自动使用 BPS、旧白名单迁移和验证范围。
 - [兼容说明](docs/COMPATIBILITY-0.2.8.md)：宿主契约、版本范围和历史实测。
 - [0.5.16 发布记录](docs/release-0.5.16-2026-09-26.md)：自动原生发图、配置迁移与验证范围。

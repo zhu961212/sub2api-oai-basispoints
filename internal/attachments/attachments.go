@@ -149,7 +149,7 @@ func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesUR
 			path := fmt.Sprintf("input[%d].%s[%d]", i, field, j)
 			invalid := func(message string) error { return fail(400, "invalid_image", message+" (path="+path+")") }
 			if len(edits) >= maxRequestImages {
-				return false, invalid("At most 20 inline images are allowed per request")
+				return false, invalid(fmt.Sprintf("At most 20 inline images are allowed per request; received at least %d. Conversation history, tool screenshots, and repeated images all count toward this limit; start a new conversation or use fewer images", len(edits)+1))
 			}
 			if value, exists := part["file_id"]; exists && value != nil && value != "" {
 				return false, invalid("input_image cannot contain both image_url and file_id")
@@ -204,7 +204,7 @@ func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesUR
 			}
 			total += img.size
 			if total > maxRequestBytes {
-				return false, invalid("Inline images exceed the 32 MiB request limit")
+				return false, invalid(fmt.Sprintf("Inline images exceed the 32 MiB request limit; counted %.2f MiB across %d images. Conversation history, tool screenshots, and repeated images all count toward this limit; start a new conversation or use fewer/smaller images", float64(total)/(1<<20), len(edits)+1))
 			}
 			edits = append(edits, imageEdit{part: part, image: img, upload: upload})
 		}

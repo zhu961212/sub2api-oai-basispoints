@@ -666,7 +666,9 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		}
 	}
 	upstreamURL := cfg.ResponsesURL
-	req, err := http.NewRequestWithContext(stream.Context(), start.GetMethod(), upstreamURL, bytes.NewReader(requestBody))
+	requestCtx, cancelRequest := context.WithTimeout(stream.Context(), time.Duration(cfg.TimeoutSeconds)*time.Second)
+	defer cancelRequest()
+	req, err := http.NewRequestWithContext(requestCtx, start.GetMethod(), upstreamURL, bytes.NewReader(requestBody))
 	if err != nil {
 		return sendError(stream, "upstream_request", "cannot create upstream request", false)
 	}
@@ -678,7 +680,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	if cfg.RewriteTools {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	resp, err := requestClient.Do(req)
+	resp, err := doBasisPointsRequest(requestClient, req)
 	if err != nil {
 		return sendError(stream, "upstream_transport", safeTransportError(err), true)
 	}
@@ -708,7 +710,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	}
 	respBody, err := readLimited(resp.Body, cfg.MaxResponseBytes)
 	if err != nil {
-		return sendError(stream, "upstream_response_too_large", safeError(err), true)
+		return sendError(stream, errorCode(err), safeError(err), true)
 	}
 	if imagesRewritten {
 		respBody, _ = redactImageFailureJSON(respBody, "")
@@ -1152,16 +1154,20 @@ func safeTransportError(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return "request canceled"
 	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return safeUpstreamReadError(err)
+	}
 	return "upstream transport failed"
 }
 
 func readLimited(r io.Reader, max int) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(r, int64(max)+1))
 	if err != nil {
-		return nil, fmt.Errorf("upstream response could not be read")
+		return nil, &protocol.APIError{Status: http.StatusBadGateway, Kind: "upstream_read", Message: safeUpstreamReadError(err)}
 	}
 	if len(data) > max {
-		return nil, fmt.Errorf("upstream response exceeds configured limit")
+		return nil, &protocol.APIError{Status: http.StatusBadGateway, Kind: "upstream_response_too_large", Message: "upstream response exceeds configured limit"}
 	}
 	return data, nil
 }

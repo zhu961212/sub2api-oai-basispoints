@@ -97,10 +97,24 @@ func redactImageErrorValues(value any) {
 func sendImageUpstreamError(stream pluginv1.TransportPlugin_ForwardServer, resp *http.Response, max int) error {
 	body, err := readLimited(resp.Body, max)
 	if err != nil {
-		return sendError(stream, "upstream_read", safeError(err), true)
+		return sendError(stream, errorCode(err), safeError(err), true)
 	}
 	message := redactImageDiagnostic(protocol.ErrorMessage(body))
-	encoded := protocol.JSONBytes(map[string]any{"error": map[string]any{"message": message, "type": "upstream_error", "code": "upstream_error"}})
+	failure := map[string]any{
+		"message": fmt.Sprintf("Basis Points returned HTTP %d: %s", resp.StatusCode, message),
+		"type":    "upstream_error", "code": "upstream_error",
+	}
+	if object, parseErr := protocol.RawObject(body); parseErr == nil {
+		if upstream, ok := object["error"].(map[string]any); ok {
+			// Keep diagnostic identifiers, never the validator's echoed input.
+			for _, field := range []string{"type", "code", "param"} {
+				if value, ok := upstream[field].(string); ok && value != "" {
+					failure[field] = redactImageDiagnostic(value)
+				}
+			}
+		}
+	}
+	encoded := protocol.JSONBytes(map[string]any{"error": failure})
 	return sendHTTPResponse(stream, resp, encoded, "application/json")
 }
 

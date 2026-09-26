@@ -111,7 +111,7 @@ func sendImageSafeHTTPResponse(stream pluginv1.TransportPlugin_ForwardServer, re
 	}
 	body, err := readLimited(resp.Body, max)
 	if err != nil {
-		return sendError(stream, "upstream_response_too_large", safeError(err), true)
+		return sendError(stream, errorCode(err), safeError(err), true)
 	}
 	body, _ = redactImageFailureJSON(body, "")
 	return sendHTTPResponse(stream, resp, body, resp.Header.Get("Content-Type"))

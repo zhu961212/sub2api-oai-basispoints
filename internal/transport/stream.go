@@ -595,7 +595,7 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 			return finishStream()
 		}
 		if result.err != nil {
-			return fail("upstream_read", "upstream response could not be read")
+			return fail("upstream_read", safeUpstreamReadError(result.err))
 		}
 		nextRead <- struct{}{}
 	}
