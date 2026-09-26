@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -232,7 +233,7 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	}
 	observeBPSStatus := newBasisPointsStatusObserver(func() { t.disableBPSAccount(ctx, accountID) })
 	start := &pluginv1.ForwardRequestStart{AccountId: accountID}
-	headers, proxyURL, err := prepareHeaders(ctx, start, host, c.AuthMode)
+	headers, proxyURL, err := t.prepareBPSHeaders(ctx, start, host, c)
 	if err != nil {
 		return "error", "", err
 	}
@@ -240,6 +241,7 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	if err != nil {
 		return "error", "", err
 	}
+	requestClient = withoutBPSRedirects(requestClient)
 	// Match real forwarding: Basis Points expects normalized input, explicit
 	// model selection and streamed Responses output.
 	upstreamBody, err := protocol.PrepareResponsesBody(map[string]any{
@@ -249,6 +251,9 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	}, c)
 	if err != nil {
 		return "error", "", fmt.Errorf("cannot prepare check request")
+	}
+	if c.BPSDeviceConvergence {
+		applyBPSDeviceBody(upstreamBody, headers.Get("X-Codex-Installation-Id"))
 	}
 	body := protocol.JSONBytes(upstreamBody)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ResponsesURL, bytes.NewReader(body))
@@ -282,25 +287,15 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	if err != nil {
 		return "error", "", err
 	}
-	if isExpectedDegradationAnswer(answer) {
-		return "ok", answer, nil
-	}
-	return "degraded", answer, nil
+	status, verdictErr := classifyDegradationAnswer(answer)
+	return status, answer, verdictErr
 }
 
-// isExpectedDegradationAnswer accepts the variants shown by capable models
-// ("苹果17", "iPhone 17 系列", or "Apple 17"). Explanations are harmless
-// when they identify the 17 generation; older generations and answers without
-// that generation are classified as degraded.
+// isExpectedDegradationAnswer retains the fixed, user-selected generation rule.
+// Ambiguous answers must not be promoted to a conclusive account verdict.
 func isExpectedDegradationAnswer(answer string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(answer))
-	normalized = strings.NewReplacer(
-		" ", "", "\t", "", "\r", "", "\n", "", "　", "",
-		"-", "", "_", "",
-	).Replace(normalized)
-	return strings.Contains(normalized, "苹果17") ||
-		strings.Contains(normalized, "iphone17") ||
-		strings.Contains(normalized, "apple17")
+	status, _ := classifyDegradationAnswer(answer)
+	return status == "ok"
 }
 
 // degradationAnswer accepts both the JSON and SSE forms returned by Responses
@@ -328,6 +323,15 @@ func degradationAnswer(body []byte, contentType string) (string, error) {
 			return "", err
 		}
 	}
+	if output, ok := object["output"].([]any); ok {
+		for _, value := range output {
+			if item, ok := value.(map[string]any); ok {
+				if err := degradationResponseError(item); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
 	if choices, ok := object["choices"].([]any); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]any); ok {
 			if reason, ok := choice["finish_reason"].(string); ok && reason != "" && reason != "stop" {
@@ -345,12 +349,8 @@ func degradationAnswer(body []byte, contentType string) (string, error) {
 // gateways keep partial output inside a failed envelope without copying the
 // error or terminal status into the nested response.
 func degradationResponseError(object map[string]any) error {
-	if object["error"] != nil {
-		return fmt.Errorf("upstream response contains an error")
-	}
-	switch protocol.StringValue(object["type"]) {
-	case "error", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
-		return fmt.Errorf("upstream response did not complete")
+	if err := degradationExplicitFailure(object); err != nil {
+		return err
 	}
 	if status, ok := object["status"].(string); ok && status != "" && status != "completed" {
 		return fmt.Errorf("upstream response did not complete")
@@ -358,19 +358,55 @@ func degradationResponseError(object map[string]any) error {
 	return nil
 }
 
+// Progress events may have an in_progress status. Explicit failure evidence is
+// rejected immediately without treating ordinary progress as terminal.
+func degradationExplicitFailure(object map[string]any) error {
+	if object["error"] != nil {
+		return fmt.Errorf("upstream response contains an error")
+	}
+	if degradationFailureKind(protocol.StringValue(object["type"])) || degradationFailureKind(protocol.StringValue(object["status"])) {
+		return fmt.Errorf("upstream response did not complete")
+	}
+	for _, key := range []string{"success", "ok"} {
+		if success, ok := object[key].(bool); ok && !success {
+			return fmt.Errorf("upstream response reports a failed operation")
+		}
+	}
+	for _, key := range []string{"status", "status_code", "http_status"} {
+		status, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(object[key])))
+		if err == nil && status >= 400 && status <= 599 {
+			return fmt.Errorf("upstream response reports HTTP %d", status)
+		}
+	}
+	return nil
+}
+
+func degradationFailureKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "error", "failed", "incomplete", "cancelled", "canceled", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		return true
+	default:
+		return false
+	}
+}
+
 func responsesOutputText(object map[string]any) string {
 	if text, ok := object["output_text"].(string); ok {
 		return text
 	}
 	if output, ok := object["output"].([]any); ok {
+		var texts []string
 		for _, value := range output {
 			item, ok := value.(map[string]any)
 			if !ok {
 				continue
 			}
 			if text := outputItemText(item); text != "" {
-				return text
+				texts = append(texts, text)
 			}
+		}
+		if len(texts) > 0 {
+			return strings.Join(texts, "\n")
 		}
 	}
 	if choices, ok := object["choices"].([]any); ok && len(choices) > 0 {

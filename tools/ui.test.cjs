@@ -123,6 +123,7 @@ function createPage(options = {}) {
     "select-all-button": "button",
     "degradation-check-button": "button",
     "bps-403-toggle": "button",
+    "bps-device-toggle": "button",
     "degradation-result": "div",
     "retry-button": "button",
   };
@@ -140,6 +141,7 @@ function createPage(options = {}) {
   ids["account-fields"].appendChild(ids["select-all-button"]);
   ids["account-fields"].appendChild(ids["degradation-check-button"]);
   ids["account-fields"].appendChild(ids["bps-403-toggle"]);
+  ids["account-fields"].appendChild(ids["bps-device-toggle"]);
   ids["account-fields"].appendChild(ids["account-list"]);
   ids["account-fields"].appendChild(ids["account-hint"]);
   ids["account-fields"].appendChild(ids["degradation-result"]);
@@ -236,6 +238,7 @@ function createPage(options = {}) {
     selectAll: () => ids["select-all-button"].click(),
     degradationCheck: () => ids["degradation-check-button"].click(),
     toggle403: () => ids["bps-403-toggle"].click(),
+    toggleDevice: () => ids["bps-device-toggle"].click(),
     checkAccount: (accountID) => {
       const button = accountRow(accountID).button;
       assert.ok(button, "Account #" + accountID + " must have its own diagnostic button");
@@ -248,7 +251,7 @@ function createPage(options = {}) {
 }
 
 test("configuration actions work without sandboxed form submission", () => {
-  for (const id of ["save-button", "retry-button", "select-all-button", "bps-403-toggle"]) {
+  for (const id of ["save-button", "retry-button", "select-all-button", "bps-403-toggle", "bps-device-toggle"]) {
     const tag = htmlSource.match(new RegExp("<button\\b[^>]*\\bid=[\"']" + id + "[\"'][^>]*>"));
     assert.ok(tag, id + " exists");
     assert.match(tag[0], /\btype=["']button["']/);
@@ -429,17 +432,19 @@ test("select all is disabled when the list is empty and preserves hidden saved I
   assert.deepEqual(page.calls.save[0].account_ids, [99]);
 });
 
-test("account rows show unique full IDs and keep diagnostic controls outside the label", async () => {
-  const names = ["shared-first@example.com", "shared-second@example.com", "短名", "😀一二三四五六七"];
+test("account rows show complete names with secondary IDs and separate diagnostic controls", async () => {
+  const names = ["shared-first@example.com", "shared-second@example.com", "短名", "😀一二三四五六七", "同名账号", "同名账号", "完整超长账号名称-".repeat(20), "<img src=x onerror=alert(1)>"];
   const page = createPage({ accounts: names.map((name, index) => ({ id: index + 1, name, schedulable: true })) });
   await flush();
   for (let index = 0; index < names.length; index++) {
     const { row, name, availability, result, button, checkbox } = page.accountRow(index + 1);
     assert.ok(hasClass(row, "account-row"));
-    assert.equal(name.textContent, String(index + 1));
+    assert.equal(name.textContent, names[index]);
+    assert.equal(name.children.length, 0, "Account names are plain text, never parsed markup");
     assert.equal(name.title, "账号 ID：" + (index + 1));
     assert.equal(button.getAttribute("aria-label"), "检测账号 ID：" + (index + 1));
     assert.ok(availability);
+    assert.equal(availability.textContent, "#" + (index + 1) + " · 可用");
     assert.ok(result);
     assert.equal(button.textContent, "降智检测");
     assert.equal(button.type, "button");
@@ -448,6 +453,8 @@ test("account rows show unique full IDs and keep diagnostic controls outside the
     assert.ok(!descendants(checkbox.parentNode).includes(button), "Diagnostic clicks cannot toggle the checkbox label");
   }
   assert.notEqual(page.accountRow(1).name.textContent, page.accountRow(2).name.textContent);
+  assert.equal(page.accountRow(5).name.textContent, page.accountRow(6).name.textContent);
+  assert.notEqual(page.accountRow(5).availability.textContent, page.accountRow(6).availability.textContent);
 });
 
 test("account rows never truncate long IDs when names are missing", async () => {
@@ -457,6 +464,85 @@ test("account rows never truncate long IDs when names are missing", async () => 
   assert.equal(name.textContent, "123456789");
   assert.match(name.title, /123456789/);
   assert.equal(button.value, "123456789");
+});
+
+test("empty or non-string account names fall back to the full account ID", async (t) => {
+  for (const value of [undefined, null, "", "   ", String.fromCharCode(9, 10), 123, {}, []]) {
+    await t.test(JSON.stringify(value) || "undefined", async () => {
+      const page = createPage({ accounts: [{ id: 1234567890123456, name: value, schedulable: true }] });
+      await flush();
+      const row = page.accountRow(1234567890123456);
+      assert.equal(row.name.textContent, "1234567890123456");
+      assert.equal(row.availability.textContent, "#1234567890123456 · 可用");
+      assert.equal(row.button.value, "1234567890123456");
+    });
+  }
+});
+
+test("duplicate names keep single-account 403 and 429 verdicts attached to numeric IDs", async () => {
+  const sharedName = "同名账号😀-完整名称-不应截断";
+  const fixtures = [
+    { id: 1234567890123456, error: "HTTP 403" },
+    { id: 2234567890123456, error: "HTTP 429" },
+  ];
+  const page = createPage({
+    accounts: fixtures.map((fixture) => ({ id: fixture.id, name: sharedName, schedulable: true })),
+    test: (_number, store) => {
+      const current = fixtures.find((fixture) => fixture.id === store.config.degradation_check_account_id);
+      return Promise.resolve({ status_json: JSON.stringify({ degradation_check: { completed: true, degraded_account_ids: [],
+        results: [{ account_id: current.id, name: "wrong-name-from-stale-result", status: "error", error: current.error }],
+      } }) });
+    },
+  });
+  await flush();
+  for (const [index, fixture] of fixtures.entries()) {
+    page.checkAccount(fixture.id);
+    await flush();
+    assert.equal(page.calls.save[index * 2].degradation_check_account_id, fixture.id);
+    assert.match(page.accountRow(fixture.id).result.textContent, /检测失败/);
+    assert.equal(page.accountRow(fixture.id).result.title, fixture.error);
+    if (index === 0) assert.equal(page.accountRow(fixtures[1].id).result.textContent, "未检测");
+    const line = page.ids["degradation-result"].children[1];
+    assert.ok(line.textContent.startsWith(sharedName + "（#" + fixture.id + "） · "));
+    assert.ok(line.textContent.endsWith(fixture.error));
+    assert.doesNotMatch(line.textContent, /wrong-name/);
+    assert.deepEqual(page.selected(), fixtures.map((entry) => entry.id));
+  }
+  assert.equal(page.accountRow(fixtures[0].id).result.title, "HTTP 403");
+});
+
+test("diagnostic names use safe text and directory renames refresh cached rows and reports", async () => {
+  const id = 1234567890123456;
+  const name = "<svg onload=alert(1)>😀完整账号名称";
+  const check = { completed: true, degraded_account_ids: [], results: [
+    { account_id: id, name: "outdated-name", status: "ok", answer: "苹果17" },
+    { account_id: 99, name: "<img src=x onerror=alert(1)>", status: "error", error: "HTTP 429" },
+    { account_id: 1234567999999999, status: "skipped", error: "unavailable" },
+  ] };
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id, name, schedulable: true }], degradation_check: check }) };
+  const page = createPage({ status });
+  await flush();
+  const report = page.ids["degradation-result"];
+  assert.ok(report.children[1].textContent.startsWith(name + "（#" + id + "）"));
+  assert.ok(report.children[2].textContent.startsWith("<img src=x onerror=alert(1)>（#99）"));
+  assert.ok(report.children[3].textContent.startsWith("#1234567999999999 · "));
+  for (const line of report.children) assert.equal(line.children.length, 0);
+  const oldRow = page.accountRow(id).row;
+  status.status_json = JSON.stringify({ accounts: [{ id, name: "重命名后的完整账号😀", schedulable: true }] });
+  page.pollStatus();
+  await flush();
+  assert.equal(page.accountRow(id).name.textContent, "重命名后的完整账号😀");
+  assert.notEqual(page.accountRow(id).row, oldRow);
+  assert.ok(report.children[1].textContent.startsWith("重命名后的完整账号😀（#" + id + "）"));
+  assert.match(page.accountRow(id).result.textContent, /符合检测规则/);
+  const stableRow = page.accountRow(id).row;
+  const stableReport = report.children[1];
+  const created = page.calls.elements;
+  page.pollStatus();
+  await flush();
+  assert.equal(page.calls.elements, created);
+  assert.equal(page.accountRow(id).row, stableRow);
+  assert.equal(report.children[1], stableReport);
 });
 
 test("403 auto-disable defaults on and both settings survive saving and reopening", async () => {
@@ -511,6 +597,208 @@ test("403 auto-disable rejects a dropped setting in save acknowledgement or relo
       assert.match(page.ids["form-hint"].textContent, /403 自动停用开关与提交内容不一致/);
       assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
       assert.equal(page.ids["bps-403-toggle"].disabled, false);
+    });
+  }
+});
+
+test("device convergence is opt-in and requires the strict true configuration value", async (t) => {
+  for (const value of [undefined, null, false, 0, 1, "true", true]) {
+    await t.test(String(value), async () => {
+      const page = createPage({ store: { config: { account_ids: [], bps_device_convergence: value } } });
+      assert.equal(page.ids["bps-device-toggle"].disabled, true);
+      page.toggleDevice();
+      await flush();
+      assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(value === true));
+      assert.equal(page.ids["bps-device-toggle"].textContent, "设备收敛：" + (value === true ? "已开启" : "已关闭"));
+      assert.equal(page.calls.save.length, 0);
+    });
+  }
+});
+
+test("device convergence saves on and off across reopen without polling over unsaved changes", async () => {
+  const store = { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2], bps_auto_disable_on_403: false } };
+  const options = { store, getStatus: () => Promise.resolve({ healthy: true, status_json: JSON.stringify({
+    accounts: [1, 2, 3].map((id) => ({ id, schedulable: true })), bps_device_convergence: true,
+  }) }) };
+  let page = createPage(options);
+  await flush();
+  assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "false");
+  for (const expected of [true, false]) {
+    page.toggleDevice();
+    assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(expected));
+    assert.match(page.ids["bps-device-toggle"].textContent, /待保存/);
+    assert.equal(page.calls.save.length, 0);
+    page.pollStatus();
+    await flush();
+    assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(expected));
+    assert.match(page.ids["bps-device-toggle"].textContent, /待保存/);
+    page.save();
+    assert.equal(page.ids["bps-device-toggle"].disabled, true);
+    page.ids["bps-device-toggle"].emit("click");
+    await flush();
+    assert.equal(store.config.bps_device_convergence, expected);
+    assert.equal(store.config.bps_auto_disable_on_403, false);
+    assert.deepEqual(page.selected(), [1, 3]);
+    assert.deepEqual(store.config.excluded_account_ids, [2]);
+    assert.match(page.ids["form-hint"].textContent, /已保存/);
+    assert.doesNotMatch(page.ids["bps-device-toggle"].textContent, /待保存/);
+    assert.equal(page.ids["bps-device-toggle"].disabled, false);
+    page = createPage(options);
+    await flush();
+    assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(expected));
+  }
+});
+
+test("device convergence rejects unsupported save acknowledgements and read-back values", async (t) => {
+  for (const phase of ["save", "reload"]) {
+    for (const value of [undefined, false, "true", 1]) {
+      await t.test(phase + "/" + String(value), async () => {
+        const tamper = (reply) => {
+          if (value === undefined) delete reply.bps_device_convergence;
+          else reply.bps_device_convergence = value;
+          return reply;
+        };
+        const page = createPage({
+          save(config, store) { store.config = clone(config); return Promise.resolve(phase === "save" ? tamper(clone(config)) : clone(config)); },
+          load(number, store) { const reply = clone(store.config); return Promise.resolve(number > 1 && phase === "reload" ? tamper(reply) : reply); },
+        });
+        await flush();
+        page.toggleDevice();
+        page.save();
+        await flush();
+        assert.match(page.ids["form-hint"].textContent, /设备收敛开关与提交内容不一致/);
+        assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
+        assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "true");
+        assert.match(page.ids["bps-device-toggle"].textContent, /待保存/);
+        assert.equal(page.ids["bps-device-toggle"].disabled, false);
+      });
+    }
+  }
+});
+
+test("disabled device convergence accepts an omitted false value but rejects a true reply", async (t) => {
+  for (const phase of ["save", "reload"]) {
+    for (const unexpectedTrue of [false, true]) {
+      await t.test(phase + "/unexpected_true=" + unexpectedTrue, async () => {
+        const page = createPage({
+          store: { config: { account_ids: [], bps_device_convergence: true } },
+          save(config, store) {
+            store.config = clone(config);
+            delete store.config.bps_device_convergence;
+            const reply = clone(store.config);
+            if (phase === "save" && unexpectedTrue) reply.bps_device_convergence = true;
+            return Promise.resolve(reply);
+          },
+          load(number, store) {
+            const reply = clone(store.config);
+            if (number > 1 && phase === "reload" && unexpectedTrue) reply.bps_device_convergence = true;
+            return Promise.resolve(reply);
+          },
+        });
+        await flush();
+        page.toggleDevice();
+        page.save();
+        await flush();
+        assert.equal(page.calls.save[0].bps_device_convergence, false);
+        assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "false");
+        if (unexpectedTrue) {
+          assert.match(page.ids["form-hint"].textContent, /设备收敛开关与提交内容不一致/);
+        } else {
+          assert.match(page.ids["form-hint"].textContent, /已保存/);
+          assert.doesNotMatch(page.ids["bps-device-toggle"].textContent, /待保存/);
+          const reopened = createPage({ store: page.store });
+          await flush();
+          assert.equal(reopened.ids["bps-device-toggle"].getAttribute("aria-pressed"), "false");
+        }
+      });
+    }
+  }
+});
+
+test("failed device convergence saves preserve the user's pending setting and unlock controls", async (t) => {
+  for (const phase of ["save", "reload"]) {
+    await t.test(phase, async () => {
+      const page = createPage({
+        save(config, store) {
+          if (phase === "save") return Promise.reject(new Error("save unavailable"));
+          store.config = clone(config);
+          return Promise.resolve(clone(config));
+        },
+        load(number, store) { return number > 1 && phase === "reload" ? Promise.reject(new Error("reload unavailable")) : Promise.resolve(clone(store.config)); },
+      });
+      await flush();
+      page.toggleDevice();
+      page.save();
+      await flush();
+      assert.match(page.ids["form-hint"].textContent, /失败|未确认/);
+      assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "true");
+      assert.match(page.ids["bps-device-toggle"].textContent, /待保存/);
+      assert.equal(page.ids["bps-device-toggle"].disabled, false);
+    });
+  }
+});
+
+test("all diagnostic saves and failure cleanup preserve the selected device convergence policy", async (t) => {
+  for (const targeted of [false, true]) {
+    for (const enabled of [false, true]) {
+      for (const failed of [false, true]) {
+        await t.test("targeted=" + targeted + "/enabled=" + enabled + "/failed=" + failed, async () => {
+          const page = createPage({
+            store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2], bps_device_convergence: !enabled } },
+            test: () => failed ? Promise.reject(new Error("diagnostic unavailable")) : Promise.resolve({ status_json: JSON.stringify({
+              degradation_check: { completed: true, results: [{ account_id: 2, status: "ok", answer: "苹果17" }], degraded_account_ids: [] },
+            }) }),
+          });
+          await flush();
+          page.toggleDevice();
+          if (targeted) page.checkAccount(2);
+          else page.degradationCheck();
+          assert.equal(page.ids["bps-device-toggle"].disabled, true);
+          page.ids["bps-device-toggle"].emit("click");
+          await flush();
+          assert.equal(page.calls.test, 1);
+          assert.equal(page.calls.save.length, 2);
+          for (const saved of page.calls.save) assert.equal(saved.bps_device_convergence, enabled);
+          assert.equal(page.store.config.bps_device_convergence, enabled);
+          assert.equal(page.store.config.degradation_check, false);
+          assert.ok(!page.store.config.degradation_check_account_id);
+          assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(enabled));
+          assert.equal(page.ids["bps-device-toggle"].disabled, false);
+          assert.deepEqual(page.selected(), [1, 3]);
+          if (failed) assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
+          else assert.doesNotMatch(page.ids["bps-device-toggle"].textContent, /待保存/);
+        });
+      }
+    }
+  }
+});
+
+test("diagnostics reject a lost enabled device setting at trigger, cleanup, or read-back", async (t) => {
+  for (const phase of ["trigger", "cleanup", "reload"]) {
+    await t.test(phase, async () => {
+      const page = createPage({
+        store: { config: { account_ids: [], bps_device_convergence: true } },
+        save(config, store) {
+          store.config = clone(config);
+          const reply = clone(config);
+          if ((phase === "trigger" && config.degradation_check) || (phase === "cleanup" && !config.degradation_check)) delete reply.bps_device_convergence;
+          return Promise.resolve(reply);
+        },
+        load(number, store) {
+          const reply = clone(store.config);
+          if (number > 1 && phase === "reload") delete reply.bps_device_convergence;
+          return Promise.resolve(reply);
+        },
+        test: () => Promise.resolve({ status_json: JSON.stringify({ degradation_check: { completed: true, results: [{ account_id: 2, status: "ok", answer: "苹果17" }], degraded_account_ids: [] } }) }),
+      });
+      await flush();
+      page.checkAccount(2);
+      await flush();
+      assert.equal(page.calls.test, phase === "trigger" ? 0 : 1);
+      assert.match(page.ids["form-hint"].textContent, /设备收敛开关与提交内容不一致/);
+      assert.equal(page.store.config.degradation_check, false);
+      for (const saved of page.calls.save) assert.equal(saved.bps_device_convergence, true);
+      assert.equal(page.ids["bps-device-toggle"].disabled, false);
     });
   }
 });
@@ -577,6 +865,7 @@ test("single-account diagnostics use the real ID and preserve selection models a
     account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2, 88],
     enabled_models: ["gpt-6-astra"], timeout_seconds: 123,
     bps_auto_disable_on_403: false,
+    bps_device_convergence: true,
   };
   const page = createPage({
     store: { config: clone(config) },
@@ -783,7 +1072,7 @@ test("per-account verdicts remain attached to real IDs after status polling and 
   assert.match(page.accountRow(1).result.textContent, /疑似降智/);
   assert.match(page.accountRow(2).result.textContent, /符合检测规则|正常/);
   assert.doesNotMatch(page.accountRow(3).result.textContent, /疑似降智|符合检测规则|正常/);
-  assert.equal(page.accountRow(1).name.textContent, "1");
+  assert.equal(page.accountRow(1).name.textContent, "renamed-one");
   assert.equal(page.accountRow(2).name.title, "账号 ID：2");
   assert.deepEqual(page.selected(), [1, 2, 3]);
 });
@@ -826,7 +1115,7 @@ test("degradation check selects returned degraded accounts and clears its trigge
   assert.equal(page.store.config.degradation_check, false);
   assert.deepEqual(page.selected(), [2]);
   assert.match(page.ids["form-hint"].textContent, /已自动选择 1 个降智账号/);
-  assert.match(page.ids["degradation-result"].children.map((item) => item.textContent).join(" "), /#2 · 疑似降智/);
+  assert.match(page.ids["degradation-result"].children.map((item) => item.textContent).join(" "), /Second（#2） · 疑似降智/);
 });
 
 test("degradation check keeps the existing account scope when none are degraded", async () => {
@@ -1037,7 +1326,7 @@ test("selected accounts save on click, persist on read-back, and survive reopeni
   assert.equal(page.calls.load, 2, "Saving must confirm the persisted host configuration");
   const submitted = clone(page.calls.save[0]);
   submitted.account_ids.sort((a, b) => a - b);
-  assert.deepEqual(submitted, { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false, bps_auto_disable_on_403: true });
+  assert.deepEqual(submitted, { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false, bps_auto_disable_on_403: true, bps_device_convergence: false });
   assert.deepEqual(page.selected(), [1, 2]);
   assert.match(page.ids["form-hint"].textContent, /已保存/);
   assert.equal(page.ids["account-fields"].disabled, false);
@@ -1180,7 +1469,7 @@ test("automatic images need no configuration controls", async () => {
   await flush();
   page.save();
   await flush();
-  assert.deepEqual(page.calls.save[0], { account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels, bps_auto_disable_on_403: true });
+  assert.deepEqual(page.calls.save[0], { account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels, bps_auto_disable_on_403: true, bps_device_convergence: false });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
@@ -1224,7 +1513,7 @@ test("a rejected save preserves account edits for retry", async () => {
   page.save();
   await flush();
   assert.equal(page.calls.save.length, 2);
-  assert.deepEqual(page.store.config, { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels, bps_auto_disable_on_403: true });
+  assert.deepEqual(page.store.config, { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels, bps_auto_disable_on_403: true, bps_device_convergence: false });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
@@ -1658,7 +1947,7 @@ test("same-version 403 polls preserve an explicit restore until ordinary save co
   assert.deepEqual(page.store.config.bps_reenabled_accounts, { 2: bpsBlockA });
   assert.deepEqual(page.store.config.excluded_account_ids, []);
   assert.deepEqual(page.selected(), [1, 2, 3]);
-  assert.equal(page.accountRow(2).availability.textContent, "可用");
+  assert.equal(page.accountRow(2).availability.textContent, "#2 · 可用");
   page.save();
   await flush();
   assert.deepEqual(page.calls.save[1].bps_reenabled_accounts, { 2: bpsBlockA }, "Confirmed acknowledgement remains persisted");

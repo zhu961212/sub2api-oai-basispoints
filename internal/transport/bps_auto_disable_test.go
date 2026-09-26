@@ -112,3 +112,39 @@ func TestBPSForbiddenForwardUsesPolicyAtResponseTime(t *testing.T) {
 		t.Fatalf("in-flight request ignored current policy: result=%+v disabled=%t", result, fixture.disabled(7))
 	}
 }
+
+func TestBPSAutoDisableRepeatedStreamFailureCreatesOneRestriction(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, transform := range []bool{false, true} {
+			t.Run(fmt.Sprintf("enabled=%t/transform=%t", enabled, transform), func(t *testing.T) {
+				fixture := newBPSForbiddenForwardFixture(t, transform, func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, streamData(map[string]any{"type": "response.output_text.delta", "delta": "working"}))
+					failure := map[string]any{"status": "failed", "output": []any{}, "error": map[string]any{"status_code": 403, "message": "PRIVATE forbidden diagnostic"}}
+					for range 2 {
+						_, _ = io.WriteString(w, streamData(map[string]any{"type": "response.failed", "response": failure}))
+					}
+				})
+				host := newBPSKVTestHost()
+				fixture.transport.bindBPSAccountStore(host)
+				defer fixture.transport.bindBPSAccountStore(nil)
+				waitBPSStore(t, fixture.transport)
+				fixture.transport.mu.RLock()
+				url := fixture.transport.cfg.ResponsesURL
+				fixture.transport.mu.RUnlock()
+				applyConfig(t, fixture.transport, map[string]any{"responses_url": url, "transform_responses": transform, "account_ids": []int64{7, 8}, "bps_auto_disable_on_403": enabled})
+				result := fixture.forward(t, 7, map[string]any{"model": "gpt-6-astra", "input": "hi", "stream": true})
+				host.mu.Lock()
+				writes, records := host.sets, len(host.values)
+				host.mu.Unlock()
+				want := 0
+				if enabled {
+					want = 1
+				}
+				if result.errFrame != nil || result.status != http.StatusOK || !result.ended || writes != want || records != want || fixture.disabled(7) != enabled || fixture.disabled(8) {
+					t.Fatalf("repeated failure changed restriction scope: writes=%d records=%d disabled7=%t disabled8=%t result=%+v", writes, records, fixture.disabled(7), fixture.disabled(8), result)
+				}
+			})
+		}
+	}
+}

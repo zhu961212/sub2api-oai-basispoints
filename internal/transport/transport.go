@@ -59,20 +59,23 @@ type cachedProxyClient struct {
 
 // accountSummary 是账号目录中对配置页可见的最小字段集合。
 type accountSummary struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	Status      string `json:"status"`
-	Schedulable bool   `json:"schedulable"`
+	// Derived from trusted host metadata; never exposed in Health/config UI.
+	deviceInstallationID string
+	ID                   int64  `json:"id"`
+	Name                 string `json:"name"`
+	Status               string `json:"status"`
+	Schedulable          bool   `json:"schedulable"`
 }
 
 // accountCache 缓存宿主返回的账号目录。Health 可能被宿主健康检查和配置页轮询
 // 同时调用，缓存可以避免每次探测都查一次账号表；失败时保留上一次成功结果，避免
 // 面板因瞬时故障闪空。
 type accountCache struct {
-	mu      sync.Mutex
-	expires time.Time
-	items   []accountSummary
-	refresh *accountRefresh
+	mu        sync.Mutex
+	expires   time.Time
+	items     []accountSummary
+	deviceIDs map[int64]string
+	refresh   *accountRefresh
 }
 
 type accountRefresh struct {
@@ -310,6 +313,7 @@ func healthStatusJSON(c protocol.Config, accounts []accountSummary) string {
 		"auth_mode":                c.AuthMode,
 		"timeout_seconds":          c.TimeoutSeconds,
 		"rewrite_tools":            c.RewriteTools,
+		"bps_device_convergence":   c.BPSDeviceConvergence,
 		"transform_responses":      c.TransformResponses,
 		"reasoning_efforts":        protocol.SupportedReasoningEfforts(),
 		"image_input":              "automatic_attachments",
@@ -368,16 +372,51 @@ func (t *Transport) accountDirectory(ctx context.Context) []accountSummary {
 	}
 }
 
+// accountDeviceID avoids copying/scanning the full account directory on the
+// request hot path. Cold/stale lookups share the existing bounded refresh.
+func (t *Transport) accountDeviceID(ctx context.Context, accountID int64) string {
+	if accountID <= 0 || ctx.Err() != nil {
+		return ""
+	}
+	t.mu.RLock()
+	if t.closed || t.host == nil {
+		t.mu.RUnlock()
+		return ""
+	}
+	t.accounts.mu.Lock()
+	id, fresh := t.accounts.deviceIDs[accountID], time.Now().Before(t.accounts.expires)
+	t.accounts.mu.Unlock()
+	t.mu.RUnlock()
+	if fresh {
+		return id
+	}
+	t.accountDirectory(ctx)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.closed || t.host == nil || ctx.Err() != nil {
+		return ""
+	}
+	t.accounts.mu.Lock()
+	defer t.accounts.mu.Unlock()
+	return t.accounts.deviceIDs[accountID]
+}
+
 func (t *Transport) refreshAccountDirectory(ctx context.Context, host pluginv1.HostServiceClient, refresh *accountRefresh) {
 	defer refresh.cancel()
 	response, err := host.ListAccounts(ctx, &pluginv1.ListAccountsRequest{Platform: "openai", AccountType: "oauth"})
 	items := make([]accountSummary, 0, len(response.GetAccounts()))
+	deviceIDs := make(map[int64]string, len(response.GetAccounts()))
 	for _, account := range response.GetAccounts() {
+		deviceID := bpsAccountDeviceID(account.GetMetadataJson())
+		if _, exists := deviceIDs[account.GetId()]; !exists {
+			deviceIDs[account.GetId()] = deviceID
+		}
 		items = append(items, accountSummary{
-			ID:          account.GetId(),
-			Name:        account.GetName(),
-			Status:      account.GetStatus(),
-			Schedulable: account.GetSchedulable(),
+			ID:                   account.GetId(),
+			Name:                 account.GetName(),
+			Status:               account.GetStatus(),
+			Schedulable:          account.GetSchedulable(),
+			deviceInstallationID: deviceID,
 		})
 	}
 	t.accounts.mu.Lock()
@@ -387,6 +426,7 @@ func (t *Transport) refreshAccountDirectory(ctx context.Context, host pluginv1.H
 	}
 	if err == nil {
 		t.accounts.items = items
+		t.accounts.deviceIDs = deviceIDs
 		t.accounts.expires = time.Now().Add(accountCacheTTL)
 	} else {
 		// Keep the last successful snapshot and suppress sequential failures.
@@ -407,6 +447,7 @@ func (cache *accountCache) invalidate() {
 		cache.refresh = nil
 	}
 	cache.items = nil
+	cache.deviceIDs = nil
 	cache.expires = time.Time{}
 }
 
@@ -593,7 +634,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		t.disableBPSAccount(stream.Context(), start.GetAccountId())
 	})
 
-	requestHeaders, proxyURL, err := prepareHeaders(stream.Context(), start, host, cfg.AuthMode)
+	requestHeaders, proxyURL, err := t.prepareBPSHeaders(stream.Context(), start, host, cfg)
 	if err != nil {
 		// 固定账号解析失败这类错误换账号也不会变好，必须上报为"已发出"，
 		// 否则宿主会拿池子里每个账号各试一遍，最后把一个跟真实原因无关的
@@ -610,6 +651,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	if requestClient == nil {
 		return sendError(stream, "invalid_proxy", "proxy client is unavailable", false)
 	}
+	requestClient = withoutBPSRedirects(requestClient)
 	requestBody := body
 	var source map[string]any
 	imagesRewritten := false
@@ -671,9 +713,13 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 				return sendRequestValidationError(stream, err)
 			}
 		}
+		deviceRewritten := false
+		if cfg.BPSDeviceConvergence {
+			deviceRewritten = applyBPSDeviceBody(prepared, requestHeaders.Get("X-Codex-Installation-Id"))
+		}
 		if cfg.RewriteTools {
 			requestBody = protocol.JSONBytes(prepared)
-		} else if imagesRewritten {
+		} else if imagesRewritten || deviceRewritten {
 			// Local session markers are never part of the upstream wire body.
 			// Keep them in source for response translation/replay.
 			wireSource := make(map[string]any, len(source))
@@ -706,6 +752,9 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	}
 	defer resp.Body.Close()
 	observeBPSStatus(resp.StatusCode)
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return sendError(stream, "upstream_redirect", "Basis Points returned an unexpected HTTP redirect", true)
+	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
 		return sendBasisPointsAccountStatus(stream, resp.StatusCode)
 	}

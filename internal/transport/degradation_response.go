@@ -20,6 +20,9 @@ func readDegradationResponse(ctx context.Context, body io.Reader, contentType st
 	var terminal []byte
 	finished := errors.New("degradation response finished")
 	emit := func(event sseRelayEvent) error {
+		if degradationFailureKind(event.event) {
+			return fmt.Errorf("upstream response did not complete")
+		}
 		data := strings.TrimSpace(event.data)
 		if data == "" {
 			return nil
@@ -30,6 +33,9 @@ func readDegradationResponse(ctx context.Context, body io.Reader, contentType st
 		payload, err := protocol.RawObject([]byte(data))
 		if err != nil {
 			return nil
+		}
+		if err := degradationExplicitFailure(payload); err != nil {
+			return err
 		}
 		kind := protocol.StringValue(payload["type"])
 		if kind == "" {

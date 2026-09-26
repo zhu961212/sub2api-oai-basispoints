@@ -71,7 +71,7 @@ func basisPointsFailureStatus(object map[string]any, event string) int {
 	if response != nil {
 		fields = append(fields, response, relayObject(response["error"]))
 	}
-	var diagnostics []string
+	var diagnostics, messages []string
 	for _, field := range fields {
 		for _, key := range []string{"status_code", "status"} {
 			var status int
@@ -92,10 +92,20 @@ func basisPointsFailureStatus(object map[string]any, event string) int {
 		for _, key := range []string{"code", "type", "message"} {
 			diagnostics = append(diagnostics, strings.ToLower(protocol.StringValue(field[key])))
 		}
+		messages = append(messages, strings.ToLower(protocol.StringValue(field["message"])))
 	}
 	combined := strings.Join(diagnostics, " ")
-	for _, marker := range []string{"rate_limit", "usage_limit_reached", "quota_exceeded"} {
+	for _, marker := range []string{"rate_limit", "usage_limit", "insufficient_quota", "quota_exceeded"} {
 		if strings.Contains(combined, marker) {
+			return 429
+		}
+	}
+	// Match the host's semantic rate-limit diagnostics only within an
+	// already identified failure. Never inspect assistant output or tool
+	// arguments, and never infer a persistent 403 from these words.
+	for _, message := range messages {
+		if strings.Contains(message, "usage limit") && strings.Contains(message, "reached") ||
+			strings.Contains(message, "rate limit") && (strings.Contains(message, "reached") || strings.Contains(message, "exceeded")) {
 			return 429
 		}
 	}

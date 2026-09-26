@@ -34,6 +34,19 @@ func TestDegradationTestConfigKeepsEachAccountResultIsolated(t *testing.T) {
 		{id: 15, wantStatus: "error", stream: true, response: map[string]any{"type": "response.completed", "error": map[string]any{"code": "unknown_failure"}, "response": map[string]any{"status": "completed", "output_text": "苹果17"}}},
 		{id: 17, wantStatus: "error", noCredential: true},
 		{id: 19, wantStatus: "skipped", unavailable: true},
+		{id: 21, wantStatus: "error", wantAnswer: "可能是 iPhone 17", response: map[string]any{"output_text": "可能是 iPhone 17"}},
+		{id: 23, wantStatus: "error", wantAnswer: "我不知道", response: map[string]any{"output_text": "我不知道"}},
+		{id: 25, wantStatus: "error", wantAnswer: "不是 iPhone 17，是 iPhone 16", response: map[string]any{"output_text": "不是 iPhone 17，是 iPhone 16"}},
+		{id: 27, wantStatus: "error", wantAnswer: "iPhone 170", response: map[string]any{"output_text": "iPhone 170"}},
+		{id: 29, wantStatus: "error", wantAnswer: "pineapple17", response: map[string]any{"output_text": "pineapple17"}},
+		{id: 31, wantStatus: "degraded", wantAnswer: "iPhone 18", response: map[string]any{"output_text": "iPhone 18"}},
+		{id: 33, wantStatus: "error", response: map[string]any{"success": false, "response": map[string]any{"output_text": "苹果17"}}},
+		{id: 35, wantStatus: "error", response: map[string]any{"ok": false, "output_text": "苹果16"}},
+		{id: 37, wantStatus: "error", response: map[string]any{"status_code": 500, "response": map[string]any{"output_text": "苹果17"}}},
+		{id: 39, wantStatus: "error", response: map[string]any{"http_status": "500", "output_text": "苹果16"}},
+		{id: 41, wantStatus: "error", response: map[string]any{"status": "completed", "response": map[string]any{"success": false, "output_text": "苹果17"}}},
+		{id: 43, wantStatus: "error", response: map[string]any{"status": "completed", "output": []any{map[string]any{"type": "message", "status": "incomplete", "content": []any{map[string]any{"type": "output_text", "text": "苹果17"}}}}}},
+		{id: 45, wantStatus: "error", wantAnswer: "苹果17\n苹果16", response: map[string]any{"status": "completed", "output": []any{map[string]any{"type": "output_text", "text": "苹果17"}, map[string]any{"type": "output_text", "text": "苹果16"}}}},
 	}
 	host := &degradationTestHost{fakeHost: &fakeHost{tokenFor: make(map[int64]string)}}
 	calls := make(map[int64]*atomic.Int32)

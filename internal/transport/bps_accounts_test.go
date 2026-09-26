@@ -182,6 +182,70 @@ func TestBPSAccountRestrictionWithoutHostIsImmediateAndLaterPersisted(t *testing
 	}
 }
 
+func TestBPSAccountStaleAcknowledgementCannotReleaseConcurrentRestriction(t *testing.T) {
+	host, tr := newBPSKVTestHost(), newBPSAccountTransport(t)
+	tr.bindBPSAccountStore(host)
+	waitBPSStore(t, tr)
+	tr.disableBPSAccount(context.Background(), 7)
+	previous := host.record(7)
+	applyConfig(t, tr, map[string]any{"bps_reenabled_accounts": map[string]string{"7": previous.BlockID}})
+
+	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	host.mu.Lock()
+	host.beforeSet = func(ctx context.Context, key string) {
+		if key != bpsAccountKey(7) {
+			return
+		}
+		enteredOnce.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	}
+	host.mu.Unlock()
+	go func() { defer close(finished); tr.disableBPSAccount(context.Background(), 7) }()
+	defer func() { releaseOnce.Do(func() { close(release) }); <-finished }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("new restriction did not enter storage")
+	}
+
+	// A UI save based on the old status snapshot can arrive while a new 403
+	// is already marked in memory but not yet committed to host storage.
+	applyConfig(t, tr, map[string]any{"bps_reenabled_accounts": map[string]string{"7": previous.BlockID}})
+	tr.mu.RLock()
+	staleConfig := tr.cfg.Clone()
+	tr.mu.RUnlock()
+	tr.bpsAccounts.mu.RLock()
+	latest, pending := tr.bpsAccounts.records[7], tr.bpsAccounts.dirty[7]
+	tr.bpsAccounts.mu.RUnlock()
+	if !pending || latest.BlockID == previous.BlockID || !tr.isBPSAccountDisabled(7, staleConfig) || tr.isBPSAccountDisabled(8, staleConfig) {
+		t.Fatal("stale acknowledgement released the new restriction or affected another account")
+	}
+	releaseOnce.Do(func() { close(release) })
+	<-finished
+	if host.record(7).BlockID != latest.BlockID {
+		t.Fatal("acknowledgement replaced the newer durable restriction")
+	}
+
+	fresh := newBPSAccountTransport(t)
+	applyConfig(t, fresh, map[string]any{"bps_reenabled_accounts": staleConfig.BPSReenabledAccounts})
+	fresh.bindBPSAccountStore(host)
+	waitBPSStore(t, fresh)
+	if !fresh.isBPSAccountDisabled(7, staleConfig) {
+		t.Fatal("restart accepted stale acknowledgement for the latest restriction")
+	}
+	applyConfig(t, fresh, map[string]any{"bps_reenabled_accounts": map[string]string{"7": latest.BlockID}})
+	fresh.mu.RLock()
+	currentConfig := fresh.cfg.Clone()
+	fresh.mu.RUnlock()
+	if fresh.isBPSAccountDisabled(7, currentConfig) || host.record(7).BlockID != latest.BlockID {
+		t.Fatal("exact acknowledgement did not restore BPS without deleting its durable marker")
+	}
+}
+
 func TestBPSAccountFailedWriteRemainsBlockedAndRetriesWithoutReload(t *testing.T) {
 	host, tr := newBPSKVTestHost(), newBPSAccountTransport(t)
 	host.failSet = true

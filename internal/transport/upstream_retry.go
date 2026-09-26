@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -64,7 +65,13 @@ func basisPointsRetryDelay(response *http.Response, attempt int, now time.Time) 
 	}
 	// Honor the server's minimum wait. Return long delays to the caller instead
 	// of keeping an interactive request queued or retrying earlier than asked.
-	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	// A positive delay can be valid decimal text yet exceed int64. Treat it
+	// as a long wait instead of retrying early with the default backoff.
+	if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(value, "-") {
+		return 0, false
+	}
+	if err == nil {
 		if seconds < 0 {
 			return delay, true
 		}

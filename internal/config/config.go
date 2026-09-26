@@ -18,7 +18,7 @@ import (
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.5.27"
+	Version = "0.5.28"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -71,6 +71,9 @@ type Config struct {
 	// BPSAutoDisableOn403 controls creation of new BPS account restrictions.
 	// Disabling this policy never clears an existing restriction.
 	BPSAutoDisableOn403 bool `json:"bps_auto_disable_on_403"`
+	// BPSDeviceConvergence opts into account-scoped device identity on BPS.
+	// Default off preserves the host/client device identity until enabled.
+	BPSDeviceConvergence bool `json:"bps_device_convergence"`
 	// Acknowledging one block never clears a newer persisted BPS 403.
 	BPSReenabledAccounts map[string]string `json:"bps_reenabled_accounts,omitempty"`
 	// DegradationCheck is a one-shot request marker consumed by TestConfig.

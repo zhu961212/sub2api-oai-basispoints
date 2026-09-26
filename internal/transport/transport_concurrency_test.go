@@ -61,6 +61,10 @@ type gatedIdentityHost struct {
 	proxyURL string
 }
 
+func (host *gatedIdentityHost) ListAccounts(context.Context, *pluginv1.ListAccountsRequest, ...grpc.CallOption) (*pluginv1.ListAccountsResponse, error) {
+	return &pluginv1.ListAccountsResponse{}, nil
+}
+
 func (host *gatedIdentityHost) ResolveOutboundIdentity(ctx context.Context, request *pluginv1.ResolveOutboundIdentityRequest, _ ...grpc.CallOption) (*pluginv1.ResolveOutboundIdentityResponse, error) {
 	close(host.entered)
 	select {

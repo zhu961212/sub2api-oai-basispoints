@@ -120,6 +120,25 @@ func TestDegradationReaderSupportsJSONAndTerminalEOF(t *testing.T) {
 	}
 }
 
+func TestDegradationReaderRejectsConflictingFailureEvents(t *testing.T) {
+	completed := streamData(map[string]any{"type": "response.completed", "response": map[string]any{"status": "completed", "output_text": "苹果17"}})
+	for name, data := range map[string]string{
+		"event overrides completed payload":     "event: error\n" + completed,
+		"invalid error payload":                 "event: error\ndata: upstream broke\n\n" + completed,
+		"error envelope before completed":       streamData(map[string]any{"error": map[string]any{"code": "unknown_failure"}}) + completed,
+		"failed operation before completed":     streamData(map[string]any{"success": false}) + completed,
+		"failed HTTP envelope before completed": streamData(map[string]any{"status_code": 500}) + completed,
+	} {
+		t.Run(name, func(t *testing.T) {
+			reader := &degradationTailReader{data: []byte(data), step: 7, err: context.DeadlineExceeded}
+			_, _, err := readDegradationResponse(context.Background(), reader, "text/event-stream", 4096)
+			if err == nil || reader.tailRead {
+				t.Fatalf("failure was accepted or waited for EOF: err=%v tail=%v", err, reader.tailRead)
+			}
+		})
+	}
+}
+
 func TestDegradationReaderStopsAtCanceledTerminal(t *testing.T) {
 	for _, kind := range []string{"response.cancelled", "response.canceled"} {
 		reader := &degradationTailReader{data: []byte(streamData(map[string]any{"type": kind})), err: context.DeadlineExceeded}

@@ -38,6 +38,14 @@ async function findBrowser() {
   throw new Error('Chrome/Edge/Chromium was not found; set CHROME_PATH to its executable.');
 }
 
+const browserAccounts = [
+  { id: 1011234567890123, name: '同名账号😀-完整名称', schedulable: true, status: 'active' },
+  { id: 2021234567890123, name: '同名账号😀-完整名称', schedulable: true, status: 'active' },
+  { id: 3031234567890123, name: '超长账号名称不得截断'.repeat(20) + '<img src=x onerror=window.__accountNameInjected=true>', schedulable: true, status: 'active' },
+  { id: 4041234567890123, name: 'Unicode é 账号👩‍💻 العربية', schedulable: true, status: 'active' },
+  { id: 5051234567890123, name: '   ', schedulable: true, status: 'active' },
+];
+
 // This driver runs INSIDE the opaque-origin iframe. The parent never reads its DOM.
 // It loads after the unchanged production app.js and uses real DOM click defaults.
 const driver = String.raw`
@@ -50,7 +58,9 @@ const driver = String.raw`
   const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
   const selected = () => Array.from(document.querySelectorAll('#account-list input:checked')).map((box) => Number(box.value));
   const selectedModels = () => Array.from(document.querySelectorAll('#model-list input:checked')).map((box) => box.value);
-  const accountIDs = [1011234567890123, 2021234567890123];
+  const accounts = ${JSON.stringify(browserAccounts)};
+  const accountIDs = accounts.map((account) => account.id);
+  const displayNames = accounts.map((account) => account.name.trim() ? account.name : String(account.id));
   const modelIDs = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
   const defaultModels = ['gpt-6-astra', 'gpt-5.6-sol'];
   const subset = ['gpt-6-sol', 'gpt-5.6-luna'];
@@ -62,14 +72,21 @@ const driver = String.raw`
       throw new Error('403 policy button state is incorrect; expected ' + label);
     return toggle;
   }
+  function assertDeviceConvergence(expected, pending = false) {
+    const toggle = document.getElementById('bps-device-toggle');
+    const label = '设备收敛：' + (expected ? '已开启' : '已关闭') + (pending ? '（待保存）' : '');
+    if (!toggle || toggle.type !== 'button' || toggle.getAttribute('aria-pressed') !== String(expected) || toggle.textContent !== label)
+      throw new Error('Device convergence button state is incorrect; expected ' + label);
+    return toggle;
+  }
   function assertResponsiveLayout() {
     const width = document.documentElement.clientWidth;
     if (document.documentElement.scrollWidth > width + 1 || document.body.scrollWidth > width + 1)
       throw new Error('Page overflows horizontally at ' + width + 'px');
-    for (const element of document.querySelectorAll('.account-name, #bps-403-toggle')) {
+    for (const element of document.querySelectorAll('.account-name, .account-availability, #degradation-result > span, #bps-403-toggle, #bps-device-toggle')) {
       const bounds = element.getBoundingClientRect();
       if (bounds.left < -1 || bounds.right > width + 1 || element.scrollWidth > element.clientWidth + 1)
-        throw new Error('Account ID or 403 policy control overflows at ' + width + 'px');
+        throw new Error('Account name, diagnostic result or policy control overflows at ' + width + 'px');
     }
   }
   async function until(check, label, milliseconds = 6000) {
@@ -81,20 +98,25 @@ const driver = String.raw`
     throw new Error(label + '; hint=' + document.getElementById('form-hint').textContent);
   }
   try {
-    await until(() => document.querySelectorAll('#account-list input').length === 2 &&
+    await until(() => document.querySelectorAll('#account-list input').length === accountIDs.length &&
       document.getElementById('form-hint').textContent === '' &&
       !document.getElementById('save-button').disabled, 'Configuration did not become ready');
     if (!blocked) {
-      if (!same(Array.from(document.querySelectorAll('.account-name')).map((element) => element.textContent), accountIDs.map(String)))
-        throw new Error('Account names do not show the complete account IDs');
+      if (!same(Array.from(document.querySelectorAll('.account-name')).map((element) => element.textContent), displayNames))
+        throw new Error('Account labels do not preserve complete names or empty-name ID fallback');
+      if (document.querySelector('#account-list img, #account-list svg, #account-list script') || window.__accountNameInjected)
+        throw new Error('Account names were parsed as HTML');
       for (const row of document.querySelectorAll('.account-row')) {
         const accountID = row.querySelector('input').value;
-        if (row.querySelector('.account-name').title !== '账号 ID：' + accountID ||
+        if (!row.querySelector('.account-availability').textContent.startsWith('#' + accountID + ' · ') ||
+            row.querySelector('.account-name').title !== '账号 ID：' + accountID ||
             row.querySelector('.account-check-button').getAttribute('aria-label') !== '检测账号 ID：' + accountID)
           throw new Error('Account identity or individual check button labels point to the wrong account');
       }
       const initial403Policy = stage === 'select' || stage === 'clear';
       if (assert403Policy(initial403Policy).disabled) throw new Error('403 policy control did not become ready');
+      const initialDeviceConvergence = stage === 'all';
+      if (assertDeviceConvergence(initialDeviceConvergence).disabled) throw new Error('Device convergence control did not become ready');
       assertResponsiveLayout();
       if (document.querySelector('[id^="image-relay"]') || document.querySelector('input:not(#account-list input):not(#model-list input), select, details'))
         throw new Error('Images still require additional configuration controls');
@@ -113,8 +135,36 @@ const driver = String.raw`
     const initial = stage === 'reopen-empty' || (stage === 'select' && blocked) ? [] : accountIDs;
     if (!same(selected(), initial)) throw new Error('Reopened selection was ' + JSON.stringify(selected()) + ', expected ' + JSON.stringify(initial));
     send('opened', { selected: selected(), models: selectedModels(), viewportWidth: document.documentElement.clientWidth,
-      autoDisableOn403: document.getElementById('bps-403-toggle')?.getAttribute('aria-pressed') });
-    if (stage === 'reopen-empty') { send('done', { selected: selected(), models: selectedModels() }); return; }
+      autoDisableOn403: document.getElementById('bps-403-toggle')?.getAttribute('aria-pressed'),
+      deviceConvergence: document.getElementById('bps-device-toggle')?.getAttribute('aria-pressed') });
+    if (stage === 'reopen-empty') {
+      const statuses = ['error', 'error', 'degraded', 'ok', 'skipped'];
+      for (let index = 0; index < accountIDs.length; index++) {
+        const accountID = accountIDs[index];
+        document.querySelector('.account-check-button[value="' + accountID + '"]').click();
+        if (!document.getElementById('bps-403-toggle').disabled || !document.getElementById('bps-device-toggle').disabled)
+          throw new Error('Diagnostic did not lock policy controls');
+        await until(() => document.getElementById('form-hint').textContent.includes('当前账号：') &&
+          !document.getElementById('save-button').disabled, 'Single-account diagnostic did not complete');
+        for (let rowIndex = 0; rowIndex < accountIDs.length; rowIndex++) {
+          const row = document.querySelector('.account-check-button[value="' + accountIDs[rowIndex] + '"]').closest('.account-row');
+          const verdict = row.querySelector('.account-check-result');
+          if (rowIndex <= index ? !verdict.classList.contains('result-' + statuses[rowIndex]) : verdict.textContent !== '未检测')
+            throw new Error('Single-account result leaked across equal account names');
+        }
+        const label = displayNames[index] === String(accountID) ? '#' + accountID : displayNames[index] + '（#' + accountID + '）';
+        if (!document.querySelector('#degradation-result > span:nth-child(2)').textContent.startsWith(label + ' · '))
+          throw new Error('Diagnostic result lost the complete account name or ID');
+        if (document.querySelector('#degradation-result img, #degradation-result svg, #degradation-result script') || window.__accountNameInjected)
+          throw new Error('Diagnostic names were parsed as HTML');
+        if (!same(selected(), []) || !same(selectedModels(), [])) throw new Error('Individual diagnostic changed account/model routing');
+        assert403Policy(false);
+        assertDeviceConvergence(false);
+        assertResponsiveLayout();
+      }
+      send('done', { selected: selected(), models: selectedModels(), singleAccountDiagnostics: accountIDs.length });
+      return;
+    }
     if (stage === 'select' && !blocked) {
       const selectAll = document.getElementById('select-all-button');
       if (!selectAll || !selectAll.disabled) throw new Error('Legacy unrestricted accounts were not already selected');
@@ -130,9 +180,20 @@ const driver = String.raw`
     if (!same(selected(), expected)) throw new Error('Account selection controls did not change the selected accounts');
     const expectedModels = stage === 'select' ? subset : stage === 'all' ? modelIDs : [];
     const expected403Policy = stage === 'all';
+    const expectedDeviceConvergence = stage === 'select';
     if (!blocked) {
       assert403Policy(!expected403Policy).click();
       assert403Policy(expected403Policy, true);
+      const initialDeviceConvergence = stage === 'all';
+      assertDeviceConvergence(initialDeviceConvergence).click();
+      assertDeviceConvergence(!initialDeviceConvergence, true);
+      assertResponsiveLayout();
+      assertDeviceConvergence(!initialDeviceConvergence, true).click();
+      assertDeviceConvergence(initialDeviceConvergence);
+      if (initialDeviceConvergence !== expectedDeviceConvergence) {
+        assertDeviceConvergence(initialDeviceConvergence).click();
+        assertDeviceConvergence(expectedDeviceConvergence, true);
+      }
       assertResponsiveLayout();
       for (const box of document.querySelectorAll('#model-list input')) {
         if (box.checked !== expectedModels.includes(box.value)) box.click();
@@ -147,6 +208,11 @@ const driver = String.raw`
     button.click();
     if (!blocked && !document.getElementById('model-fields').disabled) throw new Error('Model fields were not locked during save');
     if (!blocked && !document.getElementById('bps-403-toggle').disabled) throw new Error('403 policy control was not locked during save');
+    if (!blocked && !document.getElementById('bps-device-toggle').disabled) throw new Error('Device convergence control was not locked during save');
+    if (!blocked) {
+      document.getElementById('bps-device-toggle').click();
+      assertDeviceConvergence(expectedDeviceConvergence, expectedDeviceConvergence !== (stage === 'all'));
+    }
     send('clicked', { selected: selected(), clickCount, submitCount, buttonType: button.type });
     if (blocked) {
       await sleep(800);
@@ -159,6 +225,7 @@ const driver = String.raw`
     if (!same(selected(), expected)) throw new Error('Selection changed after save');
     if (!same(selectedModels(), expectedModels)) throw new Error('Model selection changed after save');
     if (assert403Policy(expected403Policy).disabled) throw new Error('403 policy control did not unlock after save');
+    if (assertDeviceConvergence(expectedDeviceConvergence).disabled) throw new Error('Device convergence control did not unlock after save');
     assertResponsiveLayout();
     send('done', { selected: selected(), models: selectedModels(), hint: document.getElementById('form-hint').textContent });
   } catch (error) { send('failure', { error: error.message }); }
@@ -185,16 +252,15 @@ const host = `
   let finished = false;
   let loadCount = 0;
   let saveCount = 0;
+  let testCount = 0;
+  let lastCheck = null;
   const events = [];
-  const accounts = [
-    { id: 1011234567890123, name: 'Regression account A', schedulable: true, status: 'active' },
-    { id: 2021234567890123, name: 'Regression account B', schedulable: true, status: 'active' },
-  ];
+  const accounts = ${JSON.stringify(browserAccounts)};
   const accountIDs = accounts.map((account) => account.id);
   async function finish(ok, details) {
     if (finished) return;
     finished = true;
-    const result = { ok, ...details, saveCount, loadCount, persisted: config, events };
+    const result = { ok, ...details, saveCount, loadCount, testCount, persisted: config, events };
     document.getElementById('result').textContent = JSON.stringify(result, null, 2);
     await fetch('/__test/result/' + secret, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result) });
   }
@@ -228,6 +294,7 @@ const host = `
       if (stage === 'select') {
         if (saveCount !== 1 || !same(config.account_ids, accountIDs)) return void finish(false, { error: 'Selected accounts were not persisted by the host' });
         if (config.bps_auto_disable_on_403 !== false) return void finish(false, { error: 'Disabled 403 policy was not persisted by the host' });
+        if (config.bps_device_convergence !== true) return void finish(false, { error: 'Enabled device convergence was not persisted by the host' });
         if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, []))
           return void finish(false, { error: 'Legacy unrestricted accounts were not migrated to automatic selection' });
         if (!same(config.enabled_models, subset)) return void finish(false, { error: 'Model subset was not persisted by the host' });
@@ -237,6 +304,7 @@ const host = `
         if (saveCount !== 2 || !same(config.account_ids, accountIDs) || !same(config.enabled_models, models))
           return void finish(false, { error: 'All six models were not persisted or accounts changed' });
         if (config.bps_auto_disable_on_403 !== true) return void finish(false, { error: 'Enabled 403 policy was not persisted by the host' });
+        if (config.bps_device_convergence !== false) return void finish(false, { error: 'Disabled device convergence was not persisted by the host' });
         return reopen('clear');
       }
       if (stage === 'clear') {
@@ -245,11 +313,18 @@ const host = `
         if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, accountIDs))
           return void finish(false, { error: 'Cleared accounts were not persisted as explicit exclusions' });
         if (config.bps_auto_disable_on_403 !== false) return void finish(false, { error: '403 policy changed while clearing accounts' });
+        if (config.bps_device_convergence !== false) return void finish(false, { error: 'Device convergence changed while clearing accounts' });
         return reopen('reopen-empty');
       }
+      if (testCount !== accountIDs.length || data.singleAccountDiagnostics !== accountIDs.length)
+        return void finish(false, { error: 'Individual diagnostics did not check every fixture account' });
       return void finish(true, { checkedSelectionSurvivedReopen: true, emptySelectionSurvivedReopen: true,
-        fullAccountIDsDisplayed: true, default403PolicyEnabled: true, disabled403PolicySurvivedReopen: true,
+        fullAccountNamesDisplayed: true, duplicateNamesDisambiguatedByIDs: true, namesRenderedAsText: true,
+        singleAccountDiagnosticsIsolated: true, default403PolicyEnabled: true, disabled403PolicySurvivedReopen: true,
         enabled403PolicySurvivedReopen: true, wideAndNarrowLayoutsWithoutOverflow: true,
+        defaultDeviceConvergenceDisabled: true, enabledDeviceConvergenceSurvivedReopen: true,
+        disabledDeviceConvergenceSurvivedReopen: true, deviceConvergenceDirtyStateReset: true,
+        deviceConvergenceLockedDuringSave: true,
         automaticImagesWithoutSettings: true,
         defaultModelsSelected: true, modelSubsetSurvivedReopen: true, allSixModelsSurvivedReopen: true,
         emptyModelSelectionSurvivedReopen: true, otherConfigurationPreserved: true });
@@ -263,9 +338,25 @@ const host = `
     if (data.type === 'config.load') { loadCount++; return respond({ ok: true, config: clone(config) }); }
     if (data.type === 'plugin.status') return respond({ ok: true, result: { healthy: true, message: 'ready',
       status_json: JSON.stringify({ plugin_version: 'browser-test', accounts, account_ids: config.account_ids,
-        available_models: models, enabled_models: config.enabled_models }) } });
+        available_models: models, enabled_models: config.enabled_models, degradation_check: lastCheck }) } });
+    if (data.type === 'config.test') {
+      const index = accountIDs.indexOf(config.degradation_check_account_id);
+      if (stage !== 'reopen-empty' || config.degradation_check !== true || index < 0)
+        return void finish(false, { error: 'Diagnostic did not target an explicit account ID' });
+      testCount++;
+      const statuses = ['error', 'error', 'degraded', 'ok', 'skipped'];
+      const result = { account_id: accountIDs[index], name: 'stale-result-name', status: statuses[index] };
+      if (index === 0 || index === 1) result.error = index === 0 ? 'HTTP 403' : 'HTTP 429';
+      else if (index === 4) result.error = 'temporarily unavailable';
+      else result.answer = index === 2 ? '苹果16' : '苹果17';
+      lastCheck = { completed: true, results: [result], degraded_account_ids: index === 2 ? [accountIDs[index]] : [] };
+      return respond({ ok: true, result: { status_json: JSON.stringify({ degradation_check: lastCheck }) } });
+    }
     if (data.type === 'config.save') {
       saveCount++;
+      if (stage === 'reopen-empty' && (data.config.bps_auto_disable_on_403 !== false || data.config.bps_device_convergence !== false ||
+          !same(data.config.account_ids, []) || !same(data.config.enabled_models, []) || !same(data.config.excluded_account_ids, accountIDs)))
+        return void finish(false, { error: 'Diagnostic save changed policies or account/model routing' });
       if (data.config.timeout_seconds !== 123 || data.config.auth_mode !== 'chatgpt' || data.config.rewrite_tools !== false)
         return void finish(false, { error: 'Saving account selection overwrote unrelated configuration' });
       config = clone(data.config);
@@ -350,7 +441,7 @@ try {
   const result = await resultPromise;
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) throw new Error(result.error || 'Browser regression failed');
-  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: complete account IDs fit wide and narrow layouts; 403 policy, account choices, and model choices persist across iframe destruction and reopening.');
+  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: complete safe account names fit wide/narrow layouts and diagnostics stay tied to IDs; 403/device policies and account/model choices persist after reopening.');
 } catch (error) {
   console.error(error.stack || error.message);
   process.exitCode = 1;

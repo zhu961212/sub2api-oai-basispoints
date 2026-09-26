@@ -133,6 +133,8 @@ func TestBasisPointsRetryDelayBoundaries(t *testing.T) {
 		{"maximum_seconds", 503, 0, "5", 5 * time.Second, true},
 		{"long_seconds", 503, 0, "6", 0, false},
 		{"huge_seconds", 503, 0, "9223372036854775807", 0, false},
+		{"overflow_seconds", 503, 0, "9223372036854775808", 0, false},
+		{"very_large_seconds", 503, 0, strings.Repeat("9", 64), 0, false},
 		{"negative_seconds", 503, 0, "-1", 250 * time.Millisecond, true},
 		{"invalid", 503, 0, "not-a-delay", 250 * time.Millisecond, true},
 		{"date", 503, 0, now.Add(3 * time.Second).Format(http.TimeFormat), 3 * time.Second, true},
@@ -153,7 +155,7 @@ func TestBasisPointsRetryDelayBoundaries(t *testing.T) {
 }
 
 func TestBasisPointsRetryPreservesResponseWhenRetryUnavailable(t *testing.T) {
-	for _, reason := range []string{"long_delay", "deadline", "unreplayable", "body_error", "server_disallowed"} {
+	for _, reason := range []string{"long_delay", "overflow_delay", "deadline", "unreplayable", "body_error", "server_disallowed"} {
 		t.Run(reason, func(t *testing.T) {
 			ctx := context.Background()
 			if reason == "deadline" {
@@ -172,6 +174,9 @@ func TestBasisPointsRetryPreservesResponseWhenRetryUnavailable(t *testing.T) {
 			want := &http.Response{StatusCode: http.StatusServiceUnavailable, Header: make(http.Header), Body: body}
 			if reason == "long_delay" {
 				want.Header.Set("Retry-After", "6")
+			}
+			if reason == "overflow_delay" {
+				want.Header.Set("Retry-After", "9223372036854775808")
 			}
 			if reason == "server_disallowed" {
 				want.Header.Set("X-Should-Retry", "false")

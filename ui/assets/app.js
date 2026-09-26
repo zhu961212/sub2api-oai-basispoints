@@ -34,6 +34,7 @@
     "excluded_account_ids",
     "bps_reenabled_accounts",
     "bps_auto_disable_on_403",
+    "bps_device_convergence",
     "max_response_bytes",
     "auth_mode",
     "tools_version_id",
@@ -50,6 +51,7 @@
   var excludedIDs = [];
   var autoSelectNewAccounts = false;
   var bpsAutoDisableOn403 = true;
+  var bpsDeviceConvergence = false;
   var accountDirectoryReady = false;
   var knownAccountIDs = [];
   var knownAccountIDSet = new Set();
@@ -68,6 +70,7 @@
   var accountCheckButtons = [];
   var renderedAccountSignature = null;
   var renderedDegradationSignature = null;
+  var lastDegradationCheck = null;
   var disposed = false;
   var resizeObserver = null;
   var lastResizeHeight = null;
@@ -116,6 +119,8 @@
     id("retry-button").disabled = loading || saving;
     id("bps-403-toggle").disabled = locked;
     renderBps403Toggle();
+    id("bps-device-toggle").disabled = locked;
+    renderBpsDeviceToggle();
     var degradationButton = id("degradation-check-button");
     if (degradationButton) {
       degradationButton.disabled = locked || !accounts.some(isSelectableAccount);
@@ -253,7 +258,8 @@
   }
 
   function accountDisplayName(account) {
-    return String(account.id);
+    if (typeof account.name === "string" && account.name.trim()) return account.name;
+    return Number.isSafeInteger(account.id) && account.id > 0 ? String(account.id) : "账号";
   }
 
   function renderBps403Toggle() {
@@ -271,9 +277,27 @@
     scheduleResize();
   }
 
-  function verifyBps403Policy(config, expected) {
+  function renderBpsDeviceToggle() {
+    var button = id("bps-device-toggle");
+    var pending = bpsDeviceConvergence !== (loaded.bps_device_convergence === true);
+    button.textContent = "设备收敛：" + (bpsDeviceConvergence ? "已开启" : "已关闭") + (pending ? "（待保存）" : "");
+    button.setAttribute("aria-pressed", String(bpsDeviceConvergence));
+  }
+
+  function toggleBpsDevice(event) {
+    event.preventDefault();
+    if (!configReady || saving || loading || degradationChecking) return;
+    bpsDeviceConvergence = !bpsDeviceConvergence;
+    renderBpsDeviceToggle();
+    scheduleResize();
+  }
+
+  function verifyBpsPolicies(config, expected) {
     if ((config.bps_auto_disable_on_403 !== false) !== (expected.bps_auto_disable_on_403 !== false)) {
       throw new Error("宿主返回的 403 自动停用开关与提交内容不一致，请重新保存");
+    }
+    if ((config.bps_device_convergence === true) !== (expected.bps_device_convergence === true)) {
+      throw new Error("宿主返回的设备收敛开关与提交内容不一致，请重新保存");
     }
   }
 
@@ -306,12 +330,23 @@
   }
 
   function renderDegradationResult(check) {
+    lastDegradationCheck = check && typeof check === "object" ? check : null;
     var container = id("degradation-result");
     if (!container) {
       return;
     }
-    var signature = JSON.stringify([check, (check && Array.isArray(check.results) ? check.results : []).map(function (result) {
-      return result && accountChecks[result.account_id];
+    var results = check && Array.isArray(check.results) ? check.results : [];
+    var accountByID = new Map();
+    accounts.forEach(function (account) { accountByID.set(account.id, account); });
+    var labels = results.map(function (result) {
+      if (!result || typeof result !== "object") return "账号";
+      var account = accountByID.get(result.account_id) || { id: result.account_id, name: result.name };
+      var name = accountDisplayName(account);
+      if (!Number.isSafeInteger(result.account_id) || result.account_id <= 0) return name;
+      return name === String(result.account_id) ? "#" + result.account_id : name + "（#" + result.account_id + "）";
+    });
+    var signature = JSON.stringify([check, results.map(function (result, index) {
+      return [result && accountChecks[result.account_id], labels[index]];
     })]);
     if (signature === renderedDegradationSignature) return;
     renderedDegradationSignature = signature;
@@ -319,7 +354,6 @@
     if (!check || typeof check !== "object") {
       return;
     }
-    var results = Array.isArray(check.results) ? check.results : [];
     var degraded = confirmedDegradedIDs(check);
     if (check.completed !== true && check.state !== "done") {
       var state = document.createElement("span");
@@ -334,7 +368,7 @@
       ? "检测完成：" + degraded.length + " 个疑似降智账号（按自定义“苹果17”规则，不代表可靠智力测评）"
       : "检测结束：未获得有效回答，保留原账号选择。失败或跳过不等于降智。";
     container.appendChild(summary);
-    results.forEach(function (result) {
+    results.forEach(function (result, index) {
       if (!result || typeof result !== "object") {
         return;
       }
@@ -343,9 +377,8 @@
       var status = String(remembered ? remembered.status : result.status || "");
       line.className = status === "degraded" ? "result-degraded" :
         (status === "ok" ? "result-ok" : "result-error");
-      var accountID = Number.isSafeInteger(result.account_id) ? "#" + String(result.account_id).slice(0, 6) : "账号";
       var detail = remembered ? remembered.detail : result.answer || result.error || "";
-      line.textContent = accountID + " · " + degradationStatusLabel(status) +
+      line.textContent = labels[index] + " · " + degradationStatusLabel(status) +
         (detail ? " · " + String(detail).slice(0, 160) : "");
       container.appendChild(line);
     });
@@ -448,7 +481,7 @@
   function accountListSignature() {
     return JSON.stringify(accounts.map(function (account) {
       var check = accountChecks[account.id];
-      return [account.id, !!account.schedulable, account.status || "",
+      return [account.id, accountDisplayName(account), !!account.schedulable, account.status || "",
         isSelected(account.id), check ? check.status : "", check ? check.detail : "",
         bpsDisabledAccounts.get(account.id), hasPendingBpsRestore(account.id)];
     }));
@@ -504,7 +537,7 @@
       text.title = "账号 ID：" + account.id;
       var availability = document.createElement("span");
       availability.className = "account-availability" + (bpsDisabledAccounts.has(account.id) ? " bps-disabled" : "");
-      availability.textContent = bpsAvailabilityLabel(account);
+      availability.textContent = "#" + account.id + " · " + bpsAvailabilityLabel(account);
       if (bpsDisabledAccounts.has(account.id)) availability.title = "仅停用此账号的 BPS 转发，宿主账号保留。重新勾选并保存可尝试恢复；开启自动停用时，再次收到 BPS 403 会重新停用。";
       copy.appendChild(text);
       copy.appendChild(availability);
@@ -595,6 +628,7 @@
     });
     config.account_ids = selectedIDs.length ? selectedIDs.slice() : [];
     config.bps_auto_disable_on_403 = bpsAutoDisableOn403;
+    config.bps_device_convergence = bpsDeviceConvergence;
     // 旧非空白名单必须先拿到有效目录，才能保留已知未勾选账号的透传行为。
     if (autoSelectNewAccounts || accountDirectoryReady) {
       config.auto_select_new_accounts = true;
@@ -681,6 +715,8 @@
     autoSelectNewAccounts = loaded.auto_select_new_accounts === true || selectedIDs.length === 0;
     bpsAutoDisableOn403 = loaded.bps_auto_disable_on_403 !== false;
     renderBps403Toggle();
+    bpsDeviceConvergence = loaded.bps_device_convergence === true;
+    renderBpsDeviceToggle();
     // A diagnostic save preserves confirmed acknowledgements only. Keep a
     // user's still-unsaved restore choice local until an ordinary save.
     var pendingRestores = new Set();
@@ -736,6 +772,9 @@
     if (details.degradation_check && !degradationChecking) {
       rememberAccountChecks(details.degradation_check);
       renderDegradationResult(details.degradation_check);
+    } else if (lastDegradationCheck && !degradationChecking) {
+      // Directory renames also refresh a locally completed diagnostic report.
+      renderDegradationResult(lastDegradationCheck);
     }
     renderAccountList();
     renderAccountHint();
@@ -842,7 +881,7 @@
     bridge
       .saveConfig(submitted)
       .then(function (normalized) {
-        verifyBps403Policy(normalized, submitted);
+        verifyBpsPolicies(normalized, submitted);
         if (!sameAccountPolicy(normalized, submitted)) {
           throw new Error("宿主返回的账号选择、自动接入模式或排除名单与提交内容不一致");
         }
@@ -857,7 +896,7 @@
         return bridge.loadConfig();
       })
       .then(function (persisted) {
-        verifyBps403Policy(persisted, submitted);
+        verifyBpsPolicies(persisted, submitted);
         if (!sameAccountPolicy(persisted, submitted)) {
           throw new Error("重新读取的账号选择、自动接入模式或排除名单与提交内容不一致，请重试或检查宿主日志");
         }
@@ -920,7 +959,7 @@
       .saveConfig(trigger)
       .then(function (normalized) {
         triggerSaved = true;
-        verifyBps403Policy(normalized, trigger);
+        verifyBpsPolicies(normalized, trigger);
         if (!sameAccountPolicy(normalized, trigger) || !sameModels(normalized, trigger.enabled_models)) {
           throw new Error("宿主返回的账号路由或模型选择与检测前不一致");
         }
@@ -972,7 +1011,7 @@
             : "没有可自动选择的检测结果，正在保留原账号选择并清除检测标记…"
         );
         return bridge.saveConfig(finalConfig).then(function (normalized) {
-          verifyBps403Policy(normalized, finalConfig);
+          verifyBpsPolicies(normalized, finalConfig);
           if (!sameAccountPolicy(normalized, finalConfig) || !sameModels(normalized, finalConfig.enabled_models)) {
             throw new Error("宿主返回的降智账号路由或模型选择与检测结果不一致");
           }
@@ -988,7 +1027,7 @@
           throw new Error("宿主未返回降智检测结果");
         }
         var degraded = confirmedDegradedIDs(check);
-        verifyBps403Policy(persisted, finalConfig);
+        verifyBpsPolicies(persisted, finalConfig);
         if (!sameAccountPolicy(persisted, finalConfig)) {
           throw new Error("重新读取的降智账号选择、自动接入模式或排除名单与检测结果不一致");
         }
@@ -1043,6 +1082,7 @@
     id("save-button").addEventListener("click", handleSave);
     id("select-all-button").addEventListener("click", selectAllAccounts);
     id("bps-403-toggle").addEventListener("click", toggleBps403);
+    id("bps-device-toggle").addEventListener("click", toggleBpsDevice);
     var degradationButton = id("degradation-check-button");
     if (degradationButton) {
       degradationButton.addEventListener("click", handleDegradationCheck);

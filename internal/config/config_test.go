@@ -104,6 +104,45 @@ func TestBPSAutoDisableOn403Configuration(t *testing.T) {
 	}
 }
 
+func TestBPSDeviceConvergenceConfiguration(t *testing.T) {
+	for _, test := range []struct {
+		name, raw string
+		want      bool
+	}{
+		{"missing payload", "", false},
+		{"old config", `{"account_ids":[7]}`, false},
+		{"explicit enabled", `{"bps_device_convergence":true}`, true},
+		{"explicit disabled", `{"bps_device_convergence":false}`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, err := Parse([]byte(test.raw))
+			if err != nil || c.BPSDeviceConvergence != test.want {
+				t.Fatalf("parsed device policy = %t want %t; err=%v", c.BPSDeviceConvergence, test.want, err)
+			}
+			raw, err := json.Marshal(c.Clone())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if fields["bps_device_convergence"] != test.want {
+				t.Fatalf("device policy must serialize explicit false: %s", raw)
+			}
+			again, err := Parse(raw)
+			if err != nil || again.BPSDeviceConvergence != test.want {
+				t.Fatalf("device policy changed after round-trip: %v %v", again, err)
+			}
+		})
+	}
+	for _, raw := range []string{`{"bps_device_convergence":"true"}`, `{"bps_device_convergence":1}`} {
+		if _, err := Parse([]byte(raw)); err == nil {
+			t.Fatalf("invalid device policy accepted: %s", raw)
+		}
+	}
+}
+
 func TestParseRejectsUnknownFields(t *testing.T) {
 	if _, err := Parse([]byte(`{"responses_urll":"https://example.test"}`)); err == nil {
 		t.Fatal("unknown field was accepted")

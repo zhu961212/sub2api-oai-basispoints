@@ -16,6 +16,10 @@
 
 third_party/sub2api/go.mod 是用于编译上述副本的本地模块入口。此声明记录来源，不更改第三方许可或上游版权。
 
+## 设备收敛协议与编码参考
+
+0.5.28 的设备 ID 优先级、codex_fingerprint_seed 派生命名空间和 UUID 位设置，以及 HTTP 安全的 turn metadata JSON 编码，对照上述 Sub2API 0.2.8 固定提交的 backend/internal/service/openai_codex_fingerprint.go 和 openai_codex_turn_metadata.go 实现。插件适配代码位于 internal/transport/device_fingerprint.go 与 device_fingerprint_rewrite.go，相关许可来源同上，完整上游许可证已保留。设备开关、BPS 载体边界、旧宿主回退及缓存属于本插件适配；行为与差异见 [设备指纹说明](docs/BPS-DEVICE-FINGERPRINT.md)。
+
 ## Go 模块依赖
 
 其余模块的精确版本与校验值由 go.mod、go.sum 记录，源码由 Go 模块机制管理，各依赖继续适用其原许可证。发布者应保留对应依赖要求的声明。
