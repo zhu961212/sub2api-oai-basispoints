@@ -69,6 +69,41 @@ func TestParseNilPayloadYieldsDefaults(t *testing.T) {
 	}
 }
 
+func TestBPSAutoDisableOn403Configuration(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"missing payload", "", true},
+		{"old config", `{"account_ids":[7]}`, true},
+		{"explicit enabled", `{"bps_auto_disable_on_403":true}`, true},
+		{"explicit disabled", `{"bps_auto_disable_on_403":false}`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, err := Parse([]byte(test.raw))
+			if err != nil || c.BPSAutoDisableOn403 != test.want {
+				t.Fatalf("parsed policy = %t, want %t; err=%v", c.BPSAutoDisableOn403, test.want, err)
+			}
+			raw, err := json.Marshal(c.Clone())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if fields["bps_auto_disable_on_403"] != test.want {
+				t.Fatalf("serialized policy must retain explicit false: %s", raw)
+			}
+			again, err := Parse(raw)
+			if err != nil || again.BPSAutoDisableOn403 != test.want {
+				t.Fatalf("round-trip changed policy: %#v, %v", again, err)
+			}
+		})
+	}
+}
+
 func TestParseRejectsUnknownFields(t *testing.T) {
 	if _, err := Parse([]byte(`{"responses_urll":"https://example.test"}`)); err == nil {
 		t.Fatal("unknown field was accepted")

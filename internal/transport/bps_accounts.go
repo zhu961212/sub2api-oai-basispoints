@@ -179,6 +179,16 @@ func (t *Transport) disableBPSAccount(ctx context.Context, id int64) {
 	if id <= 0 {
 		return
 	}
+	// Every explicit BPS 403 reaches this shared write boundary, including
+	// attachment uploads, tool correction and on-demand account checks. Use
+	// the current policy so disabling it also covers requests already in flight.
+	// Hold the config read lock through the in-memory mark to order it with
+	// ApplyConfig; persistence can finish independently after that point.
+	t.mu.RLock()
+	if !t.cfg.BPSAutoDisableOn403 {
+		t.mu.RUnlock()
+		return
+	}
 	var random [16]byte
 	_, _ = rand.Read(random[:])
 	record := bpsAccountRecord{AccountID: id, BlockID: hex.EncodeToString(random[:]), Reason: bpsAccountFailureReason, HTTPStatus: 403}
@@ -189,6 +199,7 @@ func (t *Transport) disableBPSAccount(ctx context.Context, id int64) {
 	s.records[id], s.revisions[id], s.dirty[id] = record, s.revision, true
 	epoch := s.epoch
 	s.mu.Unlock()
+	t.mu.RUnlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}

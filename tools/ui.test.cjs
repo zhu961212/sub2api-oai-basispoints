@@ -122,6 +122,7 @@ function createPage(options = {}) {
     "save-button": "button",
     "select-all-button": "button",
     "degradation-check-button": "button",
+    "bps-403-toggle": "button",
     "degradation-result": "div",
     "retry-button": "button",
   };
@@ -138,6 +139,7 @@ function createPage(options = {}) {
   ids["model-fields"].appendChild(ids["model-hint"]);
   ids["account-fields"].appendChild(ids["select-all-button"]);
   ids["account-fields"].appendChild(ids["degradation-check-button"]);
+  ids["account-fields"].appendChild(ids["bps-403-toggle"]);
   ids["account-fields"].appendChild(ids["account-list"]);
   ids["account-fields"].appendChild(ids["account-hint"]);
   ids["account-fields"].appendChild(ids["degradation-result"]);
@@ -233,6 +235,7 @@ function createPage(options = {}) {
     save: () => ids["save-button"].click(),
     selectAll: () => ids["select-all-button"].click(),
     degradationCheck: () => ids["degradation-check-button"].click(),
+    toggle403: () => ids["bps-403-toggle"].click(),
     checkAccount: (accountID) => {
       const button = accountRow(accountID).button;
       assert.ok(button, "Account #" + accountID + " must have its own diagnostic button");
@@ -245,7 +248,7 @@ function createPage(options = {}) {
 }
 
 test("configuration actions work without sandboxed form submission", () => {
-  for (const id of ["save-button", "retry-button", "select-all-button"]) {
+  for (const id of ["save-button", "retry-button", "select-all-button", "bps-403-toggle"]) {
     const tag = htmlSource.match(new RegExp("<button\\b[^>]*\\bid=[\"']" + id + "[\"'][^>]*>"));
     assert.ok(tag, id + " exists");
     assert.match(tag[0], /\btype=["']button["']/);
@@ -426,15 +429,16 @@ test("select all is disabled when the list is empty and preserves hidden saved I
   assert.deepEqual(page.calls.save[0].account_ids, [99]);
 });
 
-test("account rows show six Unicode characters and keep diagnostic controls outside the label", async () => {
+test("account rows show unique full IDs and keep diagnostic controls outside the label", async () => {
   const names = ["shared-first@example.com", "shared-second@example.com", "短名", "😀一二三四五六七"];
   const page = createPage({ accounts: names.map((name, index) => ({ id: index + 1, name, schedulable: true })) });
   await flush();
   for (let index = 0; index < names.length; index++) {
     const { row, name, availability, result, button, checkbox } = page.accountRow(index + 1);
     assert.ok(hasClass(row, "account-row"));
-    assert.equal(name.textContent, Array.from(names[index]).slice(0, 6).join(""));
-    assert.equal(name.title, names[index]);
+    assert.equal(name.textContent, String(index + 1));
+    assert.equal(name.title, "账号 ID：" + (index + 1));
+    assert.equal(button.getAttribute("aria-label"), "检测账号 ID：" + (index + 1));
     assert.ok(availability);
     assert.ok(result);
     assert.equal(button.textContent, "降智检测");
@@ -443,23 +447,136 @@ test("account rows show six Unicode characters and keep diagnostic controls outs
     assert.equal(checkbox.parentNode.tagName, "LABEL");
     assert.ok(!descendants(checkbox.parentNode).includes(button), "Diagnostic clicks cannot toggle the checkbox label");
   }
-  assert.equal(page.accountRow(1).name.textContent, page.accountRow(2).name.textContent);
+  assert.notEqual(page.accountRow(1).name.textContent, page.accountRow(2).name.textContent);
 });
 
-test("account rows have a short identifier fallback when names are missing", async () => {
+test("account rows never truncate long IDs when names are missing", async () => {
   const page = createPage({ accounts: [{ id: 123456789, schedulable: true }] });
   await flush();
   const { name, button } = page.accountRow(123456789);
-  assert.ok(name.textContent.length > 0);
-  assert.ok(Array.from(name.textContent).length <= 6);
+  assert.equal(name.textContent, "123456789");
   assert.match(name.title, /123456789/);
   assert.equal(button.value, "123456789");
+});
+
+test("403 auto-disable defaults on and both settings survive saving and reopening", async () => {
+  const store = { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2] } };
+  let page = createPage({ store });
+  assert.equal(page.ids["bps-403-toggle"].disabled, true);
+  await flush();
+  assert.equal(page.ids["bps-403-toggle"].getAttribute("aria-pressed"), "true");
+  for (const expected of [false, true]) {
+    page.toggle403();
+    assert.equal(page.ids["bps-403-toggle"].getAttribute("aria-pressed"), String(expected));
+    assert.match(page.ids["bps-403-toggle"].textContent, /待保存/);
+    assert.equal(page.calls.save.length, 0, "Toggling requires an explicit save");
+    page.pollStatus();
+    await flush();
+    assert.equal(page.ids["bps-403-toggle"].getAttribute("aria-pressed"), String(expected));
+    page.save();
+    assert.equal(page.ids["bps-403-toggle"].disabled, true);
+    page.toggle403();
+    await flush();
+    assert.equal(store.config.bps_auto_disable_on_403, expected);
+    assert.deepEqual(page.selected(), [1, 3]);
+    assert.deepEqual(store.config.excluded_account_ids, [2]);
+    assert.match(page.ids["form-hint"].textContent, /已保存/);
+    assert.doesNotMatch(page.ids["bps-403-toggle"].textContent, /待保存/);
+    page = createPage({ store });
+    await flush();
+    assert.equal(page.ids["bps-403-toggle"].getAttribute("aria-pressed"), String(expected));
+  }
+});
+
+test("403 auto-disable rejects a dropped setting in save acknowledgement or reload", async (t) => {
+  for (const phase of ["save", "reload"]) {
+    await t.test(phase, async () => {
+      const page = createPage({
+        save(config, store) {
+          store.config = clone(config);
+          const reply = clone(config);
+          if (phase === "save") delete reply.bps_auto_disable_on_403;
+          return Promise.resolve(reply);
+        },
+        load(number, store) {
+          const reply = clone(store.config);
+          if (number > 1 && phase === "reload") delete reply.bps_auto_disable_on_403;
+          return Promise.resolve(reply);
+        },
+      });
+      await flush();
+      page.toggle403();
+      page.save();
+      await flush();
+      assert.match(page.ids["form-hint"].textContent, /403 自动停用开关与提交内容不一致/);
+      assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
+      assert.equal(page.ids["bps-403-toggle"].disabled, false);
+    });
+  }
+});
+
+test("single-account checks keep every result tied to its ID across repeated checks", async () => {
+  const fixtures = [
+    { account_id: 1, status: "ok", answer: "苹果17", label: /符合检测规则/ },
+    { account_id: 2, status: "degraded", answer: "苹果16", label: /疑似降智/ },
+    { account_id: 3, status: "error", error: "HTTP 429", label: /检测失败/ },
+  ];
+  const probed = [];
+  const page = createPage({
+    store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2], bps_auto_disable_on_403: false } },
+    accounts: fixtures.map((fixture) => ({ id: fixture.account_id, name: "identical-name", schedulable: true })),
+    test(_number, store) {
+      const target = store.config.degradation_check_account_id;
+      probed.push(target);
+      const { label, ...result } = fixtures.find((fixture) => fixture.account_id === target);
+      return Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
+        completed: true, results: [result], degraded_account_ids: result.status === "degraded" ? [target] : [],
+      } }) });
+    },
+  });
+  await flush();
+  const checked = new Set();
+  for (const target of [3, 1, 2, 1]) {
+    page.checkAccount(target);
+    assert.equal(page.ids["bps-403-toggle"].disabled, true);
+    page.toggle403();
+    await flush();
+    checked.add(target);
+    for (const fixture of fixtures) {
+      assert.match(page.accountRow(fixture.account_id).result.textContent, checked.has(fixture.account_id) ? fixture.label : /未检测/);
+    }
+    assert.deepEqual(page.selected(), [1, 3]);
+    assert.equal(page.store.config.bps_auto_disable_on_403, false);
+    assert.equal(page.store.config.degradation_check, false);
+    assert.ok(!page.store.config.degradation_check_account_id);
+  }
+  assert.deepEqual(probed, [3, 1, 2, 1]);
+});
+
+test("diagnostics do not start when the host loses the 403 switch setting", async () => {
+  const page = createPage({
+    store: { config: { account_ids: [], bps_auto_disable_on_403: false } },
+    save(config, store) {
+      store.config = clone(config);
+      const reply = clone(config);
+      if (config.degradation_check) delete reply.bps_auto_disable_on_403;
+      return Promise.resolve(reply);
+    },
+  });
+  await flush();
+  page.checkAccount(2);
+  await flush();
+  assert.equal(page.calls.test, 0);
+  assert.equal(page.store.config.degradation_check, false);
+  assert.equal(page.store.config.bps_auto_disable_on_403, false);
+  assert.match(page.ids["form-hint"].textContent, /403 自动停用开关与提交内容不一致/);
 });
 
 test("single-account diagnostics use the real ID and preserve selection models and exclusions", async () => {
   const config = {
     account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2, 88],
     enabled_models: ["gpt-6-astra"], timeout_seconds: 123,
+    bps_auto_disable_on_403: false,
   };
   const page = createPage({
     store: { config: clone(config) },
@@ -666,8 +783,8 @@ test("per-account verdicts remain attached to real IDs after status polling and 
   assert.match(page.accountRow(1).result.textContent, /疑似降智/);
   assert.match(page.accountRow(2).result.textContent, /符合检测规则|正常/);
   assert.doesNotMatch(page.accountRow(3).result.textContent, /疑似降智|符合检测规则|正常/);
-  assert.equal(page.accountRow(1).name.textContent, "rename");
-  assert.equal(page.accountRow(2).name.title, "renamed-two");
+  assert.equal(page.accountRow(1).name.textContent, "1");
+  assert.equal(page.accountRow(2).name.title, "账号 ID：2");
   assert.deepEqual(page.selected(), [1, 2, 3]);
 });
 
@@ -920,7 +1037,7 @@ test("selected accounts save on click, persist on read-back, and survive reopeni
   assert.equal(page.calls.load, 2, "Saving must confirm the persisted host configuration");
   const submitted = clone(page.calls.save[0]);
   submitted.account_ids.sort((a, b) => a - b);
-  assert.deepEqual(submitted, { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false });
+  assert.deepEqual(submitted, { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false, bps_auto_disable_on_403: true });
   assert.deepEqual(page.selected(), [1, 2]);
   assert.match(page.ids["form-hint"].textContent, /已保存/);
   assert.equal(page.ids["account-fields"].disabled, false);
@@ -1063,7 +1180,7 @@ test("automatic images need no configuration controls", async () => {
   await flush();
   page.save();
   await flush();
-  assert.deepEqual(page.calls.save[0], { account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels });
+  assert.deepEqual(page.calls.save[0], { account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels, bps_auto_disable_on_403: true });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
@@ -1107,7 +1224,7 @@ test("a rejected save preserves account edits for retry", async () => {
   page.save();
   await flush();
   assert.equal(page.calls.save.length, 2);
-  assert.deepEqual(page.store.config, { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels });
+  assert.deepEqual(page.store.config, { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels, bps_auto_disable_on_403: true });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 

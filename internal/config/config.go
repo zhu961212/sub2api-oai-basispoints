@@ -18,7 +18,7 @@ import (
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.5.26"
+	Version = "0.5.27"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -68,6 +68,9 @@ type Config struct {
 	// 缺省 false 保留旧白名单，配置页保存时迁移为自动模式。
 	AutoSelectNewAccounts bool    `json:"auto_select_new_accounts,omitempty"`
 	ExcludedAccountIDs    []int64 `json:"excluded_account_ids,omitempty"`
+	// BPSAutoDisableOn403 controls creation of new BPS account restrictions.
+	// Disabling this policy never clears an existing restriction.
+	BPSAutoDisableOn403 bool `json:"bps_auto_disable_on_403"`
 	// Acknowledging one block never clears a newer persisted BPS 403.
 	BPSReenabledAccounts map[string]string `json:"bps_reenabled_accounts,omitempty"`
 	// DegradationCheck is a one-shot request marker consumed by TestConfig.
@@ -90,13 +93,14 @@ type Config struct {
 // 能规范化为完整配置，而不是解析失败。
 func Default() Config {
 	return Config{
-		ResponsesURL:       DefaultResponsesURL,
-		EnabledModels:      cloneStrings(defaultModels),
-		TimeoutSeconds:     DefaultTimeoutSeconds,
-		MaxResponseBytes:   DefaultMaxResponseBytes,
-		AuthMode:           DefaultAuthMode,
-		RewriteTools:       true,
-		TransformResponses: true,
+		ResponsesURL:        DefaultResponsesURL,
+		EnabledModels:       cloneStrings(defaultModels),
+		TimeoutSeconds:      DefaultTimeoutSeconds,
+		MaxResponseBytes:    DefaultMaxResponseBytes,
+		AuthMode:            DefaultAuthMode,
+		RewriteTools:        true,
+		TransformResponses:  true,
+		BPSAutoDisableOn403: true,
 	}
 }
 

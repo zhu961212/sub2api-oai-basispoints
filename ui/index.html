@@ -26,7 +26,9 @@
           <div class="actions account-actions">
             <button id="select-all-button" type="button" class="ghost" disabled>全选列表账号</button>
             <button id="degradation-check-button" type="button" class="ghost" disabled>一键检测降智账号</button>
+            <button id="bps-403-toggle" type="button" class="ghost" aria-pressed="true" aria-describedby="bps-403-hint" disabled>403 自动停用：已开启</button>
           </div>
+          <span id="bps-403-hint" class="hint">开启后，账号收到 BPS HTTP 403 时自动停用其 BPS 转发。切换后保存生效；关闭不会恢复已停用账号，恢复需重新勾选并保存。</span>
           <div id="account-list" class="check-list"></div>
           <span id="account-hint" class="hint">新增账号自动勾选并使用 BPS；取消勾选会记住排除。旧配置保存一次即可启用，之后无需再次打开配置页。</span>
           <span class="hint">检测会向可用账号发送真实请求，可能消耗额度。按自定义“苹果17”回答规则筛选疑似账号，不代表可靠智力测评；限流、鉴权失败、超时和跳过均不会判为降智。</span>

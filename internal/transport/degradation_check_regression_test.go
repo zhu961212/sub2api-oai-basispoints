@@ -37,12 +37,16 @@ func (f degradationRoundTripper) RoundTrip(request *http.Request) (*http.Respons
 
 func TestDegradationAnswerRejectsUnfinishedOrEmptyReplies(t *testing.T) {
 	cases := map[string]map[string]any{
-		"whitespace":     {"output_text": "  \t\n"},
-		"incomplete":     {"status": "incomplete", "output_text": "苹果16"},
-		"failed":         {"status": "failed", "output_text": "苹果16"},
-		"error":          {"error": map[string]any{"code": "rate_limit_exceeded"}, "output_text": "苹果16"},
-		"truncated chat": {"choices": []any{map[string]any{"finish_reason": "length", "message": map[string]any{"content": "苹果16"}}}},
-		"filtered chat":  {"choices": []any{map[string]any{"finish_reason": "content_filter", "message": map[string]any{"content": "苹果16"}}}},
+		"whitespace":          {"output_text": "  \t\n"},
+		"incomplete":          {"status": "incomplete", "output_text": "苹果16"},
+		"failed":              {"status": "failed", "output_text": "苹果16"},
+		"error":               {"error": map[string]any{"code": "rate_limit_exceeded"}, "output_text": "苹果16"},
+		"truncated chat":      {"choices": []any{map[string]any{"finish_reason": "length", "message": map[string]any{"content": "苹果16"}}}},
+		"filtered chat":       {"choices": []any{map[string]any{"finish_reason": "content_filter", "message": map[string]any{"content": "苹果16"}}}},
+		"envelope error":      {"error": map[string]any{"code": "unknown_failure"}, "response": map[string]any{"status": "completed", "output_text": "苹果16"}},
+		"failed envelope":     {"type": "response.failed", "response": map[string]any{"output_text": "苹果17"}},
+		"unfinished envelope": {"status": "incomplete", "response": map[string]any{"status": "completed", "output_text": "苹果16"}},
+		"error type":          {"type": "error", "output_text": "苹果17"},
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

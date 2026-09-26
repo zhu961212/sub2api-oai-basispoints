@@ -81,11 +81,13 @@ func TestDegradationHTTPErrorDoesNotWaitForBody(t *testing.T) {
 
 func TestDegradationReaderRejectsIncompleteResponses(t *testing.T) {
 	for name, data := range map[string]string{
-		"partial text":          streamData(map[string]any{"type": "response.output_text.delta", "delta": "苹果16"}),
-		"done without terminal": "data: [DONE]" + string([]byte{10, 10}),
-		"failed":                streamData(map[string]any{"type": "response.failed", "response": map[string]any{"status": "failed", "output_text": "苹果16"}}),
-		"incomplete":            streamData(map[string]any{"type": "response.completed", "response": map[string]any{"status": "incomplete", "output_text": "苹果16"}}),
-		"missing response":      streamData(map[string]any{"type": "response.completed"}),
+		"partial text":             streamData(map[string]any{"type": "response.output_text.delta", "delta": "苹果16"}),
+		"done without terminal":    "data: [DONE]" + string([]byte{10, 10}),
+		"failed":                   streamData(map[string]any{"type": "response.failed", "response": map[string]any{"status": "failed", "output_text": "苹果16"}}),
+		"incomplete":               streamData(map[string]any{"type": "response.completed", "response": map[string]any{"status": "incomplete", "output_text": "苹果16"}}),
+		"missing response":         streamData(map[string]any{"type": "response.completed"}),
+		"completed envelope error": streamData(map[string]any{"type": "response.completed", "error": map[string]any{"code": "unknown_failure"}, "response": map[string]any{"status": "completed", "output_text": "苹果17"}}),
+		"unfinished envelope":      streamData(map[string]any{"type": "response.completed", "status": "incomplete", "response": map[string]any{"status": "completed", "output_text": "苹果16"}}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			body, kind, err := readDegradationResponse(context.Background(), strings.NewReader(data), "text/event-stream", 4096)

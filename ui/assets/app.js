@@ -33,6 +33,7 @@
     "auto_select_new_accounts",
     "excluded_account_ids",
     "bps_reenabled_accounts",
+    "bps_auto_disable_on_403",
     "max_response_bytes",
     "auth_mode",
     "tools_version_id",
@@ -48,6 +49,7 @@
   var selectedIDSet = new Set();
   var excludedIDs = [];
   var autoSelectNewAccounts = false;
+  var bpsAutoDisableOn403 = true;
   var accountDirectoryReady = false;
   var knownAccountIDs = [];
   var knownAccountIDSet = new Set();
@@ -112,6 +114,8 @@
     id("model-fields").disabled = locked;
     id("retry-button").hidden = configReady || loading;
     id("retry-button").disabled = loading || saving;
+    id("bps-403-toggle").disabled = locked;
+    renderBps403Toggle();
     var degradationButton = id("degradation-check-button");
     if (degradationButton) {
       degradationButton.disabled = locked || !accounts.some(isSelectableAccount);
@@ -125,9 +129,6 @@
 
   function statusLabel(account) {
     var parts = ["#" + account.id];
-    if (account.name) {
-      parts.push(account.name);
-    }
     parts.push(account.schedulable ? "可用" : (account.status || "暂停"));
     if (bpsDisabledAccounts.has(account.id)) parts.push(bpsAvailabilityLabel(account));
     return parts.join(" · ");
@@ -252,7 +253,28 @@
   }
 
   function accountDisplayName(account) {
-    return Array.from(String(account.name || account.id)).slice(0, 6).join("");
+    return String(account.id);
+  }
+
+  function renderBps403Toggle() {
+    var button = id("bps-403-toggle");
+    var pending = bpsAutoDisableOn403 !== (loaded.bps_auto_disable_on_403 !== false);
+    button.textContent = "403 自动停用：" + (bpsAutoDisableOn403 ? "已开启" : "已关闭") + (pending ? "（待保存）" : "");
+    button.setAttribute("aria-pressed", String(bpsAutoDisableOn403));
+  }
+
+  function toggleBps403(event) {
+    event.preventDefault();
+    if (!configReady || saving || loading || degradationChecking) return;
+    bpsAutoDisableOn403 = !bpsAutoDisableOn403;
+    renderBps403Toggle();
+    scheduleResize();
+  }
+
+  function verifyBps403Policy(config, expected) {
+    if ((config.bps_auto_disable_on_403 !== false) !== (expected.bps_auto_disable_on_403 !== false)) {
+      throw new Error("宿主返回的 403 自动停用开关与提交内容不一致，请重新保存");
+    }
   }
 
   function rememberAccountChecks(check) {
@@ -426,7 +448,7 @@
   function accountListSignature() {
     return JSON.stringify(accounts.map(function (account) {
       var check = accountChecks[account.id];
-      return [account.id, account.name || "", !!account.schedulable, account.status || "",
+      return [account.id, !!account.schedulable, account.status || "",
         isSelected(account.id), check ? check.status : "", check ? check.detail : "",
         bpsDisabledAccounts.get(account.id), hasPendingBpsRestore(account.id)];
     }));
@@ -479,11 +501,11 @@
       var text = document.createElement("span");
       text.className = "account-name";
       text.textContent = accountDisplayName(account);
-      text.title = String(account.name || account.id);
+      text.title = "账号 ID：" + account.id;
       var availability = document.createElement("span");
       availability.className = "account-availability" + (bpsDisabledAccounts.has(account.id) ? " bps-disabled" : "");
       availability.textContent = bpsAvailabilityLabel(account);
-      if (bpsDisabledAccounts.has(account.id)) availability.title = "仅停用此账号的 BPS 转发，宿主账号保留。重新勾选并保存可尝试恢复；再次收到一次 BPS 403 会重新停用。";
+      if (bpsDisabledAccounts.has(account.id)) availability.title = "仅停用此账号的 BPS 转发，宿主账号保留。重新勾选并保存可尝试恢复；开启自动停用时，再次收到 BPS 403 会重新停用。";
       copy.appendChild(text);
       copy.appendChild(availability);
       label.appendChild(box);
@@ -502,8 +524,8 @@
       button.value = String(account.id);
       button.textContent = checkingAccountID === account.id ? "检测中…" : "降智检测";
       button.disabled = !configReady || saving || loading || degradationChecking || !account.schedulable;
-      button.title = account.schedulable ? "检测账号 #" + account.id + "：" + String(account.name || account.id) : "账号不可调度，暂不能检测";
-      button.setAttribute("aria-label", "检测账号 #" + account.id + "：" + String(account.name || account.id));
+      button.title = account.schedulable ? "检测账号 ID：" + account.id : "账号不可调度，暂不能检测";
+      button.setAttribute("aria-label", "检测账号 ID：" + account.id);
       button.addEventListener("click", function (event) { handleDegradationCheck(event, account.id); });
       accountCheckButtons.push({ account: account, button: button });
       row.appendChild(button);
@@ -572,6 +594,7 @@
       }
     });
     config.account_ids = selectedIDs.length ? selectedIDs.slice() : [];
+    config.bps_auto_disable_on_403 = bpsAutoDisableOn403;
     // 旧非空白名单必须先拿到有效目录，才能保留已知未勾选账号的透传行为。
     if (autoSelectNewAccounts || accountDirectoryReady) {
       config.auto_select_new_accounts = true;
@@ -656,6 +679,8 @@
     selectedIDSet = new Set(selectedIDs);
     excludedIDs = configAccountIDs(loaded, "excluded_account_ids");
     autoSelectNewAccounts = loaded.auto_select_new_accounts === true || selectedIDs.length === 0;
+    bpsAutoDisableOn403 = loaded.bps_auto_disable_on_403 !== false;
+    renderBps403Toggle();
     // A diagnostic save preserves confirmed acknowledgements only. Keep a
     // user's still-unsaved restore choice local until an ordinary save.
     var pendingRestores = new Set();
@@ -817,6 +842,7 @@
     bridge
       .saveConfig(submitted)
       .then(function (normalized) {
+        verifyBps403Policy(normalized, submitted);
         if (!sameAccountPolicy(normalized, submitted)) {
           throw new Error("宿主返回的账号选择、自动接入模式或排除名单与提交内容不一致");
         }
@@ -831,6 +857,7 @@
         return bridge.loadConfig();
       })
       .then(function (persisted) {
+        verifyBps403Policy(persisted, submitted);
         if (!sameAccountPolicy(persisted, submitted)) {
           throw new Error("重新读取的账号选择、自动接入模式或排除名单与提交内容不一致，请重试或检查宿主日志");
         }
@@ -893,6 +920,7 @@
       .saveConfig(trigger)
       .then(function (normalized) {
         triggerSaved = true;
+        verifyBps403Policy(normalized, trigger);
         if (!sameAccountPolicy(normalized, trigger) || !sameModels(normalized, trigger.enabled_models)) {
           throw new Error("宿主返回的账号路由或模型选择与检测前不一致");
         }
@@ -944,6 +972,7 @@
             : "没有可自动选择的检测结果，正在保留原账号选择并清除检测标记…"
         );
         return bridge.saveConfig(finalConfig).then(function (normalized) {
+          verifyBps403Policy(normalized, finalConfig);
           if (!sameAccountPolicy(normalized, finalConfig) || !sameModels(normalized, finalConfig.enabled_models)) {
             throw new Error("宿主返回的降智账号路由或模型选择与检测结果不一致");
           }
@@ -959,6 +988,7 @@
           throw new Error("宿主未返回降智检测结果");
         }
         var degraded = confirmedDegradedIDs(check);
+        verifyBps403Policy(persisted, finalConfig);
         if (!sameAccountPolicy(persisted, finalConfig)) {
           throw new Error("重新读取的降智账号选择、自动接入模式或排除名单与检测结果不一致");
         }
@@ -1012,6 +1042,7 @@
     // 通过普通按钮点击发 bridge 消息，兼容宿主的 form-action 'none'。
     id("save-button").addEventListener("click", handleSave);
     id("select-all-button").addEventListener("click", selectAllAccounts);
+    id("bps-403-toggle").addEventListener("click", toggleBps403);
     var degradationButton = id("degradation-check-button");
     if (degradationButton) {
       degradationButton.addEventListener("click", handleDegradationCheck);

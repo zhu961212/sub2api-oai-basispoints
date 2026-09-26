@@ -37,6 +37,9 @@ func readDegradationResponse(ctx context.Context, body io.Reader, contentType st
 		}
 		switch kind {
 		case "response.completed", "response.done":
+			if err := degradationResponseError(payload); err != nil {
+				return err
+			}
 			response, ok := payload["response"].(map[string]any)
 			if !ok {
 				return fmt.Errorf("invalid upstream completed response")

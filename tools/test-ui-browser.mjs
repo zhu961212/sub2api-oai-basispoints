@@ -50,10 +50,28 @@ const driver = String.raw`
   const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
   const selected = () => Array.from(document.querySelectorAll('#account-list input:checked')).map((box) => Number(box.value));
   const selectedModels = () => Array.from(document.querySelectorAll('#model-list input:checked')).map((box) => box.value);
+  const accountIDs = [1011234567890123, 2021234567890123];
   const modelIDs = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
   const defaultModels = ['gpt-6-astra', 'gpt-5.6-sol'];
   const subset = ['gpt-6-sol', 'gpt-5.6-luna'];
   const same = (actual, expected) => JSON.stringify(actual) === JSON.stringify(expected);
+  function assert403Policy(expected, pending = false) {
+    const toggle = document.getElementById('bps-403-toggle');
+    const label = '403 自动停用：' + (expected ? '已开启' : '已关闭') + (pending ? '（待保存）' : '');
+    if (!toggle || toggle.type !== 'button' || toggle.getAttribute('aria-pressed') !== String(expected) || toggle.textContent !== label)
+      throw new Error('403 policy button state is incorrect; expected ' + label);
+    return toggle;
+  }
+  function assertResponsiveLayout() {
+    const width = document.documentElement.clientWidth;
+    if (document.documentElement.scrollWidth > width + 1 || document.body.scrollWidth > width + 1)
+      throw new Error('Page overflows horizontally at ' + width + 'px');
+    for (const element of document.querySelectorAll('.account-name, #bps-403-toggle')) {
+      const bounds = element.getBoundingClientRect();
+      if (bounds.left < -1 || bounds.right > width + 1 || element.scrollWidth > element.clientWidth + 1)
+        throw new Error('Account ID or 403 policy control overflows at ' + width + 'px');
+    }
+  }
   async function until(check, label, milliseconds = 6000) {
     const end = performance.now() + milliseconds;
     while (performance.now() < end) {
@@ -67,6 +85,17 @@ const driver = String.raw`
       document.getElementById('form-hint').textContent === '' &&
       !document.getElementById('save-button').disabled, 'Configuration did not become ready');
     if (!blocked) {
+      if (!same(Array.from(document.querySelectorAll('.account-name')).map((element) => element.textContent), accountIDs.map(String)))
+        throw new Error('Account names do not show the complete account IDs');
+      for (const row of document.querySelectorAll('.account-row')) {
+        const accountID = row.querySelector('input').value;
+        if (row.querySelector('.account-name').title !== '账号 ID：' + accountID ||
+            row.querySelector('.account-check-button').getAttribute('aria-label') !== '检测账号 ID：' + accountID)
+          throw new Error('Account identity or individual check button labels point to the wrong account');
+      }
+      const initial403Policy = stage === 'select' || stage === 'clear';
+      if (assert403Policy(initial403Policy).disabled) throw new Error('403 policy control did not become ready');
+      assertResponsiveLayout();
       if (document.querySelector('[id^="image-relay"]') || document.querySelector('input:not(#account-list input):not(#model-list input), select, details'))
         throw new Error('Images still require additional configuration controls');
       if (!document.body.textContent.includes('支持直接发送图片和截图，无需额外配置'))
@@ -81,9 +110,10 @@ const driver = String.raw`
       if (/图片中转|公网 HTTPS|反向代理|监听地址|存储目录/.test(document.body.textContent))
         throw new Error('Obsolete image hosting instructions are still visible');
     }
-    const initial = stage === 'reopen-empty' || (stage === 'select' && blocked) ? [] : [101, 202];
+    const initial = stage === 'reopen-empty' || (stage === 'select' && blocked) ? [] : accountIDs;
     if (!same(selected(), initial)) throw new Error('Reopened selection was ' + JSON.stringify(selected()) + ', expected ' + JSON.stringify(initial));
-    send('opened', { selected: selected(), models: selectedModels() });
+    send('opened', { selected: selected(), models: selectedModels(), viewportWidth: document.documentElement.clientWidth,
+      autoDisableOn403: document.getElementById('bps-403-toggle')?.getAttribute('aria-pressed') });
     if (stage === 'reopen-empty') { send('done', { selected: selected(), models: selectedModels() }); return; }
     if (stage === 'select' && !blocked) {
       const selectAll = document.getElementById('select-all-button');
@@ -96,10 +126,14 @@ const driver = String.raw`
     } else if (stage !== 'all') {
       for (const box of document.querySelectorAll('#account-list input')) box.click();
     }
-    const expected = stage === 'select' || stage === 'all' ? [101, 202] : [];
+    const expected = stage === 'select' || stage === 'all' ? accountIDs : [];
     if (!same(selected(), expected)) throw new Error('Account selection controls did not change the selected accounts');
     const expectedModels = stage === 'select' ? subset : stage === 'all' ? modelIDs : [];
+    const expected403Policy = stage === 'all';
     if (!blocked) {
+      assert403Policy(!expected403Policy).click();
+      assert403Policy(expected403Policy, true);
+      assertResponsiveLayout();
       for (const box of document.querySelectorAll('#model-list input')) {
         if (box.checked !== expectedModels.includes(box.value)) box.click();
       }
@@ -112,6 +146,7 @@ const driver = String.raw`
     document.getElementById('config-form').addEventListener('submit', () => { submitCount++; }, true);
     button.click();
     if (!blocked && !document.getElementById('model-fields').disabled) throw new Error('Model fields were not locked during save');
+    if (!blocked && !document.getElementById('bps-403-toggle').disabled) throw new Error('403 policy control was not locked during save');
     send('clicked', { selected: selected(), clickCount, submitCount, buttonType: button.type });
     if (blocked) {
       await sleep(800);
@@ -123,6 +158,8 @@ const driver = String.raw`
       'Save button did not finish a confirmed save');
     if (!same(selected(), expected)) throw new Error('Selection changed after save');
     if (!same(selectedModels(), expectedModels)) throw new Error('Model selection changed after save');
+    if (assert403Policy(expected403Policy).disabled) throw new Error('403 policy control did not unlock after save');
+    assertResponsiveLayout();
     send('done', { selected: selected(), models: selectedModels(), hint: document.getElementById('form-hint').textContent });
   } catch (error) { send('failure', { error: error.message }); }
 })();`;
@@ -150,9 +187,10 @@ const host = `
   let saveCount = 0;
   const events = [];
   const accounts = [
-    { id: 101, name: 'Regression account A', schedulable: true, status: 'active' },
-    { id: 202, name: 'Regression account B', schedulable: true, status: 'active' },
+    { id: 1011234567890123, name: 'Regression account A', schedulable: true, status: 'active' },
+    { id: 2021234567890123, name: 'Regression account B', schedulable: true, status: 'active' },
   ];
+  const accountIDs = accounts.map((account) => account.id);
   async function finish(ok, details) {
     if (finished) return;
     finished = true;
@@ -165,6 +203,8 @@ const host = `
     stage = nextStage;
     token = crypto.randomUUID();
     frame = document.createElement('iframe');
+    frame.style.width = stage === 'select' || stage === 'clear' ? '900px' : '320px';
+    frame.style.height = '1600px';
     frame.setAttribute('sandbox', 'allow-scripts');
     frame.src = '/ui/index.html?stage=' + stage + '&blocked=' + (expectBlocked ? '1' : '0') + '#bridge_token=' + encodeURIComponent(token);
     document.body.appendChild(frame);
@@ -186,25 +226,30 @@ const host = `
       }
       if (data.type !== 'done') return;
       if (stage === 'select') {
-        if (saveCount !== 1 || !same(config.account_ids, [101, 202])) return void finish(false, { error: 'Selected accounts were not persisted by the host' });
+        if (saveCount !== 1 || !same(config.account_ids, accountIDs)) return void finish(false, { error: 'Selected accounts were not persisted by the host' });
+        if (config.bps_auto_disable_on_403 !== false) return void finish(false, { error: 'Disabled 403 policy was not persisted by the host' });
         if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, []))
           return void finish(false, { error: 'Legacy unrestricted accounts were not migrated to automatic selection' });
         if (!same(config.enabled_models, subset)) return void finish(false, { error: 'Model subset was not persisted by the host' });
         return reopen('all');
       }
       if (stage === 'all') {
-        if (saveCount !== 2 || !same(config.account_ids, [101, 202]) || !same(config.enabled_models, models))
+        if (saveCount !== 2 || !same(config.account_ids, accountIDs) || !same(config.enabled_models, models))
           return void finish(false, { error: 'All six models were not persisted or accounts changed' });
+        if (config.bps_auto_disable_on_403 !== true) return void finish(false, { error: 'Enabled 403 policy was not persisted by the host' });
         return reopen('clear');
       }
       if (stage === 'clear') {
         if (saveCount !== 3 || !same(config.account_ids, []) || !same(config.enabled_models, []))
           return void finish(false, { error: 'Empty account and model selections were not persisted by the host' });
-        if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, [101, 202]))
+        if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, accountIDs))
           return void finish(false, { error: 'Cleared accounts were not persisted as explicit exclusions' });
+        if (config.bps_auto_disable_on_403 !== false) return void finish(false, { error: '403 policy changed while clearing accounts' });
         return reopen('reopen-empty');
       }
       return void finish(true, { checkedSelectionSurvivedReopen: true, emptySelectionSurvivedReopen: true,
+        fullAccountIDsDisplayed: true, default403PolicyEnabled: true, disabled403PolicySurvivedReopen: true,
+        enabled403PolicySurvivedReopen: true, wideAndNarrowLayoutsWithoutOverflow: true,
         automaticImagesWithoutSettings: true,
         defaultModelsSelected: true, modelSubsetSurvivedReopen: true, allSixModelsSurvivedReopen: true,
         emptyModelSelectionSurvivedReopen: true, otherConfigurationPreserved: true });
@@ -305,7 +350,7 @@ try {
   const result = await resultPromise;
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) throw new Error(result.error || 'Browser regression failed');
-  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: account choices and model subset, all-six, and empty choices persist across iframe destruction and reopening.');
+  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: complete account IDs fit wide and narrow layouts; 403 policy, account choices, and model choices persist across iframe destruction and reopening.');
 } catch (error) {
   console.error(error.stack || error.message);
   process.exitCode = 1;

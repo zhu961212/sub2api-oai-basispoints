@@ -319,14 +319,14 @@ func degradationAnswer(body []byte, contentType string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid upstream response")
 	}
+	if err := degradationResponseError(object); err != nil {
+		return "", err
+	}
 	if nested, ok := object["response"].(map[string]any); ok {
 		object = nested
-	}
-	if responseError, exists := object["error"]; exists && responseError != nil {
-		return "", fmt.Errorf("upstream response contains an error")
-	}
-	if status, ok := object["status"].(string); ok && status != "" && status != "completed" {
-		return "", fmt.Errorf("upstream response did not complete")
+		if err := degradationResponseError(object); err != nil {
+			return "", err
+		}
 	}
 	if choices, ok := object["choices"].([]any); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]any); ok {
@@ -339,6 +339,23 @@ func degradationAnswer(body []byte, contentType string) (string, error) {
 		return answer, nil
 	}
 	return "", fmt.Errorf("upstream response contains no output text")
+}
+
+// Gate both the envelope and the response before classifying output text. Some
+// gateways keep partial output inside a failed envelope without copying the
+// error or terminal status into the nested response.
+func degradationResponseError(object map[string]any) error {
+	if object["error"] != nil {
+		return fmt.Errorf("upstream response contains an error")
+	}
+	switch protocol.StringValue(object["type"]) {
+	case "error", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		return fmt.Errorf("upstream response did not complete")
+	}
+	if status, ok := object["status"].(string); ok && status != "" && status != "completed" {
+		return fmt.Errorf("upstream response did not complete")
+	}
+	return nil
 }
 
 func responsesOutputText(object map[string]any) string {
