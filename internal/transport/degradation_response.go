@@ -34,15 +34,11 @@ func readDegradationResponse(ctx context.Context, body io.Reader, contentType st
 		if err != nil {
 			return nil
 		}
-		if err := degradationExplicitFailure(payload); err != nil {
-			return err
+		state := protocol.ClassifyResponseTerminal(event.event, payload)
+		if state.Failed() {
+			return fmt.Errorf("upstream response did not complete")
 		}
-		kind := protocol.StringValue(payload["type"])
-		if kind == "" {
-			kind = event.event
-		}
-		switch kind {
-		case "response.completed", "response.done":
+		if state == protocol.TerminalCompleted {
 			if err := degradationResponseError(payload); err != nil {
 				return err
 			}
@@ -52,8 +48,6 @@ func readDegradationResponse(ctx context.Context, body io.Reader, contentType st
 			}
 			terminal = protocol.JSONBytes(response)
 			return finished
-		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled", "error":
-			return fmt.Errorf("upstream response did not complete")
 		}
 		return nil
 	}

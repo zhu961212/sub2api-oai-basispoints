@@ -18,7 +18,7 @@ import (
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.5.28"
+	Version = "0.6.0"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -76,14 +76,12 @@ type Config struct {
 	BPSDeviceConvergence bool `json:"bps_device_convergence"`
 	// Acknowledging one block never clears a newer persisted BPS 403.
 	BPSReenabledAccounts map[string]string `json:"bps_reenabled_accounts,omitempty"`
-	// DegradationCheck is a one-shot request marker consumed by TestConfig.
-	// The UI sets it immediately before config.test and clears it after the
-	// result has been applied. It is deliberately persisted by the host for the
-	// duration of that two-step bridge operation because TestConfig receives the
-	// saved configuration, not arbitrary UI payload.
+	// Legacy diagnostic fields remain parseable so old saved configurations
+	// can be loaded and cleared by ordinary saving. Public TestConfig rejects
+	// them: UI Bridge v1 cannot bind a request to the caller's intended target.
 	DegradationCheck bool `json:"degradation_check,omitempty"`
-	// DegradationCheckAccountID narrows the one-shot check to one account.
-	// Zero keeps the bulk scan; the UI clears both command fields afterwards.
+	// DegradationCheckAccountID selects a target only for the private probe
+	// runner. It cannot authorize an account request through legacy TestConfig.
 	DegradationCheckAccountID int64  `json:"degradation_check_account_id,omitempty"`
 	MaxResponseBytes          int    `json:"max_response_bytes"`
 	AuthMode                  string `json:"auth_mode"`

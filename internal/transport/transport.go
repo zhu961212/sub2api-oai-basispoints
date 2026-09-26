@@ -515,26 +515,13 @@ func (t *Transport) TestConfig(ctx context.Context, r *pluginv1.TestConfigReques
 	if err != nil {
 		return &pluginv1.TestConfigResponse{Success: false, Message: safeError(err)}, nil
 	}
-	if c.DegradationCheck {
-		started := time.Now()
-		check, checkErr := t.runDegradationCheck(ctx, c)
-		statusJSON := mergeDegradationStatus(t.bpsAccountStatusJSON(healthStatusJSON(c, t.accountDirectory(ctx)), c), check)
-		if checkErr != nil {
-			return &pluginv1.TestConfigResponse{
-				Success:    false,
-				Message:    safeError(checkErr),
-				LatencyMs:  time.Since(started).Milliseconds(),
-				StatusJson: statusJSON,
-			}, nil
-		}
-		// A completed check is a successful operation even when one or more
-		// accounts answered incorrectly. The per-account verdicts are in
-		// status_json; returning success=false would make UI Bridge discard them.
+	if c.DegradationCheck || c.DegradationCheckAccountID != 0 {
+		// Bridge v1 reloads shared saved config for each Test and cannot bind
+		// the RPC to the caller's target. Reject old pages and stale persisted
+		// triggers before resolving credentials or sending a charged request.
 		return &pluginv1.TestConfigResponse{
-			Success:    true,
-			Message:    fmt.Sprintf("degradation check completed: %d degraded account(s)", len(check.DegradedAccountIDs)),
-			LatencyMs:  time.Since(started).Milliseconds(),
-			StatusJson: statusJSON,
+			Success: false,
+			Message: "account diagnostics unavailable: UI Bridge v1 cannot atomically bind the requested account; clear legacy degradation_check fields and use ordinary connectivity testing",
 		}, nil
 	}
 	started := time.Now()

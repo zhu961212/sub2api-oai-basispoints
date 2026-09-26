@@ -33,7 +33,7 @@ func (d *sseDecoder) feed(chunk []byte, emit func(event, data string) error) err
 		line = strings.TrimSuffix(line, "\r")
 		chunk = chunk[index+1:]
 		if line == "" {
-			if len(d.data) > 0 {
+			if len(d.data) > 0 || terminalKind(d.event).Failed() {
 				if err := emit(d.event, strings.Join(d.data, "\n")); err != nil {
 					return err
 				}

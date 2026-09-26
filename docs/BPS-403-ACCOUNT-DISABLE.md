@@ -30,6 +30,16 @@
 
 ## 持久化与异常
 
+### 能否查询禁用时长
+
+插件本地停用与上游账号访问限制是两件事。本地停用记录以 TTL=0 保存，没有自动到期或倒计时，必须明确重新勾选并保存才恢复。现有记录没有 blocked_at / expires_at 字段，因此无法从旧记录精确计算已经停用多久；导出账号中的 OAuth 到期时间、订阅到期时间和 Codex 额度重置时间均不能当作 BPS 解禁时间。
+
+2026-09-27 北京时间 03:41，对用户提供的单账号导出执行官方只读 GET /basispoints/api/responses/access?include_models=true 查询，结果为 HTTP 200、allowed=true、denial_reason=null。响应没有禁用起止时间、剩余时长或重试倒计时字段。这只说明查询时访问检查允许，不能据此证明模型推理请求均已恢复，也无法反推先前 403 的原因或禁用时长。该只读查询没有发送推理请求，也没有自动恢复插件中的停用记录。
+
+用户随后明确要求真实账号测试。北京时间 03:46，经插件现有请求构造链向 /basispoints/api/responses 发送 gpt-6-astra、low、Say OK 最小请求，两次均返回 HTTP 403；第二次仅用于核对时间响应头。错误正文为 “403: This request was blocked by our usage policy.”，type=server_error，code=null。响应没有 Retry-After、X-RateLimit-Reset、X-RateLimit-Reset-Requests 或 X-RateLimit-Reset-Tokens，正文也没有恢复时间。因此当前可确认该账号这类推理请求被上游使用政策拒绝，不能查询出明确禁用时长，更不能推定固定 24 小时或永久封禁。没有继续反复尝试，也没有修改账号停用状态。
+
+同一次排查中，Python 默认 HTTP 客户端先被边缘层拒绝（HTTP 403、Cloudflare 1010）；使用系统 HTTP 客户端查询同一官方接口获得上述 200 结果。边缘层 403 本身不能证明账号有固定封禁期限。查询及测试凭据通过进程内存、临时进程环境或标准输入传递，未写入源码或日志，文档及脱敏日志不包含令牌或账号身份。相关公开政策与本次诊断边界见 [使用政策核查](BPS-POLICY-DIAGNOSTICS.md)。
+
 - 使用宿主提供的、按插件隔离的 KV 保存独立账号记录，TTL=0；记录仅含账号 ID、随机 block_id、http_403 原因和状态，不含凭据或错误正文。
 - 重启时加载停用记录，超过 1000 条时按前缀分批读取，避免宿主 KVList 上限截断。成功加载后不定时全量查询，正常请求只查内存。
 - 存储加载期间或加载失败时，不贸然放行尚未确认状态的 BPS 请求；Health 仍符合宿主初始化契约。

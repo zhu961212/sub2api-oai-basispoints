@@ -82,6 +82,9 @@ func truncatedRelayCanRegenerate(native, source map[string]any) bool {
 // Regenerate only the final unexecuted relay. Explicit prior tool history must
 // be complete; opaque server-side history and unfinished calls stay ineligible.
 func ToolRepairEligible(source, response map[string]any) bool {
+	if ClassifyResponseTerminal("", response).Failed() {
+		return false
+	}
 	if source == nil || response == nil || source["previous_response_id"] != nil || source["previousResponseId"] != nil || source["conversation"] != nil || len(clientToolSpecs(source)) == 0 {
 		return false
 	}
@@ -144,6 +147,9 @@ func PrepareToolRepairBody(prepared, source, response map[string]any) (map[strin
 // visible response identity and progress; append repair output in the former
 // withheld tool slot. Normal transformation validates and caches everything.
 func MergeToolRepairResponse(source, original, repaired map[string]any) (map[string]any, error) {
+	if terminal := ClassifyResponseTerminal("", repaired); terminal.Failed() {
+		return nil, ResponseTerminalError(terminal, repaired)
+	}
 	if !ToolRepairEligible(source, original) || stringValue(repaired["status"]) != "completed" {
 		return nil, fail(502, "invalid_tool_call", unknownClientToolMessage)
 	}

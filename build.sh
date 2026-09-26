@@ -25,7 +25,7 @@ fi
 echo "==> go run ./tools/packager $*"
 go run ./tools/packager "$@"
 
-# 独立校验：不复用打包器的自检逻辑，重新算哈希并（在有公钥时）验证签名。
+# 独立校验：不复用打包器的自检逻辑；只有明确签名构建才自动传入配套公钥。
 # Follow the same output/source/key flags as the packager.
 SOURCE=manifest.source.json
 DIST=dist
@@ -72,8 +72,6 @@ if [ -n "$PYTHON" ]; then
       exit 1
     fi
     verify_args+=(--require-signature --public-key "$VERIFY_KEY" --expected-key-id "$KEY_ID")
-  elif [ -f build/keys/publisher.public ]; then
-    verify_args+=(--public-key build/keys/publisher.public)
   fi
   echo "==> python tools/verify_package.py $PACKAGE"
   "$PYTHON" "${verify_args[@]}"

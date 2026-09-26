@@ -109,21 +109,16 @@ func TestDegradationCheckReturnsResultsAndOnlySelectsWrongAnswers(t *testing.T) 
 	transport.mu.Lock()
 	transport.host = &degradationTestHost{fakeHost: host}
 	transport.mu.Unlock()
-	response, err := transport.TestConfig(context.Background(), &pluginv1.TestConfigRequest{
-		ConfigJson: []byte(`{"responses_url":"` + upstream.URL + `","degradation_check":true}`),
-	})
+	cfg := protocol.DefaultConfig()
+	cfg.ResponsesURL = upstream.URL
+	cfg.DegradationCheck = true
+	check, err := transport.runDegradationCheck(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !response.GetSuccess() {
-		t.Fatalf("degradation check failed: %s", response.GetMessage())
-	}
-	var status struct {
-		DegradationCheck degradationCheckResult `json:"degradation_check"`
-	}
-	if err := json.Unmarshal([]byte(response.GetStatusJson()), &status); err != nil {
-		t.Fatal(err)
-	}
+	status := struct {
+		DegradationCheck degradationCheckResult
+	}{DegradationCheck: check}
 	if !status.DegradationCheck.Completed {
 		t.Fatal("check was not marked completed")
 	}

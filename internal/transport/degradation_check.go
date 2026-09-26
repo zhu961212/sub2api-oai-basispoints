@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -361,22 +360,8 @@ func degradationResponseError(object map[string]any) error {
 // Progress events may have an in_progress status. Explicit failure evidence is
 // rejected immediately without treating ordinary progress as terminal.
 func degradationExplicitFailure(object map[string]any) error {
-	if object["error"] != nil {
-		return fmt.Errorf("upstream response contains an error")
-	}
-	if degradationFailureKind(protocol.StringValue(object["type"])) || degradationFailureKind(protocol.StringValue(object["status"])) {
-		return fmt.Errorf("upstream response did not complete")
-	}
-	for _, key := range []string{"success", "ok"} {
-		if success, ok := object[key].(bool); ok && !success {
-			return fmt.Errorf("upstream response reports a failed operation")
-		}
-	}
-	for _, key := range []string{"status", "status_code", "http_status"} {
-		status, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(object[key])))
-		if err == nil && status >= 400 && status <= 599 {
-			return fmt.Errorf("upstream response reports HTTP %d", status)
-		}
+	if terminal := protocol.ClassifyResponseTerminal("", object); terminal.Failed() {
+		return protocol.ResponseTerminalError(terminal, object)
 	}
 	return nil
 }

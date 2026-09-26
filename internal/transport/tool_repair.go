@@ -77,8 +77,8 @@ func readToolRepairResponse(resp *http.Response, max int) (map[string]any, error
 		if err != nil {
 			return nil, relayProtocolError("Basis Points tool correction returned invalid JSON")
 		}
-		if failure := isolatedBasisPointsFailure(response); failure != nil {
-			return nil, failure
+		if terminal := protocol.ClassifyResponseTerminal("", response); terminal.Failed() {
+			return nil, protocol.ResponseTerminalError(terminal, response)
 		}
 		return response, nil
 	}
@@ -89,23 +89,23 @@ func readToolRepairResponse(resp *http.Response, max int) (map[string]any, error
 	var response map[string]any
 	consume := func(event sseRelayEvent) error {
 		if strings.TrimSpace(event.data) == "" {
+			if state := protocol.ClassifyResponseTerminal(event.event, nil); state.Failed() {
+				return protocol.ResponseTerminalError(state, nil)
+			}
 			return nil
 		}
 		payload, err := protocol.RawObject([]byte(event.data))
 		if err != nil {
 			return relayProtocolError("Basis Points tool correction returned invalid SSE")
 		}
-		if kind := protocol.StringValue(payload["type"]); kind != "" {
-			event.event = kind
-		}
 		if isolateBasisPoints {
 			isolateBasisPointsFailureObject(payload, event.event, observers...)
 		}
-		switch event.event {
-		case "response.completed", "response.done":
-			if failure := isolatedBasisPointsFailure(payload); failure != nil {
-				return failure
-			}
+		state := protocol.ClassifyResponseTerminal(event.event, payload)
+		if state.Failed() {
+			return protocol.ResponseTerminalError(state, payload)
+		}
+		if state == protocol.TerminalCompleted {
 			response = relayObject(payload["response"])
 			if response == nil {
 				return relayProtocolError("Basis Points tool correction omitted its terminal response")
@@ -114,11 +114,6 @@ func readToolRepairResponse(resp *http.Response, max int) (map[string]any, error
 				response["status"] = "completed"
 			}
 			return terminal
-		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled", "error":
-			if failure := isolatedBasisPointsFailure(payload); failure != nil {
-				return failure
-			}
-			return relayProtocolError("Basis Points tool correction did not complete")
 		}
 		return nil
 	}
@@ -147,12 +142,11 @@ func readToolRepairResponse(resp *http.Response, max int) (map[string]any, error
 }
 
 func isolatedBasisPointsFailure(payload map[string]any) error {
-	failure := relayObject(payload["error"])
-	if response := relayObject(payload["response"]); response != nil {
-		failure = relayObject(response["error"])
-	}
-	if protocol.StringValue(failure["code"]) == "bps_service_rejected" {
-		return basisPointsServiceError(protocol.StringValue(failure["message"]))
+	response := relayObject(payload["response"])
+	for _, failure := range []map[string]any{relayObject(payload["error"]), relayObject(response["error"])} {
+		if protocol.StringValue(failure["code"]) == "bps_service_rejected" {
+			return basisPointsServiceError(protocol.StringValue(failure["message"]))
+		}
 	}
 	return nil
 }

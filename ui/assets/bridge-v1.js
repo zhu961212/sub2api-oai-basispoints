@@ -134,6 +134,9 @@
       // hasToken 为 false 时说明 URL fragment 里没有 bridge_token，
       // 宿主会静默丢弃消息，此时只能提示用户从插件管理页重新打开配置。
       hasToken: token !== "",
+      // UI Bridge v1 tests shared saved config, not a request-local target.
+      // Never implement account diagnostics as saveConfig followed by testConfig.
+      accountCheckUnavailableReason: "当前宿主 UI Bridge v1 无法原子绑定检测账号；为避免多页面检测错账号，单账号和批量检测已暂停。需宿主提供按请求绑定目标的检测接口。账号状态查询、路由保存和宿主连通性测试仍可使用。",
       ready: function () {
         post("sub2api.plugin.ready");
       },

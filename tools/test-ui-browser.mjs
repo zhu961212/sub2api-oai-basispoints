@@ -139,22 +139,31 @@ const driver = String.raw`
       deviceConvergence: document.getElementById('bps-device-toggle')?.getAttribute('aria-pressed') });
     if (stage === 'reopen-empty') {
       const statuses = ['error', 'error', 'degraded', 'ok', 'skipped'];
+      const bulk = document.getElementById('degradation-check-button');
+      if (!bulk.disabled || !bulk.title.includes('原子绑定检测账号'))
+        throw new Error('Bulk account diagnostics must be disabled with the host limitation explained');
+      bulk.click();
+      bulk.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       for (let index = 0; index < accountIDs.length; index++) {
         const accountID = accountIDs[index];
-        document.querySelector('.account-check-button[value="' + accountID + '"]').click();
-        if (!document.getElementById('bps-403-toggle').disabled || !document.getElementById('bps-device-toggle').disabled)
-          throw new Error('Diagnostic did not lock policy controls');
-        await until(() => document.getElementById('form-hint').textContent.includes('当前账号：') &&
-          !document.getElementById('save-button').disabled, 'Single-account diagnostic did not complete');
+        const button = document.querySelector('.account-check-button[value="' + accountID + '"]');
+        if (!button.disabled || !button.title.includes('原子绑定检测账号'))
+          throw new Error('Account diagnostics must be disabled with the host limitation explained');
+        button.click();
+        button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        await until(() => document.getElementById('form-hint').textContent.includes('检测已暂停') &&
+          !document.getElementById('save-button').disabled, 'Forced diagnostic event did not fail closed');
+        if (document.getElementById('bps-403-toggle').disabled || document.getElementById('bps-device-toggle').disabled)
+          throw new Error('Paused diagnostics unexpectedly locked policy controls');
         for (let rowIndex = 0; rowIndex < accountIDs.length; rowIndex++) {
           const row = document.querySelector('.account-check-button[value="' + accountIDs[rowIndex] + '"]').closest('.account-row');
           const verdict = row.querySelector('.account-check-result');
-          if (rowIndex <= index ? !verdict.classList.contains('result-' + statuses[rowIndex]) : verdict.textContent !== '未检测')
-            throw new Error('Single-account result leaked across equal account names');
+          if (!verdict.classList.contains('result-' + statuses[rowIndex]))
+            throw new Error('Passive account result leaked across equal account names');
         }
         const label = displayNames[index] === String(accountID) ? '#' + accountID : displayNames[index] + '（#' + accountID + '）';
-        if (!document.querySelector('#degradation-result > span:nth-child(2)').textContent.startsWith(label + ' · '))
-          throw new Error('Diagnostic result lost the complete account name or ID');
+        if (!document.querySelector('#degradation-result > span:nth-child(' + (index + 2) + ')').textContent.startsWith(label + ' · '))
+          throw new Error('Passive diagnostic result lost the complete account name or ID');
         if (document.querySelector('#degradation-result img, #degradation-result svg, #degradation-result script') || window.__accountNameInjected)
           throw new Error('Diagnostic names were parsed as HTML');
         if (!same(selected(), []) || !same(selectedModels(), [])) throw new Error('Individual diagnostic changed account/model routing');
@@ -162,7 +171,7 @@ const driver = String.raw`
         assertDeviceConvergence(false);
         assertResponsiveLayout();
       }
-      send('done', { selected: selected(), models: selectedModels(), singleAccountDiagnostics: accountIDs.length });
+      send('done', { selected: selected(), models: selectedModels(), pausedAccountDiagnostics: accountIDs.length, passiveAccountResults: accountIDs.length });
       return;
     }
     if (stage === 'select' && !blocked) {
@@ -267,6 +276,16 @@ const host = `
   function reopen(nextStage) {
     if (frame) frame.remove();
     stage = nextStage;
+    if (stage === 'reopen-empty') {
+      const statuses = ['error', 'error', 'degraded', 'ok', 'skipped'];
+      lastCheck = { completed: true, degraded_account_ids: [accountIDs[2]], results: accountIDs.map((id, index) => {
+        const result = { account_id: id, name: 'stale-result-name', status: statuses[index] };
+        if (index < 2) result.error = index === 0 ? 'HTTP 403' : 'HTTP 429';
+        else if (index === 4) result.error = 'temporarily unavailable';
+        else result.answer = index === 2 ? '苹果16' : '苹果17';
+        return result;
+      }) };
+    }
     token = crypto.randomUUID();
     frame = document.createElement('iframe');
     frame.style.width = stage === 'select' || stage === 'clear' ? '900px' : '320px';
@@ -316,11 +335,11 @@ const host = `
         if (config.bps_device_convergence !== false) return void finish(false, { error: 'Device convergence changed while clearing accounts' });
         return reopen('reopen-empty');
       }
-      if (testCount !== accountIDs.length || data.singleAccountDiagnostics !== accountIDs.length)
-        return void finish(false, { error: 'Individual diagnostics did not check every fixture account' });
+      if (testCount !== 0 || saveCount !== 3 || data.pausedAccountDiagnostics !== accountIDs.length || data.passiveAccountResults !== accountIDs.length)
+        return void finish(false, { error: 'Paused diagnostics dispatched a request, saved config, or lost passive results' });
       return void finish(true, { checkedSelectionSurvivedReopen: true, emptySelectionSurvivedReopen: true,
         fullAccountNamesDisplayed: true, duplicateNamesDisambiguatedByIDs: true, namesRenderedAsText: true,
-        singleAccountDiagnosticsIsolated: true, default403PolicyEnabled: true, disabled403PolicySurvivedReopen: true,
+        accountDiagnosticsPausedWithoutSideEffects: true, passiveAccountResultsIsolated: true, default403PolicyEnabled: true, disabled403PolicySurvivedReopen: true,
         enabled403PolicySurvivedReopen: true, wideAndNarrowLayoutsWithoutOverflow: true,
         defaultDeviceConvergenceDisabled: true, enabledDeviceConvergenceSurvivedReopen: true,
         disabledDeviceConvergenceSurvivedReopen: true, deviceConvergenceDirtyStateReset: true,
@@ -340,23 +359,13 @@ const host = `
       status_json: JSON.stringify({ plugin_version: 'browser-test', accounts, account_ids: config.account_ids,
         available_models: models, enabled_models: config.enabled_models, degradation_check: lastCheck }) } });
     if (data.type === 'config.test') {
-      const index = accountIDs.indexOf(config.degradation_check_account_id);
-      if (stage !== 'reopen-empty' || config.degradation_check !== true || index < 0)
-        return void finish(false, { error: 'Diagnostic did not target an explicit account ID' });
       testCount++;
-      const statuses = ['error', 'error', 'degraded', 'ok', 'skipped'];
-      const result = { account_id: accountIDs[index], name: 'stale-result-name', status: statuses[index] };
-      if (index === 0 || index === 1) result.error = index === 0 ? 'HTTP 403' : 'HTTP 429';
-      else if (index === 4) result.error = 'temporarily unavailable';
-      else result.answer = index === 2 ? '苹果16' : '苹果17';
-      lastCheck = { completed: true, results: [result], degraded_account_ids: index === 2 ? [accountIDs[index]] : [] };
-      return respond({ ok: true, result: { status_json: JSON.stringify({ degradation_check: lastCheck }) } });
+      return void finish(false, { error: 'Paused account diagnostics must never dispatch config.test' });
     }
     if (data.type === 'config.save') {
       saveCount++;
-      if (stage === 'reopen-empty' && (data.config.bps_auto_disable_on_403 !== false || data.config.bps_device_convergence !== false ||
-          !same(data.config.account_ids, []) || !same(data.config.enabled_models, []) || !same(data.config.excluded_account_ids, accountIDs)))
-        return void finish(false, { error: 'Diagnostic save changed policies or account/model routing' });
+      if (stage === 'reopen-empty')
+        return void finish(false, { error: 'Paused account diagnostics must never save configuration' });
       if (data.config.timeout_seconds !== 123 || data.config.auth_mode !== 'chatgpt' || data.config.rewrite_tools !== false)
         return void finish(false, { error: 'Saving account selection overwrote unrelated configuration' });
       config = clone(data.config);
@@ -441,7 +450,7 @@ try {
   const result = await resultPromise;
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) throw new Error(result.error || 'Browser regression failed');
-  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: complete safe account names fit wide/narrow layouts and diagnostics stay tied to IDs; 403/device policies and account/model choices persist after reopening.');
+  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: complete safe account names fit wide/narrow layouts; paused diagnostics send no requests and passive results stay tied to IDs; 403/device policies and account/model choices persist after reopening.');
 } catch (error) {
   console.error(error.stack || error.message);
   process.exitCode = 1;

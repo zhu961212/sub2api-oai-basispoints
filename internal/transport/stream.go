@@ -379,19 +379,35 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 		}
 		payload, err := protocol.RawObject([]byte(event.data))
 		if err != nil {
-			if strings.TrimSpace(event.data) == "" {
+			if protocol.ClassifyResponseTerminal(event.event, nil).Failed() {
+				payload = map[string]any{}
+			} else if strings.TrimSpace(event.data) == "" {
 				return sendRaw(event.raw)
+			} else {
+				return relayProtocolError("Basis Points returned an invalid SSE event")
 			}
-			return relayProtocolError("Basis Points returned an invalid SSE event")
 		}
 		event.payload = payload
+		// Preserve the wire event until isolation and terminal classification have
+		// inspected it. data.type must not mask a real event:error.
+		if isolateBasisPoints {
+			isolateBasisPointsFailureObject(payload, event.event, observers...)
+		}
+		state := protocol.ClassifyResponseTerminal(event.event, payload)
+		if state.Failed() {
+			pending = nil
+			terminal = true
+			if state == protocol.TerminalInvalid {
+				return protocol.ResponseTerminalError(state, payload)
+			}
+			event.event = normalizeRelayFailure("response."+string(state), payload)
+			filterRelayResponse(relayObject(payload["response"]), structured)
+			return sendJSON(event.event, payload)
+		}
 		if kind := protocol.StringValue(payload["type"]); kind != "" {
 			event.event = kind
 		} else if event.event != "" {
 			payload["type"] = event.event
-		}
-		if isolateBasisPoints {
-			isolateBasisPointsFailureObject(payload, event.event, observers...)
 		}
 		if relayToolEvent(event) && !terminal {
 			pending = append(pending, event)
@@ -407,17 +423,6 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 			response := relayObject(payload["response"])
 			if response == nil {
 				return invalid
-			}
-			status := protocol.StringValue(response["status"])
-			if status != "" && status != "completed" {
-				if status != "failed" && status != "incomplete" && status != "cancelled" && status != "canceled" {
-					return invalid
-				}
-				pending = nil
-				terminal = true
-				event.event = normalizeRelayFailure("response."+status, payload)
-				filterRelayResponse(response, structured)
-				return sendJSON(event.event, payload)
 			}
 			// response.done is an upstream alias, not a Responses terminal.
 			event.event = "response.completed"
@@ -506,11 +511,6 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 			protocol.RememberResponseContext(source, translated)
 			terminal = true
 			return sendJSON(event.event, payload)
-		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled", "error":
-			// Partial relay calls cannot execute after an explicitly failed turn.
-			pending = nil
-			terminal = true
-			event.event = normalizeRelayFailure(event.event, payload)
 		}
 		if response := relayObject(payload["response"]); response != nil {
 			filterRelayResponse(response, structured)

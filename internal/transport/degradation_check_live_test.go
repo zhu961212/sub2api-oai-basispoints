@@ -2,16 +2,18 @@ package transport
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
 	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
+	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
 
-// Opt-in real TestConfig coverage. The fixed prompt may consume account quota.
+// Opt-in private probe coverage. This is not a UI Bridge integration test.
+// The public legacy TestConfig entry point rejects diagnostic commands.
+// The fixed prompt may consume account quota.
 // Credentials come only from liveCredentials and are never included in logs.
-func TestLiveDegradationCheck(t *testing.T) {
+func TestLiveDegradationRunner(t *testing.T) {
 	accessToken, accountID, proxyURL := liveCredentials(t)
 	transport := New()
 	defer transport.Shutdown()
@@ -29,25 +31,14 @@ func TestLiveDegradationCheck(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	started := time.Now()
-	configJSON, err := json.Marshal(map[string]bool{"degradation_check": true})
-	if err != nil {
-		t.Fatal(err)
+	cfg := protocol.DefaultConfig()
+	cfg.DegradationCheck = true
+	cfg.DegradationCheckAccountID = 1
+	check, err := transport.runDegradationCheck(ctx, cfg)
+	if err != nil || !check.Completed || len(check.Results) != 1 {
+		t.Fatalf("degradation runner completed=%t result_count=%d error=%v", check.Completed, len(check.Results), err)
 	}
-	response, err := transport.TestConfig(ctx, &pluginv1.TestConfigRequest{
-		ConfigJson: configJSON,
-	})
-	if err != nil || response == nil {
-		t.Fatal("degradation TestConfig did not return a response")
-	}
-	var status struct {
-		Check degradationCheckResult `json:"degradation_check"`
-	}
-	if err := json.Unmarshal([]byte(response.GetStatusJson()), &status); err != nil {
-		t.Fatal("degradation result is not valid JSON")
-	}
-	if !response.GetSuccess() || !status.Check.Completed || len(status.Check.Results) != 1 {
-		t.Fatalf("degradation check success=%t completed=%t result_count=%d", response.GetSuccess(), status.Check.Completed, len(status.Check.Results))
-	}
+	status := struct{ Check degradationCheckResult }{Check: check}
 	result := status.Check.Results[0]
 	t.Logf("degradation status=%s answer=%q elapsed=%s", result.Status, previewText(result.Answer, 160), time.Since(started).Round(time.Millisecond))
 	if result.Status != "ok" && result.Status != "degraded" {

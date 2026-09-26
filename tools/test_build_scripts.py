@@ -12,6 +12,10 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 POWERSHELL = shutil.which("pwsh")
 BASH = shutil.which("bash")
+if not BASH and os.name == "nt":
+    git_bash = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"
+    if git_bash.is_file():
+        BASH = str(git_bash)
 
 
 class BuildScriptsTest(unittest.TestCase):
@@ -101,7 +105,7 @@ $buildArguments = ConvertFrom-Json -AsHashtable $env:BUILD_TEST_ARGUMENTS
                                          "KeyId": "publisher-v1"}, artifact, "Independent package verification failed")
         self.assertIn("--require-signature", arguments)
 
-    @unittest.skipUnless(BASH and os.name != "nt", "Native Bash is unavailable")
+    @unittest.skipUnless(BASH, "Bash is unavailable")
     def test_bash_custom_source_output_and_signature_flags(self):
         shutil.copyfile(ROOT / "build.sh", self.root / "build.sh")
         (self.root / "custom source.json").write_text(json.dumps(self.manifest), encoding="utf-8")

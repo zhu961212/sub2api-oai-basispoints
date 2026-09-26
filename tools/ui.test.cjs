@@ -479,37 +479,6 @@ test("empty or non-string account names fall back to the full account ID", async
   }
 });
 
-test("duplicate names keep single-account 403 and 429 verdicts attached to numeric IDs", async () => {
-  const sharedName = "同名账号😀-完整名称-不应截断";
-  const fixtures = [
-    { id: 1234567890123456, error: "HTTP 403" },
-    { id: 2234567890123456, error: "HTTP 429" },
-  ];
-  const page = createPage({
-    accounts: fixtures.map((fixture) => ({ id: fixture.id, name: sharedName, schedulable: true })),
-    test: (_number, store) => {
-      const current = fixtures.find((fixture) => fixture.id === store.config.degradation_check_account_id);
-      return Promise.resolve({ status_json: JSON.stringify({ degradation_check: { completed: true, degraded_account_ids: [],
-        results: [{ account_id: current.id, name: "wrong-name-from-stale-result", status: "error", error: current.error }],
-      } }) });
-    },
-  });
-  await flush();
-  for (const [index, fixture] of fixtures.entries()) {
-    page.checkAccount(fixture.id);
-    await flush();
-    assert.equal(page.calls.save[index * 2].degradation_check_account_id, fixture.id);
-    assert.match(page.accountRow(fixture.id).result.textContent, /检测失败/);
-    assert.equal(page.accountRow(fixture.id).result.title, fixture.error);
-    if (index === 0) assert.equal(page.accountRow(fixtures[1].id).result.textContent, "未检测");
-    const line = page.ids["degradation-result"].children[1];
-    assert.ok(line.textContent.startsWith(sharedName + "（#" + fixture.id + "） · "));
-    assert.ok(line.textContent.endsWith(fixture.error));
-    assert.doesNotMatch(line.textContent, /wrong-name/);
-    assert.deepEqual(page.selected(), fixtures.map((entry) => entry.id));
-  }
-  assert.equal(page.accountRow(fixtures[0].id).result.title, "HTTP 403");
-});
 
 test("diagnostic names use safe text and directory renames refresh cached rows and reports", async () => {
   const id = 1234567890123456;
@@ -738,344 +707,16 @@ test("failed device convergence saves preserve the user's pending setting and un
   }
 });
 
-test("all diagnostic saves and failure cleanup preserve the selected device convergence policy", async (t) => {
-  for (const targeted of [false, true]) {
-    for (const enabled of [false, true]) {
-      for (const failed of [false, true]) {
-        await t.test("targeted=" + targeted + "/enabled=" + enabled + "/failed=" + failed, async () => {
-          const page = createPage({
-            store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2], bps_device_convergence: !enabled } },
-            test: () => failed ? Promise.reject(new Error("diagnostic unavailable")) : Promise.resolve({ status_json: JSON.stringify({
-              degradation_check: { completed: true, results: [{ account_id: 2, status: "ok", answer: "苹果17" }], degraded_account_ids: [] },
-            }) }),
-          });
-          await flush();
-          page.toggleDevice();
-          if (targeted) page.checkAccount(2);
-          else page.degradationCheck();
-          assert.equal(page.ids["bps-device-toggle"].disabled, true);
-          page.ids["bps-device-toggle"].emit("click");
-          await flush();
-          assert.equal(page.calls.test, 1);
-          assert.equal(page.calls.save.length, 2);
-          for (const saved of page.calls.save) assert.equal(saved.bps_device_convergence, enabled);
-          assert.equal(page.store.config.bps_device_convergence, enabled);
-          assert.equal(page.store.config.degradation_check, false);
-          assert.ok(!page.store.config.degradation_check_account_id);
-          assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(enabled));
-          assert.equal(page.ids["bps-device-toggle"].disabled, false);
-          assert.deepEqual(page.selected(), [1, 3]);
-          if (failed) assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
-          else assert.doesNotMatch(page.ids["bps-device-toggle"].textContent, /待保存/);
-        });
-      }
-    }
-  }
-});
 
-test("diagnostics reject a lost enabled device setting at trigger, cleanup, or read-back", async (t) => {
-  for (const phase of ["trigger", "cleanup", "reload"]) {
-    await t.test(phase, async () => {
-      const page = createPage({
-        store: { config: { account_ids: [], bps_device_convergence: true } },
-        save(config, store) {
-          store.config = clone(config);
-          const reply = clone(config);
-          if ((phase === "trigger" && config.degradation_check) || (phase === "cleanup" && !config.degradation_check)) delete reply.bps_device_convergence;
-          return Promise.resolve(reply);
-        },
-        load(number, store) {
-          const reply = clone(store.config);
-          if (number > 1 && phase === "reload") delete reply.bps_device_convergence;
-          return Promise.resolve(reply);
-        },
-        test: () => Promise.resolve({ status_json: JSON.stringify({ degradation_check: { completed: true, results: [{ account_id: 2, status: "ok", answer: "苹果17" }], degraded_account_ids: [] } }) }),
-      });
-      await flush();
-      page.checkAccount(2);
-      await flush();
-      assert.equal(page.calls.test, phase === "trigger" ? 0 : 1);
-      assert.match(page.ids["form-hint"].textContent, /设备收敛开关与提交内容不一致/);
-      assert.equal(page.store.config.degradation_check, false);
-      for (const saved of page.calls.save) assert.equal(saved.bps_device_convergence, true);
-      assert.equal(page.ids["bps-device-toggle"].disabled, false);
-    });
-  }
-});
 
-test("single-account checks keep every result tied to its ID across repeated checks", async () => {
-  const fixtures = [
-    { account_id: 1, status: "ok", answer: "苹果17", label: /符合检测规则/ },
-    { account_id: 2, status: "degraded", answer: "苹果16", label: /疑似降智/ },
-    { account_id: 3, status: "error", error: "HTTP 429", label: /检测失败/ },
-  ];
-  const probed = [];
-  const page = createPage({
-    store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2], bps_auto_disable_on_403: false } },
-    accounts: fixtures.map((fixture) => ({ id: fixture.account_id, name: "identical-name", schedulable: true })),
-    test(_number, store) {
-      const target = store.config.degradation_check_account_id;
-      probed.push(target);
-      const { label, ...result } = fixtures.find((fixture) => fixture.account_id === target);
-      return Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
-        completed: true, results: [result], degraded_account_ids: result.status === "degraded" ? [target] : [],
-      } }) });
-    },
-  });
-  await flush();
-  const checked = new Set();
-  for (const target of [3, 1, 2, 1]) {
-    page.checkAccount(target);
-    assert.equal(page.ids["bps-403-toggle"].disabled, true);
-    page.toggle403();
-    await flush();
-    checked.add(target);
-    for (const fixture of fixtures) {
-      assert.match(page.accountRow(fixture.account_id).result.textContent, checked.has(fixture.account_id) ? fixture.label : /未检测/);
-    }
-    assert.deepEqual(page.selected(), [1, 3]);
-    assert.equal(page.store.config.bps_auto_disable_on_403, false);
-    assert.equal(page.store.config.degradation_check, false);
-    assert.ok(!page.store.config.degradation_check_account_id);
-  }
-  assert.deepEqual(probed, [3, 1, 2, 1]);
-});
 
-test("diagnostics do not start when the host loses the 403 switch setting", async () => {
-  const page = createPage({
-    store: { config: { account_ids: [], bps_auto_disable_on_403: false } },
-    save(config, store) {
-      store.config = clone(config);
-      const reply = clone(config);
-      if (config.degradation_check) delete reply.bps_auto_disable_on_403;
-      return Promise.resolve(reply);
-    },
-  });
-  await flush();
-  page.checkAccount(2);
-  await flush();
-  assert.equal(page.calls.test, 0);
-  assert.equal(page.store.config.degradation_check, false);
-  assert.equal(page.store.config.bps_auto_disable_on_403, false);
-  assert.match(page.ids["form-hint"].textContent, /403 自动停用开关与提交内容不一致/);
-});
 
-test("single-account diagnostics use the real ID and preserve selection models and exclusions", async () => {
-  const config = {
-    account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2, 88],
-    enabled_models: ["gpt-6-astra"], timeout_seconds: 123,
-    bps_auto_disable_on_403: false,
-    bps_device_convergence: true,
-  };
-  const page = createPage({
-    store: { config: clone(config) },
-    accounts: [
-      { id: 1, name: "shared-first@example.com", schedulable: true },
-      { id: 2, name: "shared-second@example.com", schedulable: true },
-      { id: 3, name: "Third", schedulable: true },
-    ],
-    test: (_number, store) => {
-      assert.equal(store.config.degradation_check, true);
-      assert.equal(store.config.degradation_check_account_id, 2);
-      return Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
-        completed: true, degraded_account_ids: [2],
-        results: [{ account_id: 2, status: "degraded", answer: "苹果16" }],
-      } }) });
-    },
-  });
-  await flush();
-  page.checkAccount(2);
-  await flush();
-  assert.equal(page.calls.test, 1);
-  assert.equal(page.calls.save.length, 2);
-  assert.equal(page.calls.save[0].degradation_check_account_id, 2);
-  assert.equal(page.calls.save[0].degradation_check, true);
-  assert.equal(page.store.config.degradation_check, false);
-  assert.ok(!page.store.config.degradation_check_account_id);
-  for (const saved of page.calls.save) {
-    for (const key of Object.keys(config)) assert.deepEqual(saved[key], config[key], key + " must survive diagnostics");
-  }
-  assert.deepEqual(page.selected(), [1, 3]);
-  assert.deepEqual(page.selectedModels(), ["gpt-6-astra"]);
-  assert.match(page.accountRow(2).result.textContent, /疑似降智/);
-  assert.doesNotMatch(page.ids["form-hint"].textContent, /已自动选择/);
-});
 
-test("single-account diagnostics render each outcome without treating failures as degradation", async (t) => {
-  for (const fixture of [
-    { status: "ok", answer: "苹果17", label: /符合检测规则|正常/ },
-    { status: "degraded", answer: "苹果16", label: /疑似降智/ },
-    { status: "error", error: "HTTP 429", label: /检测失败/ },
-    { status: "skipped", error: "account is not schedulable", label: /跳过/ },
-  ]) {
-    await t.test(fixture.status, async () => {
-      const result = { account_id: 2, status: fixture.status };
-      if (fixture.answer) result.answer = fixture.answer;
-      if (fixture.error) result.error = fixture.error;
-      const page = createPage({
-        store: { config: { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3] } },
-        test: () => Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
-          completed: true, degraded_account_ids: fixture.status === "degraded" ? [2] : [], results: [result],
-        } }) }),
-      });
-      await flush();
-      page.checkAccount(2);
-      await flush();
-      assert.deepEqual(page.selected(), [1]);
-      assert.deepEqual(page.store.config.excluded_account_ids, [2, 3]);
-      assert.match(page.accountRow(2).result.textContent, fixture.label);
-      assert.equal(page.store.config.degradation_check, false);
-      assert.ok(!page.store.config.degradation_check_account_id);
-      assert.equal(page.accountRow(2).button.isDisabled(), false);
-    });
-  }
-});
 
-test("single-account diagnostics clear both transient fields when requests fail", async () => {
-  const page = createPage({
-    store: { config: { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3] } },
-    test: () => Promise.reject(new Error("test timed out")),
-  });
-  await flush();
-  page.checkAccount(2);
-  await flush();
-  assert.equal(page.calls.save.length, 2);
-  assert.equal(page.calls.save[0].degradation_check_account_id, 2);
-  assert.equal(page.calls.save[1].degradation_check, false);
-  assert.ok(!page.calls.save[1].degradation_check_account_id);
-  assert.deepEqual(page.store.config.account_ids, [1]);
-  assert.deepEqual(page.store.config.excluded_account_ids, [2, 3]);
-  assert.deepEqual(page.selected(), [1]);
-  assert.match(page.accountRow(2).result.textContent, /检测失败/);
-  assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
-  assert.equal(page.accountRow(2).button.isDisabled(), false);
-});
 
-test("single-account diagnostics reject malformed and unrelated results", async (t) => {
-  const badResults = [
-    { title: "invalid JSON", result: { status_json: "{" } },
-    { title: "missing report", result: {} },
-    { title: "incomplete report", check: { state: "running", results: [] } },
-    { title: "missing target", check: { completed: true, results: [] } },
-    { title: "another account", check: { completed: true, results: [{ account_id: 1, status: "degraded", answer: "苹果16" }] } },
-    { title: "empty normal answer", check: { completed: true, results: [{ account_id: 2, status: "ok", answer: "   " }] } },
-    { title: "empty degraded answer", check: { completed: true, results: [{ account_id: 2, status: "degraded", answer: "" }] } },
-    { title: "conflicting target verdicts", check: { completed: true, results: [
-      { account_id: 2, status: "degraded", answer: "苹果16" }, { account_id: 2, status: "error", error: "HTTP 429" },
-    ] } },
-  ];
-  for (const fixture of badResults) {
-    await t.test(fixture.title, async () => {
-      const page = createPage({
-        store: { config: { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3] } },
-        test: () => Promise.resolve(fixture.result || { status_json: JSON.stringify({ degradation_check: fixture.check }) }),
-      });
-      await flush();
-      page.checkAccount(2);
-      await flush();
-      assert.deepEqual(page.selected(), [1]);
-      assert.deepEqual(page.store.config.excluded_account_ids, [2, 3]);
-      assert.equal(page.store.config.degradation_check, false);
-      assert.ok(!page.store.config.degradation_check_account_id);
-      assert.match(page.accountRow(2).result.textContent, /检测失败/);
-      assert.doesNotMatch(page.accountRow(1).result.textContent, /疑似降智/);
-      assert.match(page.ids["form-hint"].textContent, /检测失败/);
-    });
-  }
-});
 
-test("single-account diagnostics reject dropped or changed target acknowledgement before probing", async (t) => {
-  for (const target of [undefined, 0, 1]) {
-    await t.test(String(target), async () => {
-      const page = createPage({ save(config, store) {
-        store.config = clone(config);
-        const reply = clone(config);
-        if (config.degradation_check) {
-          if (target === undefined) delete reply.degradation_check_account_id;
-          else reply.degradation_check_account_id = target;
-        }
-        return Promise.resolve(reply);
-      } });
-      await flush();
-      page.checkAccount(2);
-      await flush();
-      assert.equal(page.calls.test, 0, "A lost target must never run a bulk check");
-      assert.equal(page.store.config.degradation_check, false);
-      assert.ok(!page.store.config.degradation_check_account_id);
-      assert.match(page.accountRow(2).result.textContent, /检测失败/);
-      assert.equal(page.accountRow(2).button.isDisabled(), false);
-    });
-  }
-});
 
-test("account diagnostics disable unavailable accounts and prevent overlapping checks", async () => {
-  const pending = deferred();
-  const page = createPage({
-    accounts: [
-      { id: 1, name: "First", schedulable: true },
-      { id: 2, name: "Second", schedulable: true },
-      { id: 3, name: "Paused", schedulable: false, status: "paused" },
-    ],
-    test: () => pending.promise,
-  });
-  await flush();
-  assert.equal(page.accountRow(3).button.isDisabled(), true);
-  page.checkAccount(3);
-  assert.equal(page.calls.save.length, 0);
-  const selected = page.selected();
-  page.checkAccount(1);
-  await flush();
-  assert.equal(page.calls.test, 1);
-  assert.match(page.accountRow(1).result.textContent, /检测中|正在检测/);
-  assert.equal(page.accountRow(2).button.isDisabled(), true);
-  page.checkAccount(2);
-  page.checkAccount(1);
-  page.degradationCheck();
-  page.check(2, false);
-  page.save();
-  page.selectAll();
-  assert.equal(page.calls.save.length, 1);
-  assert.equal(page.calls.test, 1);
-  assert.deepEqual(page.selected(), selected);
-  pending.resolve({ status_json: JSON.stringify({ degradation_check: {
-    completed: true, results: [{ account_id: 1, status: "ok", answer: "苹果17" }], degraded_account_ids: [],
-  } }) });
-  await flush();
-  assert.equal(page.accountRow(1).button.isDisabled(), false);
-  assert.equal(page.accountRow(2).button.isDisabled(), false);
-  assert.equal(page.accountRow(3).button.isDisabled(), true);
-});
 
-test("per-account verdicts remain attached to real IDs after status polling and row reorder", async () => {
-  const status = { healthy: true, status_json: JSON.stringify({ accounts: [
-    { id: 1, name: "shared-one", schedulable: true }, { id: 2, name: "shared-two", schedulable: true },
-  ] }) };
-  const page = createPage({ status, test: (_number, store) => {
-    const accountID = store.config.degradation_check_account_id;
-    return Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
-      completed: true, degraded_account_ids: accountID === 1 ? [1] : [],
-      results: [{ account_id: accountID, status: accountID === 1 ? "degraded" : "ok", answer: accountID === 1 ? "苹果16" : "苹果17" }],
-    } }) });
-  } });
-  await flush();
-  page.checkAccount(1);
-  await flush();
-  page.checkAccount(2);
-  await flush();
-  status.status_json = JSON.stringify({ accounts: [
-    { id: 2, name: "renamed-two", schedulable: true },
-    { id: 3, name: "new-account", schedulable: true },
-    { id: 1, name: "renamed-one", schedulable: true },
-  ] });
-  page.pollStatus();
-  await flush();
-  assert.match(page.accountRow(1).result.textContent, /疑似降智/);
-  assert.match(page.accountRow(2).result.textContent, /符合检测规则|正常/);
-  assert.doesNotMatch(page.accountRow(3).result.textContent, /疑似降智|符合检测规则|正常/);
-  assert.equal(page.accountRow(1).name.textContent, "renamed-one");
-  assert.equal(page.accountRow(2).name.title, "账号 ID：2");
-  assert.deepEqual(page.selected(), [1, 2, 3]);
-});
 
 test("ordinary saves discard a stale single-account diagnostic selector", async () => {
   const page = createPage({ store: { config: { account_ids: [1], degradation_check: true, degradation_check_account_id: 2 } } });
@@ -1087,146 +728,11 @@ test("ordinary saves discard a stale single-account diagnostic selector", async 
   assert.ok(!page.store.config.degradation_check_account_id);
 });
 
-test("degradation check selects returned degraded accounts and clears its trigger", async () => {
-  const store = { config: { account_ids: [1], enabled_models: defaultModels, degradation_check: false } };
-  const page = createPage({
-    store,
-    test: () => Promise.resolve({ status_json: JSON.stringify({
-      degradation_check: {
-        completed: true,
-        expected: "苹果17",
-        degraded_account_ids: [2],
-        results: [
-          { account_id: 1, status: "ok", answer: "苹果17" },
-          { account_id: 2, status: "degraded", answer: "苹果16" },
-          { account_id: 3, status: "skipped", error: "account is not schedulable" },
-        ],
-      },
-    }) }),
-  });
-  await flush();
-  page.degradationCheck();
-  await flush();
-  assert.equal(page.calls.test, 1);
-  assert.deepEqual(page.calls.save[0].degradation_check, true);
-  assert.deepEqual(page.calls.save[1].account_ids, [2]);
-  assert.equal(page.calls.save[1].degradation_check, false);
-  assert.deepEqual(page.store.config.account_ids, [2]);
-  assert.equal(page.store.config.degradation_check, false);
-  assert.deepEqual(page.selected(), [2]);
-  assert.match(page.ids["form-hint"].textContent, /已自动选择 1 个降智账号/);
-  assert.match(page.ids["degradation-result"].children.map((item) => item.textContent).join(" "), /Second（#2） · 疑似降智/);
-});
 
-test("degradation check keeps the existing account scope when none are degraded", async () => {
-  const store = { config: { account_ids: [1], enabled_models: defaultModels, degradation_check: false } };
-  const page = createPage({
-    store,
-    test: () => Promise.resolve({ status_json: JSON.stringify({
-      degradation_check: { completed: true, degraded_account_ids: [], results: [] },
-    }) }),
-  });
-  await flush();
-  page.degradationCheck();
-  await flush();
-  assert.deepEqual(page.calls.save[1].account_ids, [1]);
-  assert.deepEqual(page.store.config.account_ids, [1]);
-  assert.match(page.ids["form-hint"].textContent, /保留原账号选择/);
-});
 
-test("degradation check excludes failed skipped empty and conflicting verdicts", async () => {
-  const store = { config: { account_ids: [1], enabled_models: defaultModels, degradation_check: false } };
-  const page = createPage({
-    store,
-    test: () => Promise.resolve({ status_json: JSON.stringify({
-      degradation_check: {
-        completed: true,
-        degraded_account_ids: [2, 3, 4, 5, 6, 7, 8, 99],
-        results: [
-          { account_id: 2, status: "error", error: "HTTP 429" },
-          { account_id: 3, status: "error", error: "HTTP 401" },
-          { account_id: 4, status: "error", error: "HTTP 403" },
-          { account_id: 5, status: "error", error: "deadline exceeded" },
-          { account_id: 6, status: "skipped" },
-          { account_id: 7, status: "degraded", answer: "   " },
-          { account_id: 8, status: "degraded", answer: "苹果16" },
-          { account_id: 8, status: "error", error: "HTTP 429" },
-        ],
-      },
-    }) }),
-  });
-  await flush();
-  page.degradationCheck();
-  await flush();
-  assert.deepEqual(page.calls.save[1].account_ids, [1]);
-  assert.deepEqual(page.store.config.account_ids, [1]);
-  assert.deepEqual(page.selected(), [1]);
-  assert.equal(page.store.config.degradation_check, false);
-});
 
-test("all failed degradation probes report no valid answer and preserve scope", async () => {
-  const store = { config: { account_ids: [1], enabled_models: defaultModels } };
-  const page = createPage({
-    store,
-    test: () => Promise.resolve({ status_json: JSON.stringify({
-      degradation_check: {
-        completed: true, degraded_account_ids: [],
-        results: [{ account_id: 1, status: "error", error: "HTTP 429" }],
-      },
-    }) }),
-  });
-  await flush();
-  page.degradationCheck();
-  await flush();
-  assert.deepEqual(page.store.config.account_ids, [1]);
-  assert.match(page.ids["form-hint"].textContent, /未获得有效回答/);
-  assert.match(page.ids["form-hint"].className, /hint-error/);
-  assert.match(page.ids["degradation-result"].children.map((item) => item.textContent).join(" "), /未获得有效回答/);
-});
 
-test("a failed degradation result save restores the original scope", async () => {
-  let saves = 0;
-  const store = { config: { account_ids: [1], enabled_models: defaultModels } };
-  const page = createPage({
-    store,
-    save: (config, target) => {
-      saves++;
-      if (saves === 2) return Promise.reject(new Error("save unavailable"));
-      target.config = clone(config);
-      return Promise.resolve(clone(target.config));
-    },
-    test: () => Promise.resolve({ status_json: JSON.stringify({
-      degradation_check: {
-        completed: true, degraded_account_ids: [2],
-        results: [{ account_id: 2, status: "degraded", answer: "苹果16" }],
-      },
-    }) }),
-  });
-  await flush();
-  page.degradationCheck();
-  await flush();
-  assert.equal(page.calls.save.length, 3);
-  assert.deepEqual(page.calls.save[1].account_ids, [2]);
-  assert.deepEqual(page.calls.save[2].account_ids, [1]);
-  assert.deepEqual(page.store.config.account_ids, [1]);
-  assert.deepEqual(page.selected(), [1]);
-  assert.equal(page.store.config.degradation_check, false);
-  assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
-  assert.equal(page.ids["save-button"].disabled, false);
-});
 
-test("a rejected degradation test clears its trigger without changing account scope", async () => {
-  const store = { config: { account_ids: [1], enabled_models: defaultModels } };
-  const page = createPage({ store, test: () => Promise.reject(new Error("test timed out")) });
-  await flush();
-  page.degradationCheck();
-  await flush();
-  assert.deepEqual(page.store.config.account_ids, [1]);
-  assert.deepEqual(page.selected(), [1]);
-  assert.equal(page.store.config.degradation_check, false);
-  assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
-  assert.equal(page.ids["save-button"].disabled, false);
-});
 
 test("an invalid-only account list shows the empty state and retains saved selections", async () => {
   const page = createPage({
@@ -1794,70 +1300,8 @@ test("host-normalized null exclusions are accepted when the submitted exclusion 
   assert.deepEqual(page.selected(), [1, 2, 3]);
 });
 
-test("degradation selection updates existing exclusions while concurrent and future new accounts stay automatic", async () => {
-  const pending = deferred();
-  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }] }) };
-  const page = createPage({ status, store: { config: { auto_select_new_accounts: true, account_ids: [1], excluded_account_ids: [3, 88] } }, test: () => pending.promise });
-  await flush();
-  page.degradationCheck();
-  await flush();
-  status.status_json = JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }] });
-  page.pollStatus();
-  await flush();
-  pending.resolve({ status_json: JSON.stringify({ degradation_check: { completed: true, degraded_account_ids: [2], results: [{ account_id: 2, status: "degraded", answer: "苹果16" }] } }) });
-  await flush();
-  assert.equal(page.store.config.auto_select_new_accounts, true);
-  assert.deepEqual(page.store.config.excluded_account_ids.sort((a, b) => a - b), [1, 3, 88]);
-  assert.deepEqual(page.selected(), [2, 4]);
-  const reopened = createPage({ store: page.store, accounts: [{ id: 1 }, { id: 2 }, { id: 5 }, { id: 88 }] });
-  await flush();
-  assert.deepEqual(reopened.selected(), [2, 5]);
-});
 
-test("degradation save and read-back reject dropped automatic mode or exclusions", async (t) => {
-  for (const stage of ["acknowledgement", "read-back"]) {
-    for (const field of ["auto_select_new_accounts", "excluded_account_ids"]) {
-      await t.test(stage + " " + field, async () => {
-        let saves = 0;
-        const page = createPage({ store: { config: { account_ids: [1] } }, save(config, store) {
-          saves++;
-          const changed = clone(config);
-          if (saves === 2) delete changed[field];
-          store.config = stage === "read-back" ? changed : clone(config);
-          return Promise.resolve(stage === "acknowledgement" ? changed : clone(config));
-        }, test: () => Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
-          completed: true, degraded_account_ids: [2], results: [{ account_id: 2, status: "degraded", answer: "苹果16" }],
-        } }) }) });
-        await flush();
-        page.degradationCheck();
-        await flush();
-        assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
-        assert.doesNotMatch(page.ids["form-hint"].textContent, /已自动选择/);
-        assert.deepEqual(page.selected(), [1]);
-      });
-    }
-  }
-});
 
-test("failed degradation cleanup never reselects locally excluded accounts", async () => {
-  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }] }) };
-  let saves = 0;
-  const page = createPage({ status, save(config, store) {
-    if (++saves > 1) return Promise.reject(new Error("cleanup unavailable"));
-    store.config = clone(config);
-    return Promise.resolve(clone(config));
-  }, test: () => Promise.reject(new Error("test unavailable")) });
-  await flush();
-  page.check(1, false);
-  page.degradationCheck();
-  await flush();
-  status.status_json = JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }] });
-  page.pollStatus();
-  await flush();
-  assert.deepEqual(page.selected(), [2, 3]);
-  assert.deepEqual(page.calls.save[1].excluded_account_ids, [1]);
-  assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
-});
 
 const bpsBlockA = "a".repeat(32);
 const bpsBlockB = "b".repeat(32);
@@ -2038,68 +1482,8 @@ test("restoration requires acknowledgement persistence at save and read-back", a
   }
 });
 
-test("diagnostic saves preserve existing acknowledgements but never submit a pending restore", async () => {
-  const status = bpsStatus([[2, bpsBlockA]]);
-  const page = createPage({ status, store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2], bps_reenabled_accounts: { 88: bpsBlockB } } }, test: () => Promise.resolve({
-    status_json: JSON.stringify({ bps_disabled_account_ids: [2], bps_disabled_accounts: [{ account_id: 2, block_id: bpsBlockA }],
-      degradation_check: { completed: true, results: [{ account_id: 1, status: "ok", answer: "苹果17" }], degraded_account_ids: [] } }),
-  }) });
-  await flush();
-  page.check(2, true);
-  page.checkAccount(1);
-  await flush();
-  assert.equal(page.calls.save.length, 2);
-  for (const saved of page.calls.save) {
-    assert.deepEqual(saved.bps_reenabled_accounts, { 88: bpsBlockB });
-    assert.deepEqual(saved.excluded_account_ids, [2]);
-    assert.ok(!saved.account_ids.includes(2));
-  }
-  assert.deepEqual(page.selected(), [1, 2, 3], "The manual restore remains an unsaved local choice");
-  assert.match(page.accountRow(2).availability.textContent, /待恢复/);
-});
 
-test("403 state returned by diagnostics is excluded before cleanup is saved", async () => {
-  const status = bpsStatus();
-  const page = createPage({ status, test: () => {
-    Object.assign(status, bpsStatus([[2, bpsBlockA]]));
-    const details = JSON.parse(status.status_json);
-    details.degradation_check = { completed: true, results: [{ account_id: 2, status: "error", error: "upstream returned HTTP 403" }], degraded_account_ids: [] };
-    return Promise.resolve({ status_json: JSON.stringify(details) });
-  } });
-  await flush();
-  page.checkAccount(2);
-  await flush();
-  assert.equal(page.calls.save.length, 2);
-  assert.deepEqual(page.calls.save[1].excluded_account_ids, [2]);
-  assert.deepEqual(page.calls.save[1].account_ids, [1, 3]);
-  assert.deepEqual(page.selected(), [1, 3]);
-  assert.match(page.accountRow(2).availability.textContent, /403/);
-  assert.match(page.accountRow(2).result.textContent, /失败/);
-});
 
-test("failed diagnostics cleanup merges a concurrent 403 and preserves confirmed acknowledgements", async () => {
-  const pending = deferred();
-  const status = bpsStatus();
-  const page = createPage({ status, store: { config: { account_ids: [1, 2, 3], auto_select_new_accounts: true, bps_reenabled_accounts: { 88: bpsBlockA } } }, test: () => pending.promise });
-  await flush();
-  page.checkAccount(1);
-  await flush();
-  Object.assign(status, bpsStatus([[2, bpsBlockB]]));
-  page.pollStatus();
-  await flush();
-  pending.reject(new Error("diagnostic unavailable"));
-  await flush();
-  assert.equal(page.calls.save.length, 2);
-  assert.deepEqual(page.calls.save[1].account_ids, [1, 3]);
-  assert.deepEqual(page.calls.save[1].excluded_account_ids, [2]);
-  assert.deepEqual(page.calls.save[1].bps_reenabled_accounts, { 88: bpsBlockA });
-  assert.deepEqual(page.selected(), [1, 3]);
-  const reopened = createPage({ status, store: page.store });
-  await flush();
-  assert.deepEqual(reopened.selected(), [1, 3]);
-  assert.equal(reopened.calls.save.length, 0);
-  assert.match(reopened.accountRow(2).availability.textContent, /403/);
-});
 
 test("unchecking a pending restore discards its unsaved acknowledgement", async () => {
   const page = createPage({ status: bpsStatus([[2, bpsBlockA]]) });
@@ -2182,34 +1566,6 @@ test("ordinary saves never confirm retained diagnostic command markers", async (
   }
 });
 
-test("diagnostic 403 snapshots supersede status polls started before their result", async () => {
-  const stalePoll = deferred();
-  const finalSave = deferred();
-  let statusCalls = 0;
-  let saveCalls = 0;
-  const page = createPage({
-    getStatus: () => ++statusCalls === 2 ? stalePoll.promise : Promise.resolve(bpsStatus()),
-    save: (config, store) => {
-      store.config = clone(config);
-      return ++saveCalls === 2 ? finalSave.promise : Promise.resolve(clone(config));
-    },
-    test: () => Promise.resolve({ status_json: JSON.stringify({
-      bps_disabled_accounts: [{ account_id: 2, block_id: bpsBlockA }],
-      degradation_check: { completed: true, degraded_account_ids: [], results: [{ account_id: 2, status: "error", error: "HTTP 403" }] },
-    }) }),
-  });
-  await flush();
-  page.pollStatus();
-  page.checkAccount(2);
-  await flush();
-  assert.match(page.accountRow(2).availability.textContent, /403/);
-  stalePoll.resolve(bpsStatus());
-  await flush();
-  assert.match(page.accountRow(2).availability.textContent, /403/, "An earlier status response must not erase the diagnostic block");
-  assert.equal(page.accountRow(2).checkbox.checked, false);
-  finalSave.resolve(clone(page.store.config));
-  await flush();
-});
 
 function createBridgeHarness(options = {}) {
   const listeners = new Set();
@@ -2244,6 +1600,116 @@ function createBridgeHarness(options = {}) {
     },
   };
 }
+
+test("Bridge v1 concurrent configuration pages never save or dispatch account tests", async (t) => {
+  for (const markers of [{}, { degradation_check: true, degradation_check_account_id: 1 }]) {
+    await t.test(JSON.stringify(markers), async () => {
+      const store = { config: { account_ids: [1, 2], auto_select_new_accounts: true,
+        bps_auto_disable_on_403: false, bps_device_convergence: true, ...markers } };
+      const before = clone(store.config);
+      const dispatched = [];
+      const options = { store, test: (_n, shared) => {
+        dispatched.push(shared.config.degradation_check_account_id);
+        return Promise.reject(new Error("must not dispatch"));
+      } };
+      const first = createPage(options);
+      const second = createPage(options);
+      await flush();
+      for (const [page, target] of [[first, 1], [second, 2]]) {
+        assert.equal(page.accountRow(target).button.disabled, true);
+        assert.match(page.accountRow(target).button.title, /原子绑定检测账号/);
+        assert.equal(page.ids["degradation-check-button"].disabled, true);
+        page.checkAccount(target);
+        page.degradationCheck();
+        // Directly emitted events also fail closed; disabled buttons alone
+        // cannot protect stale pages or programmatically dispatched events.
+        page.accountRow(target).button.emit("click");
+        page.ids["degradation-check-button"].emit("click");
+      }
+      await flush();
+      assert.deepEqual(dispatched, []);
+      assert.deepEqual(store.config, before);
+      for (const page of [first, second]) {
+        assert.equal(page.calls.save.length, 0);
+        assert.equal(page.calls.test, 0);
+        assert.match(page.ids["form-hint"].textContent, /账号检测已暂停/);
+        assert.equal(page.ids["save-button"].disabled, false);
+        assert.deepEqual(page.selected(), [1, 2, 3]);
+      }
+    });
+  }
+});
+
+test("blocked diagnostics preserve unsaved route and device edits and explicit restores", async () => {
+  const page = createPage({ status: bpsStatus([[2, bpsBlockA]]), store: { config: {
+    account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2],
+    bps_reenabled_accounts: { 88: bpsBlockB }, bps_device_convergence: false,
+  } } });
+  await flush();
+  const before = clone(page.store.config);
+  page.check(2, true);
+  page.check(3, false);
+  page.toggleDevice();
+  page.toggle403();
+  page.accountRow(1).button.emit("click");
+  await flush();
+  assert.deepEqual(page.store.config, before);
+  assert.equal(page.calls.save.length, 0);
+  assert.equal(page.calls.test, 0);
+  assert.deepEqual(page.selected(), [1, 2]);
+  assert.match(page.accountRow(2).availability.textContent, /待恢复/);
+  assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "true");
+  assert.equal(page.ids["bps-403-toggle"].getAttribute("aria-pressed"), "false");
+  page.save();
+  await flush();
+  assert.equal(page.calls.test, 0);
+  assert.deepEqual(page.store.config.account_ids, [1, 2]);
+  assert.deepEqual(page.store.config.bps_reenabled_accounts, { 2: bpsBlockA, 88: bpsBlockB });
+});
+
+test("passive diagnostic verdicts stay tied to numeric account IDs after reordering", async (t) => {
+  for (const fixture of [
+    { status: "ok", answer: "苹果17", label: /符合检测规则/ },
+    { status: "degraded", answer: "苹果16", label: /疑似降智/ },
+    { status: "error", error: "HTTP 403", label: /检测失败/ },
+    { status: "error", error: "HTTP 429", label: /检测失败/ },
+    { status: "skipped", error: "unavailable", label: /跳过/ },
+    { status: "ok", answer: "", label: /检测失败/ },
+  ]) {
+    await t.test(fixture.status + (fixture.error || fixture.answer), async () => {
+      const accounts = [{ id: 1, name: "相同账号名", schedulable: true }, { id: 2, name: "相同账号名", schedulable: true }];
+      const { label, ...result } = fixture;
+      const status = { healthy: true, status_json: JSON.stringify({ accounts, degradation_check: {
+        completed: true, results: [{ account_id: 2, ...result }], degraded_account_ids: [],
+      } }) };
+      const page = createPage({ status });
+      await flush();
+      assert.match(page.accountRow(2).result.textContent, label);
+      assert.equal(page.accountRow(1).result.textContent, "未检测");
+      status.status_json = JSON.stringify({ accounts: [{ ...accounts[1], name: "更名账号" }, accounts[0]] });
+      page.pollStatus();
+      await flush();
+      assert.match(page.accountRow(2).result.textContent, label);
+      assert.equal(page.accountRow(2).name.textContent, "更名账号");
+      assert.equal(page.accountRow(1).result.textContent, "未检测");
+      assert.equal(page.calls.test, 0);
+      assert.equal(page.calls.save.length, 0);
+    });
+  }
+});
+
+test("Bridge v1 documents its account test limitation while retaining ordinary testing", async () => {
+  const host = createBridgeHarness();
+  assert.match(host.bridge.accountCheckUnavailableReason, /原子绑定检测账号/);
+  assert.match(htmlSource, /单账号和批量检测已暂停/);
+  const pending = host.bridge.testConfig();
+  assert.equal(host.sent.length, 1);
+  assert.equal(host.sent[0].data.type, "config.test");
+  assert.equal(Object.hasOwn(host.sent[0].data, "config"), false);
+  assert.equal(Object.hasOwn(host.sent[0].data, "account_id"), false);
+  host.reply({ result: { success: true, message: "endpoint reachable" } });
+  assert.equal((await pending).message, "endpoint reachable");
+});
 
 test("bridge accepts confirmed config objects and clears the request timeout", async () => {
   const host = createBridgeHarness();

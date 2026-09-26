@@ -33,6 +33,12 @@ type toolSpec struct {
 // that produced it. Follow-up requests often carry only previous_response_id
 // and omit both the full history and the tool catalog.
 func RememberResponseContext(source, response map[string]any) {
+	if ClassifyResponseTerminal("", response).Failed() {
+		return
+	}
+	if status := stringValue(response["status"]); status != "" && status != "completed" {
+		return
+	}
 	responseID := stringValue(response["id"])
 	if responseID == "" {
 		return
@@ -1243,7 +1249,11 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 		return nil, nil, false, fail(502, "invalid_upstream_response", "Basis Points returned invalid JSON")
 	}
 	output, _ := response["output"].([]any)
-	if status := stringValue(response["status"]); status != "" && status != "completed" {
+	terminal := ClassifyResponseTerminal("", response)
+	if status := stringValue(response["status"]); terminal.Failed() || status != "" && status != "completed" {
+		if terminal.Failed() {
+			NormalizeResponseFailure(map[string]any{"response": response}, terminal)
+		}
 		filtered := make([]any, 0, len(output))
 		for _, value := range output {
 			if !clientCallableItem(objectValue(value)) {
@@ -1297,9 +1307,34 @@ func syntheticStream(response map[string]any) []byte {
 	if response == nil {
 		return nil
 	}
+	response = cloneObject(response)
+	terminal := ClassifyResponseTerminal("", response)
+	if terminal == TerminalNone {
+		terminal = TerminalCompleted
+		if status := stringValue(response["status"]); status != "" && status != "completed" {
+			terminal = TerminalInvalid
+		}
+	}
+	event := "response.completed"
+	if terminal.Failed() {
+		event = NormalizeResponseFailure(map[string]any{"response": response}, terminal)
+		output, _ := response["output"].([]any)
+		filtered := make([]any, 0, len(output))
+		for _, value := range output {
+			if !clientCallableItem(objectValue(value)) {
+				filtered = append(filtered, value)
+			}
+		}
+		response["output"] = filtered
+	} else {
+		response["status"] = "completed"
+	}
 	created := cloneObject(response)
 	created["status"] = "in_progress"
 	created["output"] = []any{}
+	for _, key := range []string{"error", "incomplete_details", "status_code", "http_status", "ok", "success"} {
+		delete(created, key)
+	}
 	var builder strings.Builder
 	writeSSE(&builder, "response.created", map[string]any{"type": "response.created", "response": created})
 	writeSSE(&builder, "response.in_progress", map[string]any{"type": "response.in_progress", "response": created})
@@ -1324,9 +1359,7 @@ func syntheticStream(response map[string]any) []byte {
 			writeSSE(&builder, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": index, "item": item})
 		}
 	}
-	completed := cloneObject(response)
-	completed["status"] = "completed"
-	writeSSE(&builder, "response.completed", map[string]any{"type": "response.completed", "response": completed})
+	writeSSE(&builder, event, map[string]any{"type": event, "response": response})
 	builder.WriteString("data: [DONE]\n\n")
 	return []byte(builder.String())
 }

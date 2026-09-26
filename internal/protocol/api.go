@@ -47,23 +47,41 @@ func ParseFinalStreamResponse(raw []byte) (map[string]any, error) {
 	trimmed := string(raw)
 	if len(trimmed) > 0 {
 		if object, err := RawObject(raw); err == nil {
+			if terminal := ClassifyResponseTerminal("", object); terminal.Failed() {
+				return nil, ResponseTerminalError(terminal, object)
+			}
 			return object, nil
 		}
 	}
 	decoder := newSSEDecoder()
 	var completed map[string]any
-	consume := func(_ string, data string) error {
-		if data == "[DONE]" {
+	consume := func(event string, data string) error {
+		if completed != nil {
 			return nil
+		}
+		if data == "[DONE]" {
+			if terminal := ClassifyResponseTerminal(event, nil); terminal.Failed() {
+				return ResponseTerminalError(terminal, nil)
+			}
+			return fail(502, "invalid_upstream_response", "Basis Points stream ended without response.completed")
 		}
 		object, err := RawObject([]byte(data))
 		if err != nil {
+			if terminal := ClassifyResponseTerminal(event, nil); terminal.Failed() {
+				return ResponseTerminalError(terminal, nil)
+			}
 			return nil
 		}
-		if response, ok := object["response"].(map[string]any); ok {
-			if object["type"] == "response.completed" || response["status"] == "completed" {
-				completed = response
+		terminal := ClassifyResponseTerminal(event, object)
+		if terminal.Failed() {
+			return ResponseTerminalError(terminal, object)
+		}
+		if terminal == TerminalCompleted {
+			completed = objectValue(object["response"])
+			if completed == nil {
+				return fail(502, "invalid_upstream_response", "Basis Points completed event omitted its response")
 			}
+			completed["status"] = "completed"
 		}
 		return nil
 	}

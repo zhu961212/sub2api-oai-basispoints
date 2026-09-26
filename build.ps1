@@ -1,4 +1,5 @@
-# 构建、测试并打包 Sub2API 插件（Windows）。
+# Build, test and package the Sub2API plugin on Windows.
+# Keep this script ASCII-compatible for Windows PowerShell 5.1 without a BOM.
 #
 #   .\build.ps1
 #   .\build.ps1 -SigningKey C:\secure\publisher.private -KeyId my-publisher-v1
@@ -46,23 +47,21 @@ Write-Host "==> go $($arguments -join ' ')"
 go @arguments
 if ($LASTEXITCODE -ne 0) { throw "Plugin packaging failed." }
 
-# 独立校验：不复用打包器的自检逻辑，重新算哈希并（在有公钥时）验证签名。
-$manifest = Get-Content manifest.source.json -Raw | ConvertFrom-Json
+# Independently verify the package. Only signed builds automatically use a key.
+$manifest = Get-Content -LiteralPath manifest.source.json -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not $manifest -or [string]::IsNullOrWhiteSpace([string]$manifest.id) -or [string]::IsNullOrWhiteSpace([string]$manifest.version)) {
+    throw "Package manifest must define non-empty id and version."
+}
 $package = if ($Output) { $Output } else { Join-Path "dist" "$($manifest.id)-$($manifest.version).s2plugin" }
 $python = Get-Command python -ErrorAction SilentlyContinue
 if ($SigningKey -and -not $python) { throw "Python is required for independent signature verification." }
 if (-not (Test-Path -LiteralPath $package)) { throw "Expected plugin package was not created: $package" }
 if ($python) {
     $verifyArgs = @("tools/verify_package.py", $package)
-    $verifyKey = "build/keys/publisher.public"
     if ($SigningKey) {
         $matchingKey = [System.IO.Path]::ChangeExtension($SigningKey, "public")
         if (-not (Test-Path -LiteralPath $matchingKey)) { throw "Matching publisher public key is required: $matchingKey" }
-        $verifyKey = $matchingKey
-        $verifyArgs += @("--require-signature", "--expected-key-id", $KeyId)
-    }
-    if (Test-Path -LiteralPath $verifyKey) {
-        $verifyArgs += @("--public-key", $verifyKey)
+        $verifyArgs += @("--require-signature", "--public-key", $matchingKey, "--expected-key-id", $KeyId)
     }
     Write-Host "==> python $($verifyArgs -join ' ')"
     & python -X utf8 @verifyArgs

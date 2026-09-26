@@ -56,21 +56,9 @@ func TestDegradationCheckTargetsOneAccountUsingItsCredentialAndProxy(t *testing.
 			cfg.ExcludedAccountIDs = []int64{9}
 			cfg.DegradationCheck = true
 			cfg.DegradationCheckAccountID = 9
-			raw, err := json.Marshal(cfg)
+			check, err := tr.runDegradationCheck(context.Background(), cfg)
 			if err != nil {
-				t.Fatal(err)
-			}
-			response, err := tr.TestConfig(context.Background(), &pluginv1.TestConfigRequest{ConfigJson: raw})
-			if err != nil || !response.GetSuccess() {
-				t.Fatalf("targeted check failed: response=%v err=%v", response, err)
-			}
-			var status map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(response.GetStatusJson()), &status); err != nil {
-				t.Fatal(err)
-			}
-			var check degradationCheckResult
-			if err := json.Unmarshal(status["degradation_check"], &check); err != nil {
-				t.Fatal(err)
+				t.Fatalf("targeted check failed: %v", err)
 			}
 			if !check.Completed || len(check.Results) != 1 || check.Results[0].AccountID != 9 || check.Results[0].Name != "target" || check.Results[0].Status != "ok" || len(check.DegradedAccountIDs) != 0 {
 				t.Fatalf("unexpected single account result: %+v", check)

@@ -33,7 +33,7 @@
           <span id="bps-device-hint" class="hint">默认关闭。开启后，BPS 请求按账号统一设备标识，本插件不合并会话。切换后保存生效；关闭不撤销宿主已有的设备或会话收敛。</span>
           <div id="account-list" class="check-list"></div>
           <span id="account-hint" class="hint">新增账号自动勾选并使用 BPS；取消勾选会记住排除。旧配置保存一次即可启用，之后无需再次打开配置页。</span>
-          <span class="hint">检测会向可用账号发送真实请求，可能消耗额度。按自定义“苹果17”回答规则筛选疑似账号，不代表可靠智力测评；限流、鉴权失败、超时和跳过均不会判为降智。</span>
+          <span class="hint">当前宿主 UI Bridge v1 无法原子绑定检测账号；为避免多页面检测错账号，单账号和批量检测已暂停。需宿主提供按请求绑定目标的检测接口。账号状态查询、路由保存和宿主连通性测试仍可使用。</span>
           <div id="degradation-result" class="degradation-result" aria-live="polite"></div>
         </fieldset>
 

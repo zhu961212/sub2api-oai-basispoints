@@ -2,7 +2,6 @@ package transport
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,7 +15,7 @@ import (
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
 
-func TestDegradationTestConfigKeepsEachAccountResultIsolated(t *testing.T) {
+func TestDegradationRunnerKeepsEachAccountResultIsolated(t *testing.T) {
 	fixtures := []struct {
 		id           int64
 		wantStatus   string
@@ -88,24 +87,9 @@ func TestDegradationTestConfigKeepsEachAccountResultIsolated(t *testing.T) {
 		cfg.AccountIDs = []int64{7}
 		cfg.ExcludedAccountIDs = []int64{fixture.id}
 		cfg.DegradationCheck, cfg.DegradationCheckAccountID = true, fixture.id
-		raw, err := json.Marshal(cfg)
+		check, err := tr.runDegradationCheck(context.Background(), cfg)
 		if err != nil {
-			t.Error(err)
-			return
-		}
-		response, err := tr.TestConfig(context.Background(), &pluginv1.TestConfigRequest{ConfigJson: raw})
-		if err != nil || !response.GetSuccess() {
-			t.Errorf("account %d: TestConfig failed: response=%v err=%v", fixture.id, response, err)
-			return
-		}
-		var status map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(response.GetStatusJson()), &status); err != nil {
-			t.Error(err)
-			return
-		}
-		var check degradationCheckResult
-		if err := json.Unmarshal(status["degradation_check"], &check); err != nil {
-			t.Error(err)
+			t.Errorf("account %d: check failed: %v", fixture.id, err)
 			return
 		}
 		if !check.Completed || len(check.Results) != 1 {
