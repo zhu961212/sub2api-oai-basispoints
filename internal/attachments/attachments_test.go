@@ -58,7 +58,7 @@ func testHeaders() http.Header {
 	return h
 }
 
-func TestNativeUploadPreservesBytesAndRewritesEverySupportedContainer(t *testing.T) {
+func TestNativeUploadPreservesBytesAndKeepsToolImagesInline(t *testing.T) {
 	data := testPNG(t)
 	raw := dataURL(data, "image/png")
 	var uploads atomic.Int32
@@ -112,9 +112,12 @@ func TestNativeUploadPreservesBytesAndRewritesEverySupportedContainer(t *testing
 	if err != nil || !changed || uploads.Load() != 1 {
 		t.Fatalf("changed=%v uploads=%d err=%v", changed, uploads.Load(), err)
 	}
-	for _, part := range parts {
-		if part["file_id"] != "file-native-test" || part["image_url"] != nil {
-			t.Error("attachment reference missing")
+	if parts[0]["file_id"] != "file-native-test" || parts[0]["image_url"] != nil {
+		t.Error("message attachment reference missing")
+	}
+	for _, part := range parts[1:] {
+		if part["image_url"] != raw || part["file_id"] != nil {
+			t.Error("tool screenshot did not retain its original data URL")
 		}
 	}
 	if parts[0]["detail"] != "original" || parts[1]["detail"] != "high" || parts[2]["detail"] != "auto" {

@@ -1,5 +1,5 @@
-// Package attachments sends inline images to the upstream native attachment
-// endpoint, without a public download URL, temporary file, or local listener.
+// Package attachments uploads message images as native attachments and validates
+// inline tool screenshots without a public URL, temporary file, or local listener.
 package attachments
 
 import (
@@ -80,17 +80,25 @@ type inlineImage struct {
 	payload string
 	size    int64
 	key     [32]byte
+	// Request-local state: a tool screenshot may be seen before the same image
+	// appears in a message that needs an authenticated upload/cache key.
+	keyReady  bool
+	validated bool
 }
 
 type imageEdit struct {
-	part  map[string]any
-	image *inlineImage
+	part   map[string]any
+	image  *inlineImage
+	upload bool
 }
 
 // Rewrite visits typed images in messages and function/custom tool results.
 // All images validate before any upload; source changes only after every upload
-// succeeds. An empty scope disables reuse across requests. Caller maps must not
+// succeeds. Only message images become file IDs: tool screenshots retain their
+// data URLs. An empty scope disables reuse across requests. Caller maps must not
 // be accessed concurrently. Existing HTTPS references and file IDs are untouched.
+// A validated inline tool screenshot returns true even if its detail was already
+// explicit, so callers serialize the validated request and use image-safe errors.
 func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesURL string, headers http.Header, source map[string]any, scope string) (bool, error) {
 	var edits []imageEdit
 	unique := make(map[[32]byte]*inlineImage)
@@ -122,17 +130,20 @@ func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesUR
 			if len(raw) < 5 || !strings.EqualFold(raw[:5], "data:") {
 				continue
 			}
-			if u == nil || client == nil {
-				return false, fail(503, "attachment_unavailable", "Basis Points attachment transport is unavailable")
-			}
 			if err := ctx.Err(); err != nil {
 				return false, canceled(err)
 			}
-			if endpoint == "" {
-				var err error
-				endpoint, err = attachmentURL(responsesURL)
-				if err != nil {
-					return false, err
+			upload := field == "content"
+			if upload {
+				if u == nil || client == nil {
+					return false, fail(503, "attachment_unavailable", "Basis Points attachment transport is unavailable")
+				}
+				if endpoint == "" {
+					var err error
+					endpoint, err = attachmentURL(responsesURL)
+					if err != nil {
+						return false, err
+					}
 				}
 			}
 			path := fmt.Sprintf("input[%d].%s[%d]", i, field, j)
@@ -153,6 +164,9 @@ func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesUR
 				if err != nil {
 					return false, invalid(err.Error())
 				}
+			}
+			if upload && !img.keyReady {
+				var err error
 				img.key, err = u.imageKey(ctx, endpoint, scope, headers, img)
 				if err != nil {
 					return false, err
@@ -160,35 +174,39 @@ func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesUR
 				if existing := unique[img.key]; existing != nil {
 					img = existing
 				} else {
-					// The keyed digest covers the entire payload, MIME and
-					// identity. A hit can skip repeated base64/format scans.
-					if scope == "" || u.cached(img.key) == "" {
-						if err := validateImage(ctx, img); err != nil {
-							if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-								return false, canceled(err)
-							}
-							return false, invalid(err.Error())
-						}
-					}
+					img.keyReady = true
 					unique[img.key] = img
 					order = append(order, img)
 				}
-				// Request-local references only; payloads never enter the
-				// persistent cache. Duplicate blocks avoid repeated HMAC work.
-				if firstImage == nil {
-					firstRaw, firstImage = raw, img
-				} else {
-					if encoded == nil {
-						encoded = make(map[string]*inlineImage)
+			}
+			if !img.validated {
+				// Only a full authenticated upload-cache hit can skip scans.
+				// Tool-only images always validate without an upload dependency.
+				if !upload || scope == "" || u.cached(img.key) == "" {
+					if err := validateImage(ctx, img); err != nil {
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							return false, canceled(err)
+						}
+						return false, invalid(err.Error())
 					}
-					encoded[raw] = img
 				}
+				img.validated = true
+			}
+			// Request-local references only; payloads never enter the
+			// persistent cache. Duplicate blocks avoid repeated scans/HMACs.
+			if firstImage == nil || raw == firstRaw {
+				firstRaw, firstImage = raw, img
+			} else {
+				if encoded == nil {
+					encoded = make(map[string]*inlineImage)
+				}
+				encoded[raw] = img
 			}
 			total += img.size
 			if total > maxRequestBytes {
 				return false, invalid("Inline images exceed the 32 MiB request limit")
 			}
-			edits = append(edits, imageEdit{part: part, image: img})
+			edits = append(edits, imageEdit{part: part, image: img, upload: upload})
 		}
 	}
 	if len(edits) == 0 {
@@ -206,9 +224,11 @@ func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesUR
 		return false, canceled(err)
 	}
 	for _, edit := range edits {
-		delete(edit.part, "image_url")
-		edit.part["file_id"] = ids[edit.image.key]
-		if _, exists := edit.part["detail"]; !exists {
+		if edit.upload {
+			delete(edit.part, "image_url")
+			edit.part["file_id"] = ids[edit.image.key]
+		}
+		if edit.part["detail"] == nil {
 			edit.part["detail"] = "auto"
 		}
 	}

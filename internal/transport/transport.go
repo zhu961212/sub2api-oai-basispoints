@@ -293,19 +293,21 @@ func healthStatusJSON(c protocol.Config, accounts []accountSummary) string {
 		accountIDs = []int64{}
 	}
 	status, _ := json.Marshal(map[string]any{
-		"plugin_version":      protocol.Version,
-		"capability":          protocol.Capability,
-		"responses_url":       c.ResponsesURL,
-		"enabled_models":      c.EnabledModels,
-		"available_models":    protocol.AvailableModels(),
-		"account_ids":         accountIDs,
-		"accounts":            accounts,
-		"auth_mode":           c.AuthMode,
-		"timeout_seconds":     c.TimeoutSeconds,
-		"rewrite_tools":       c.RewriteTools,
-		"transform_responses": c.TransformResponses,
-		"reasoning_efforts":   protocol.SupportedReasoningEfforts(),
-		"image_input":         "automatic_attachments",
+		"plugin_version":           protocol.Version,
+		"capability":               protocol.Capability,
+		"responses_url":            c.ResponsesURL,
+		"enabled_models":           c.EnabledModels,
+		"available_models":         protocol.AvailableModels(),
+		"account_ids":              accountIDs,
+		"auto_select_new_accounts": c.AutoSelectNewAccounts,
+		"excluded_account_ids":     c.ExcludedAccountIDs,
+		"accounts":                 accounts,
+		"auth_mode":                c.AuthMode,
+		"timeout_seconds":          c.TimeoutSeconds,
+		"rewrite_tools":            c.RewriteTools,
+		"transform_responses":      c.TransformResponses,
+		"reasoning_efforts":        protocol.SupportedReasoningEfforts(),
+		"image_input":              "automatic_attachments",
 	})
 	return string(status)
 }
@@ -561,10 +563,9 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		return sendError(stream, "unsupported_account_type", "plugin only accepts OAuth accounts", false)
 	}
 
-	// 账号白名单（配置页勾选）：勾选的账号走 Basis Points，未勾选的账号不被改动。
-	// 宿主一旦把请求交给插件就无法"拒绝接管"，所以白名单外的账号由插件原样透传
-	// 回宿主原本指定的上游 —— 对客户端而言等同于没有启用插件。
-	if whitelist := cfg.SelectedAccountIDs(); len(whitelist) > 0 && !whitelistedAccount(whitelist, start.GetAccountId()) {
+	// 自动模式下新增账号直接走 BPS，明确取消的账号原样透传。旧配置继续使用
+	// 白名单，直到配置页保存完成迁移；无需账号轮询或打开页面才能接入新 ID。
+	if !cfg.HandlesAccount(start.GetAccountId()) {
 		return t.passthrough(stream, start, body, client, cfg.MaxResponseBytes)
 	}
 
@@ -732,15 +733,6 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		responseBody, _ = redactImageFailureJSON(responseBody, "")
 	}
 	return sendHTTPResponse(stream, resp, responseBody, responseContentType)
-}
-
-// whitelistedAccount 判断宿主本次调度的账号是否在插件的账号白名单里。
-// 宿主没给出账号 ID 时无法判断，按"允许"处理，保持插件原有的行为。
-func whitelistedAccount(whitelist []int64, accountID int64) bool {
-	if accountID == 0 {
-		return true
-	}
-	return containsAccount(whitelist, accountID)
 }
 
 // passthrough 把宿主的请求原样送到宿主原本指定的上游，不做任何改写。

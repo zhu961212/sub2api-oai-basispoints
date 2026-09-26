@@ -20,9 +20,9 @@ const (
 	degradationCheckPrompt   = "不联网，不猜测，直接说出你知道的最新苹果手机。只输出手机型号，不要解释。"
 	degradationExpectedReply = "苹果17"
 	// PluginManager.Test gives the whole operation 30 seconds. Keep enough
-	// room for several account batches while allowing a slow account to fail
-	// independently instead of holding the UI step-up request open.
-	degradationCheckTimeout  = 8 * time.Second
+	// room for returning results while allowing a slow account to finish. The
+	// total scan budget still bounds queued batches and the UI request.
+	degradationCheckTimeout  = 20 * time.Second
 	degradationCheckBudget   = 24 * time.Second
 	degradationCheckParallel = 8
 )
@@ -198,17 +198,17 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := requestClient.Do(req)
 	if err != nil {
-		return "error", "", fmt.Errorf("%s", safeTransportError(err))
+		return "error", "", degradationReadError(ctx, err)
 	}
 	defer resp.Body.Close()
-	responseBody, err := readLimited(resp.Body, c.MaxResponseBytes)
-	if err != nil {
-		return "error", "", fmt.Errorf("%s", safeError(err))
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "error", "", fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
 	}
-	answer, err := degradationAnswer(responseBody, resp.Header.Get("Content-Type"))
+	responseBody, contentType, err := readDegradationResponse(ctx, resp.Body, resp.Header.Get("Content-Type"), c.MaxResponseBytes)
+	if err != nil {
+		return "error", "", err
+	}
+	answer, err := degradationAnswer(responseBody, contentType)
 	if err != nil {
 		return "error", "", err
 	}

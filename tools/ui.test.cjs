@@ -143,7 +143,7 @@ function createPage(options = {}) {
     ready() { calls.ready++; },
     resize() {},
     dispose() {},
-    status() { calls.status++; return Promise.resolve(clone(status)); },
+    status() { calls.status++; return options.getStatus ? options.getStatus(calls.status, store) : Promise.resolve(clone(status)); },
     loadConfig() {
       calls.load++;
       return options.load ? options.load(calls.load, store) : Promise.resolve(clone(store.config));
@@ -279,12 +279,12 @@ test("model controls stay locked while loading, saving, and verifying", async ()
   page.save();
   assert.equal(page.ids["model-fields"].disabled, true);
   page.checkModel("gpt-6-astra", true);
-  saving.resolve({ account_ids: [], enabled_models: ["gpt-6-sol", "gpt-6-luna"] });
+  saving.resolve(clone(page.calls.save[0]));
   await flush();
   assert.equal(page.ids["model-fields"].disabled, true);
   page.checkModel("gpt-6-sol", false);
   assert.deepEqual(page.selectedModels(), ["gpt-6-sol", "gpt-6-luna"]);
-  verification.resolve({ account_ids: [], enabled_models: ["gpt-6-luna", "gpt-6-sol"] });
+  verification.resolve({ ...clone(page.calls.save[0]), enabled_models: ["gpt-6-luna", "gpt-6-sol"] });
   await flush();
   assert.equal(page.ids["model-fields"].disabled, false);
   assert.match(page.ids["form-hint"].textContent, /已保存/);
@@ -585,13 +585,13 @@ test("select all respects configuration load and save read-back locks", async ()
   assert.equal(page.ids["select-all-button"].disabled, true);
   page.ids["select-all-button"].emit("click");
   assert.deepEqual(page.selected(), [2, 3]);
-  verification.resolve({ account_ids: [2, 3] });
+  verification.resolve(clone(page.calls.save[0]));
   await flush();
   assert.equal(page.ids["select-all-button"].disabled, false);
   assert.deepEqual(page.calls.save[0].account_ids, [2, 3]);
 });
 
-test("status refresh enables select all for new accounts without losing unsaved selections", async () => {
+test("status refresh automatically selects new accounts without losing existing selections", async () => {
   const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }] }) };
   const page = createPage({ status });
   await flush();
@@ -600,8 +600,8 @@ test("status refresh enables select all for new accounts without losing unsaved 
   status.status_json = JSON.stringify({ accounts: [{ id: 2 }] });
   page.pollStatus();
   await flush();
-  assert.equal(page.ids["select-all-button"].disabled, false);
-  page.selectAll();
+  assert.equal(page.ids["select-all-button"].disabled, true);
+  assert.deepEqual(page.selected(), [2]);
   page.save();
   await flush();
   assert.deepEqual(page.calls.save[0].account_ids, [1, 2]);
@@ -625,7 +625,7 @@ test("selected accounts save on click, persist on read-back, and survive reopeni
   assert.equal(page.calls.load, 2, "Saving must confirm the persisted host configuration");
   const submitted = clone(page.calls.save[0]);
   submitted.account_ids.sort((a, b) => a - b);
-  assert.deepEqual(submitted, { account_ids: [1, 2], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false });
+  assert.deepEqual(submitted, { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false });
   assert.deepEqual(page.selected(), [1, 2]);
   assert.match(page.ids["form-hint"].textContent, /已保存/);
   assert.equal(page.ids["account-fields"].disabled, false);
@@ -728,7 +728,7 @@ test("the page stays locked until save read-back completes", async () => {
   assert.equal(page.ids["save-button"].disabled, true);
   assert.equal(page.ids["account-fields"].disabled, true);
   assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
-  verification.resolve({ account_ids: [2, 1] });
+  verification.resolve({ ...clone(page.calls.save[0]), account_ids: [2, 1] });
   await flush();
   assert.match(page.ids["form-hint"].textContent, /已保存/);
   assert.equal(page.ids["save-button"].disabled, false);
@@ -768,7 +768,7 @@ test("automatic images need no configuration controls", async () => {
   await flush();
   page.save();
   await flush();
-  assert.deepEqual(page.calls.save[0], { account_ids: [], enabled_models: defaultModels });
+  assert.deepEqual(page.calls.save[0], { account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
@@ -802,6 +802,8 @@ test("a rejected save preserves account edits for retry", async () => {
   } });
   await flush();
   page.check(1, true);
+  page.check(2, false);
+  page.check(3, false);
   page.save();
   await flush();
   assert.match(page.ids["form-hint"].textContent, /保存失败.*unavailable/);
@@ -810,8 +812,271 @@ test("a rejected save preserves account edits for retry", async () => {
   page.save();
   await flush();
   assert.equal(page.calls.save.length, 2);
-  assert.deepEqual(page.store.config, { account_ids: [1], enabled_models: defaultModels });
+  assert.deepEqual(page.store.config, { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
+});
+
+test("legacy unrestricted accounts display all selected and persist automatic routing on first save", async () => {
+  const page = createPage();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 2, 3]);
+  assert.match(page.ids["account-hint"].textContent, /保存一次/);
+  assert.equal(page.calls.save.length, 0);
+  page.save();
+  await flush();
+  assert.equal(page.store.config.auto_select_new_accounts, true);
+  assert.deepEqual(page.store.config.excluded_account_ids, []);
+  assert.match(page.ids["account-hint"].textContent, /无需再次打开配置页/);
+  const reopened = createPage({ store: page.store, accounts: [{ id: 1 }, { id: 4 }] });
+  await flush();
+  assert.deepEqual(reopened.selected(), [1, 4]);
+});
+
+test("legacy whitelist migration preserves unchecked and hidden excluded accounts", async () => {
+  const page = createPage({ store: { config: { account_ids: [2, 99], excluded_account_ids: [88] } } });
+  await flush();
+  assert.deepEqual(page.selected(), [2]);
+  page.save();
+  await flush();
+  assert.equal(page.store.config.auto_select_new_accounts, true);
+  assert.deepEqual(page.store.config.excluded_account_ids.sort((a, b) => a - b), [1, 3, 88]);
+  assert.deepEqual(page.store.config.account_ids, [2, 99]);
+  const reopened = createPage({ store: page.store, accounts: [{ id: 1 }, { id: 2 }, { id: 4 }, { id: 88 }, { id: 99 }] });
+  await flush();
+  assert.deepEqual(reopened.selected(), [2, 4, 99]);
+});
+
+test("legacy whitelist stays unchanged until a valid account directory arrives", async (t) => {
+  for (const status of [
+    { healthy: true, status_json: "not-json" },
+    { healthy: true, status_json: JSON.stringify({}) },
+    { healthy: true, status_json: JSON.stringify({ accounts: [] }) },
+    { healthy: true, status_json: JSON.stringify({ accounts: [null, { id: 0 }] }) },
+  ]) {
+    await t.test(status.status_json, async () => {
+      const page = createPage({ status, store: { config: { account_ids: [2], excluded_account_ids: [88] } } });
+      await flush();
+      assert.match(page.ids["account-hint"].textContent, /保留旧白名单/);
+      page.save();
+      await flush();
+      assert.notEqual(page.store.config.auto_select_new_accounts, true);
+      assert.deepEqual(page.store.config.account_ids, [2]);
+      status.status_json = JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }] });
+      page.pollStatus();
+      await flush();
+      page.save();
+      await flush();
+      assert.equal(page.store.config.auto_select_new_accounts, true);
+      assert.deepEqual(page.store.config.excluded_account_ids, [88, 1]);
+    });
+  }
+});
+
+test("automatic mode honors exclusions over snapshots and retains unsaved deselection across polling", async () => {
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }], account_ids: [1, 2], auto_select_new_accounts: true }) };
+  const page = createPage({ status, store: { config: { auto_select_new_accounts: true, account_ids: [1, 2], excluded_account_ids: [2, 88] } } });
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+  assert.match(page.ids["version-line"].textContent, /新增账号自动使用 BPS/);
+  assert.doesNotMatch(page.ids["version-line"].textContent, /固定/);
+  page.check(1, false);
+  status.status_json = JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 88 }] });
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [3, 4]);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.excluded_account_ids, [2, 88, 1]);
+});
+
+test("deselecting all known accounts excludes them while a later new account remains automatic", async () => {
+  const page = createPage();
+  await flush();
+  [1, 2, 3].forEach((id) => page.check(id, false));
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, []);
+  assert.deepEqual(page.store.config.excluded_account_ids, [1, 2, 3]);
+  const reopened = createPage({ store: page.store, accounts: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }] });
+  await flush();
+  assert.deepEqual(reopened.selected(), [4]);
+});
+
+test("select all clears visible exclusions but preserves hidden exclusions", async () => {
+  const page = createPage({ store: { config: { auto_select_new_accounts: true, excluded_account_ids: [1, 2, 88] } } });
+  await flush();
+  assert.deepEqual(page.selected(), [3]);
+  page.selectAll();
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.excluded_account_ids, [88]);
+  assert.deepEqual(page.selected(), [1, 2, 3]);
+});
+
+test("late initial configuration respects existing exclusions after status arrives first", async () => {
+  const initial = deferred();
+  const page = createPage({ load: () => initial.promise });
+  await flush();
+  initial.resolve({ auto_select_new_accounts: true, account_ids: [1], excluded_account_ids: [2] });
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+});
+
+test("out-of-order status polls cannot undo newly observed accounts or unsaved exclusions", async () => {
+  const older = deferred();
+  const newer = deferred();
+  const page = createPage({ getStatus: (number) => number === 1
+    ? Promise.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }] }) })
+    : number === 2 ? older.promise : newer.promise });
+  await flush();
+  page.check(1, false);
+  page.pollStatus();
+  page.pollStatus();
+  newer.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }] }) });
+  await flush();
+  older.resolve({ healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }] }) });
+  await flush();
+  assert.deepEqual(page.selected(), [2]);
+});
+
+test("accounts added during a migrating save stay selected through failure and retry", async () => {
+  const pending = deferred();
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }] }) };
+  let saves = 0;
+  const page = createPage({ status, store: { config: { account_ids: [1] } }, save(config, store) {
+    if (++saves === 1) return pending.promise;
+    store.config = clone(config);
+    return Promise.resolve(clone(config));
+  } });
+  await flush();
+  page.save();
+  status.status_json = JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+  pending.reject(new Error("save unavailable"));
+  await flush();
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.excluded_account_ids, [2]);
+  assert.deepEqual(page.selected(), [1, 3]);
+});
+
+test("accounts added during save verification stay automatically selected after persisted snapshot applies", async () => {
+  const verification = deferred();
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }] }) };
+  const page = createPage({ status, store: { config: { account_ids: [1] } }, load: (number, store) =>
+    number === 1 ? Promise.resolve(clone(store.config)) : verification.promise });
+  await flush();
+  page.save();
+  await flush();
+  status.status_json = JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+  page.pollStatus();
+  await flush();
+  verification.resolve(clone(page.calls.save[0]));
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.deepEqual(page.store.config.excluded_account_ids, [2]);
+  assert.deepEqual(page.selected(), [1, 3]);
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
+});
+
+test("save acknowledgement and read-back must retain automatic mode and exclusions", async (t) => {
+  for (const stage of ["acknowledgement", "read-back"]) {
+    for (const field of ["auto_select_new_accounts", "excluded_account_ids"]) {
+      await t.test(stage + " " + field, async () => {
+        const page = createPage({ store: { config: { account_ids: [1] } }, save(config, store) {
+          const changed = clone(config);
+          delete changed[field];
+          store.config = stage === "read-back" ? changed : clone(config);
+          return Promise.resolve(stage === "acknowledgement" ? changed : clone(config));
+        } });
+        await flush();
+        page.save();
+        await flush();
+        assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
+        assert.match(page.ids["form-hint"].textContent, /不一致/);
+        assert.deepEqual(page.selected(), [1]);
+      });
+    }
+  }
+});
+
+test("host-normalized null exclusions are accepted when the submitted exclusion set is empty", async () => {
+  const page = createPage({ save(config, store) {
+    store.config = { ...config, excluded_account_ids: null };
+    return Promise.resolve(clone(store.config));
+  } });
+  await flush();
+  page.save();
+  await flush();
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
+  assert.deepEqual(page.selected(), [1, 2, 3]);
+});
+
+test("degradation selection updates existing exclusions while concurrent and future new accounts stay automatic", async () => {
+  const pending = deferred();
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }] }) };
+  const page = createPage({ status, store: { config: { auto_select_new_accounts: true, account_ids: [1], excluded_account_ids: [3, 88] } }, test: () => pending.promise });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  status.status_json = JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }] });
+  page.pollStatus();
+  await flush();
+  pending.resolve({ status_json: JSON.stringify({ degradation_check: { completed: true, degraded_account_ids: [2], results: [{ account_id: 2, status: "degraded", answer: "苹果16" }] } }) });
+  await flush();
+  assert.equal(page.store.config.auto_select_new_accounts, true);
+  assert.deepEqual(page.store.config.excluded_account_ids.sort((a, b) => a - b), [1, 3, 88]);
+  assert.deepEqual(page.selected(), [2, 4]);
+  const reopened = createPage({ store: page.store, accounts: [{ id: 1 }, { id: 2 }, { id: 5 }, { id: 88 }] });
+  await flush();
+  assert.deepEqual(reopened.selected(), [2, 5]);
+});
+
+test("degradation save and read-back reject dropped automatic mode or exclusions", async (t) => {
+  for (const stage of ["acknowledgement", "read-back"]) {
+    for (const field of ["auto_select_new_accounts", "excluded_account_ids"]) {
+      await t.test(stage + " " + field, async () => {
+        let saves = 0;
+        const page = createPage({ store: { config: { account_ids: [1] } }, save(config, store) {
+          saves++;
+          const changed = clone(config);
+          if (saves === 2) delete changed[field];
+          store.config = stage === "read-back" ? changed : clone(config);
+          return Promise.resolve(stage === "acknowledgement" ? changed : clone(config));
+        }, test: () => Promise.resolve({ status_json: JSON.stringify({ degradation_check: {
+          completed: true, degraded_account_ids: [2], results: [{ account_id: 2, status: "degraded", answer: "苹果16" }],
+        } }) }) });
+        await flush();
+        page.degradationCheck();
+        await flush();
+        assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
+        assert.doesNotMatch(page.ids["form-hint"].textContent, /已自动选择/);
+        assert.deepEqual(page.selected(), [1]);
+      });
+    }
+  }
+});
+
+test("failed degradation cleanup never reselects locally excluded accounts", async () => {
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }] }) };
+  let saves = 0;
+  const page = createPage({ status, save(config, store) {
+    if (++saves > 1) return Promise.reject(new Error("cleanup unavailable"));
+    store.config = clone(config);
+    return Promise.resolve(clone(config));
+  }, test: () => Promise.reject(new Error("test unavailable")) });
+  await flush();
+  page.check(1, false);
+  page.degradationCheck();
+  await flush();
+  status.status_json = JSON.stringify({ accounts: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [2, 3]);
+  assert.deepEqual(page.calls.save[1].excluded_account_ids, [1]);
+  assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
 });
 
 function createBridgeHarness(options = {}) {

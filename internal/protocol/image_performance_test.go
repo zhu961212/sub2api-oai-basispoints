@@ -6,7 +6,7 @@ import (
 )
 
 func TestInlineImageSchemeValidationPreservesPayload(t *testing.T) {
-	for _, scheme := range []string{"data:", "DATA:", "DaTa:", " data:"} {
+	for _, scheme := range []string{"data:", "DATA:", "DaTa:"} {
 		raw := scheme + "image/png;base64,AbCdEF+/=="
 		part := map[string]any{"type": "input_image", "image_url": raw}
 		if err := validateCapabilityImage(part, true); err != nil {

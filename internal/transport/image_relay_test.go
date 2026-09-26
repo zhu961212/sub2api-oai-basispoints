@@ -180,10 +180,8 @@ func testImageRelayForwardMatrix(t *testing.T, model string) {
 					if len(ids) != 3 {
 						t.Fatalf("image count=%d; request=%s", len(ids), requestBody)
 					}
-					for _, fileID := range ids {
-						if fileID != "file-native-matrix" {
-							t.Fatal("images were not rewritten to the one native attachment")
-						}
+					if ids[0] != "file-native-matrix" || ids[1] != "" || ids[2] != "" {
+						t.Fatalf("message/tool image wire forms changed: file IDs=%v", ids)
 					}
 					var user, call map[string]any
 					for _, raw := range seen["input"].([]any) {
@@ -193,6 +191,14 @@ func testImageRelayForwardMatrix(t *testing.T, model string) {
 						}
 						if item["call_id"] == "call_arguments" {
 							call = item
+						}
+						if item["call_id"] == "call_function" || item["call_id"] == "call_custom" {
+							for _, rawPart := range item["output"].([]any) {
+								part := rawPart.(map[string]any)
+								if part["type"] == "input_image" && (part["image_url"] != inlineImage || part["file_id"] != nil || part["detail"] != "high") {
+									t.Fatalf("tool screenshot changed on wire: %#v", part)
+								}
+							}
 						}
 					}
 					parts := user["content"].([]any)

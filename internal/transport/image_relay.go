@@ -65,8 +65,11 @@ func sendImageRelayError(stream pluginv1.TransportPlugin_ForwardServer, err erro
 // bearer capabilities and must not be returned to client logs as diagnostics.
 var relayErrorToken = regexp.MustCompile("/api/bps-images/[A-Za-z0-9_-]+")
 var attachmentErrorToken = regexp.MustCompile("file-[A-Za-z0-9_-]+")
+var inlineImageErrorToken = regexp.MustCompile(`(?i)data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=]+`)
 
 func redactImageDiagnostic(text string) string {
+	// Native tool screenshots now retain data URLs; validators may echo them.
+	text = inlineImageErrorToken.ReplaceAllString(text, "data:image/[redacted]")
 	return attachmentErrorToken.ReplaceAllString(relayErrorToken.ReplaceAllString(text, "/api/bps-images/[redacted]"), "file-[redacted]")
 }
 
@@ -147,16 +150,20 @@ func hasInlineImages(source map[string]any) bool {
 	for _, value := range input {
 		item, _ := value.(map[string]any)
 		field := "content"
-		if item["type"] == "function_call_output" || item["type"] == "custom_tool_call_output" {
+		kind := strings.ToLower(protocol.StringValue(item["type"]))
+		if kind == "function_call_output" || kind == "custom_tool_call_output" {
 			field = "output"
 		}
 		parts, _ := item[field].([]any)
 		for _, value := range parts {
 			part, _ := value.(map[string]any)
-			if part["type"] != "input_image" {
+			if !strings.EqualFold(protocol.StringValue(part["type"]), "input_image") {
 				continue
 			}
 			raw, _ := part["image_url"].(string)
+			// Detect malformed spellings too so disabled rewrite/response
+			// toggles cannot bypass the strict image validation below.
+			raw = strings.TrimSpace(raw)
 			if len(raw) >= 5 && strings.EqualFold(raw[:5], "data:") {
 				return true
 			}

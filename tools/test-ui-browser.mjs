@@ -81,12 +81,15 @@ const driver = String.raw`
       if (/图片中转|公网 HTTPS|反向代理|监听地址|存储目录/.test(document.body.textContent))
         throw new Error('Obsolete image hosting instructions are still visible');
     }
-    const initial = stage === 'clear' || stage === 'all' ? [101, 202] : [];
+    const initial = stage === 'reopen-empty' || (stage === 'select' && blocked) ? [] : [101, 202];
     if (!same(selected(), initial)) throw new Error('Reopened selection was ' + JSON.stringify(selected()) + ', expected ' + JSON.stringify(initial));
     send('opened', { selected: selected(), models: selectedModels() });
     if (stage === 'reopen-empty') { send('done', { selected: selected(), models: selectedModels() }); return; }
     if (stage === 'select' && !blocked) {
       const selectAll = document.getElementById('select-all-button');
+      if (!selectAll || !selectAll.disabled) throw new Error('Legacy unrestricted accounts were not already selected');
+      for (const box of document.querySelectorAll('#account-list input:checked')) box.click();
+      if (!same(selected(), [])) throw new Error('Account checkboxes did not clear the migrated selection');
       if (!selectAll || selectAll.disabled) throw new Error('Select-all button did not become ready');
       selectAll.click();
       if (!selectAll.disabled) throw new Error('Select-all button stayed enabled after every account was selected');
@@ -133,6 +136,7 @@ const host = `
   const expectBlocked = ${JSON.stringify(expectBlocked)};
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  // Saved configuration uses catalog order; the UI groups model generations separately.
   const models = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra', 'gpt-5.6-luna'];
   const defaultModels = ['gpt-6-astra', 'gpt-5.6-sol'];
   const subset = ['gpt-6-sol', 'gpt-5.6-luna'];
@@ -183,6 +187,8 @@ const host = `
       if (data.type !== 'done') return;
       if (stage === 'select') {
         if (saveCount !== 1 || !same(config.account_ids, [101, 202])) return void finish(false, { error: 'Selected accounts were not persisted by the host' });
+        if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, []))
+          return void finish(false, { error: 'Legacy unrestricted accounts were not migrated to automatic selection' });
         if (!same(config.enabled_models, subset)) return void finish(false, { error: 'Model subset was not persisted by the host' });
         return reopen('all');
       }
@@ -194,6 +200,8 @@ const host = `
       if (stage === 'clear') {
         if (saveCount !== 3 || !same(config.account_ids, []) || !same(config.enabled_models, []))
           return void finish(false, { error: 'Empty account and model selections were not persisted by the host' });
+        if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, [101, 202]))
+          return void finish(false, { error: 'Cleared accounts were not persisted as explicit exclusions' });
         return reopen('reopen-empty');
       }
       return void finish(true, { checkedSelectionSurvivedReopen: true, emptySelectionSurvivedReopen: true,

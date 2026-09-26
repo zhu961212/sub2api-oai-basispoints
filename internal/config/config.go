@@ -15,7 +15,7 @@ import (
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.5.22"
+	Version = "0.5.24"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -58,9 +58,13 @@ type Config struct {
 	// EnabledModels 控制模型接管；nil 表示默认双模型，非 nil 空切片表示全部关闭。
 	EnabledModels  []string `json:"enabled_models"`
 	TimeoutSeconds int      `json:"timeout_seconds"`
-	// AccountIDs 限定使用这些账号（在它们之间轮询）。为空表示不限制，
-	// 完全跟随宿主调度。
+	// AccountIDs 在旧模式下是账号白名单；为空表示不限制。插件始终使用宿主
+	// 调度的账号，不参与轮询。自动模式下这里只保存界面已选账号的快照。
 	AccountIDs []int64 `json:"account_ids"`
+	// AutoSelectNewAccounts 允许当前及未来新增账号，只有明确取消的账号例外。
+	// 缺省 false 保留旧白名单，配置页保存时迁移为自动模式。
+	AutoSelectNewAccounts bool    `json:"auto_select_new_accounts,omitempty"`
+	ExcludedAccountIDs    []int64 `json:"excluded_account_ids,omitempty"`
 	// DegradationCheck is a one-shot request marker consumed by TestConfig.
 	// The UI sets it immediately before config.test and clears it after the
 	// result has been applied. It is deliberately persisted by the host for the
@@ -204,6 +208,7 @@ func (c *Config) Normalize() error {
 		return fmt.Errorf("max_response_bytes must be between 64 KiB and 128 MiB")
 	}
 	c.AccountIDs = normalizeAccountIDs(c.AccountIDs)
+	c.ExcludedAccountIDs = normalizeAccountIDs(c.ExcludedAccountIDs)
 	c.ToolsVersionID = strings.TrimSpace(c.ToolsVersionID)
 	models, err := normalizeEnabledModels(c.EnabledModels)
 	if err != nil {
@@ -217,13 +222,40 @@ func (c *Config) Normalize() error {
 func (c Config) Clone() Config {
 	c.EnabledModels = cloneStrings(c.EnabledModels)
 	c.AccountIDs = append([]int64(nil), c.AccountIDs...)
+	c.ExcludedAccountIDs = append([]int64(nil), c.ExcludedAccountIDs...)
 	return c
 }
 
-// SelectedAccountIDs 返回生效的账号限定列表（去重、过滤非法值）。
-// 为空表示不限制账号，完全跟随宿主调度。
+// SelectedAccountIDs 返回规范化的账号选择。旧模式下为空表示不限制账号；
+// 自动模式下它只是界面快照，实际路由必须使用 HandlesAccount。
 func (c Config) SelectedAccountIDs() []int64 {
 	return normalizeAccountIDs(c.AccountIDs)
+}
+
+// HandlesAccount 只判断当前调度账号是否使用 BPS，不读取或改写宿主账号目录。
+// 自动模式下，未见过的新 ID 默认接入；排除项随配置持久化，重启后仍生效。
+func (c Config) HandlesAccount(accountID int64) bool {
+	if accountID == 0 {
+		return true // 兼容未提供账号 ID 的旧宿主。
+	}
+	if c.AutoSelectNewAccounts {
+		for _, excluded := range c.ExcludedAccountIDs {
+			if excluded == accountID {
+				return false
+			}
+		}
+		return true
+	}
+	ids := c.SelectedAccountIDs()
+	if len(ids) == 0 {
+		return true
+	}
+	for _, selected := range ids {
+		if selected == accountID {
+			return true
+		}
+	}
+	return false
 }
 
 // HandlesModel 报告某个模型名是否由本插件接管（= 请求打到 Basis Points）。

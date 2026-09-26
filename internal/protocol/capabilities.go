@@ -20,8 +20,8 @@ func ValidateRequestCapabilities(source map[string]any) error {
 	return validateRequestCapabilities(source, false)
 }
 
-// ValidateImageUploadCapabilities checks the request before inline images are
-// uploaded as native BPS attachments. No public download route is required.
+// ValidateImageUploadCapabilities checks the request before image processing.
+// User images become attachments; tool screenshots use native inline content.
 func ValidateImageUploadCapabilities(source map[string]any) error {
 	return validateRequestCapabilities(source, true)
 }
@@ -73,13 +73,19 @@ func validateRequestCapabilities(source map[string]any, allowInline bool) error 
 	items, _ := source["input"].([]any)
 	for index, raw := range items {
 		item := objectValue(raw)
-		switch stringValue(item["type"]) {
+		switch kind := strings.ToLower(stringValue(item["type"])); kind {
 		case "item_reference":
 			return capabilityError("Basis Points requires expanded conversation history instead of item_reference")
 		case "configuration_update":
 			return capabilityError("Basis Points does not support configuration_update; send the desired reasoning effort on the request")
 		case "function_call_output", "custom_tool_call_output":
-			if err := validateCapabilityContent(item["output"], fmt.Sprintf("input[%d].output", index), allowInline); err != nil {
+			if item["type"] != kind {
+				return capabilityError(fmt.Sprintf("tool output type must use its exact protocol spelling (path=input[%d])", index))
+			}
+			// The official BPS client returns tool screenshots as data URLs.
+			// The attachment layer still validates their bytes and resource
+			// limits, but must not convert them into user attachment IDs.
+			if err := validateCapabilityContent(item["output"], fmt.Sprintf("input[%d].output", index), true); err != nil {
 				return err
 			}
 		}
@@ -158,8 +164,11 @@ func validateCapabilityContent(value any, path string, allowInline bool) error {
 	parts, _ := value.([]any)
 	for index, raw := range parts {
 		part := objectValue(raw)
-		switch stringValue(part["type"]) {
+		switch strings.ToLower(stringValue(part["type"])) {
 		case "input_image":
+			if part["type"] != "input_image" {
+				return capabilityError(fmt.Sprintf("image type must be input_image (path=%s[%d])", path, index))
+			}
 			if err := validateCapabilityImage(part, allowInline); err != nil {
 				return capabilityError(fmt.Sprintf("%s (path=%s[%d]; type=input_image)", err.Error(), path, index))
 			}
@@ -188,6 +197,9 @@ func validateCapabilityImage(part map[string]any, allowInline bool) error {
 	// base64 payload needlessly scans and allocates the entire image.
 	trimmed := strings.TrimSpace(raw)
 	if len(trimmed) >= 5 && strings.EqualFold(trimmed[:5], "data:") {
+		if raw != trimmed {
+			return capabilityError("inline image data URL must not contain surrounding whitespace")
+		}
 		if !allowInline {
 			return capabilityError("inline image was not uploaded as a native attachment")
 		}

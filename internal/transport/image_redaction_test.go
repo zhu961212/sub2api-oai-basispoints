@@ -1,6 +1,8 @@
 package transport
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -8,6 +10,53 @@ import (
 
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
+
+func TestInlineImageFailureDiagnosticsDoNotExposeScreenshot(t *testing.T) {
+	_, dataURL := relayTestImage(t)
+	for _, event := range []string{"error", "response.failed", "response.incomplete"} {
+		payload := map[string]any{"type": event, "message": "invalid screenshot: " + dataURL, "error": map[string]any{"message": dataURL}}
+		normalizeRelayFailure(event, payload)
+		encoded := string(protocol.JSONBytes(payload))
+		if strings.Contains(encoded, dataURL) || !strings.Contains(encoded, "data:image/[redacted]") || !strings.Contains(encoded, "invalid screenshot") {
+			t.Fatalf("inline screenshot escaped %s diagnostics", event)
+		}
+	}
+	output := []any{map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": dataURL}}}}
+	raw := protocol.JSONBytes(map[string]any{"status": "failed", "error": map[string]any{"message": dataURL}, "output": output})
+	redacted, changed := redactImageFailureJSON(raw, "")
+	if !changed || strings.Count(string(redacted), dataURL) != 1 {
+		t.Fatal("image redaction changed ordinary output or left the diagnostic unredacted")
+	}
+}
+
+func TestInlineToolImageUpstream422RedactsImageWithoutRetry(t *testing.T) {
+	_, dataURL := relayTestImage(t)
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/responses" {
+			t.Error("tool screenshot unexpectedly uploaded")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write(protocol.JSONBytes(map[string]any{"error": map[string]any{"message": "invalid screenshot: " + dataURL}}))
+	}))
+	defer upstream.Close()
+	transport := New()
+	defer transport.Shutdown()
+	applyConfig(t, transport, map[string]any{"responses_url": upstream.URL + "/responses"})
+	body := protocol.JSONBytes(map[string]any{"model": protocol.DefaultModelID, "input": []any{
+		map[string]any{"type": "function_call", "name": "screenshot", "call_id": "call_image_redaction", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": "call_image_redaction", "output": []any{map[string]any{"type": "input_image", "image_url": dataURL}}},
+	}})
+	result := runForward(t, transport, requestFrames(t, upstream.URL, token(t, "acct-tool-image"), nil, body))
+	if result.errFrame != nil || result.status != http.StatusUnprocessableEntity || !result.ended || calls != 1 {
+		t.Fatalf("unexpected failure framing or retry: status=%d calls=%d", result.status, calls)
+	}
+	if strings.Contains(string(result.body), dataURL) || !strings.Contains(string(result.body), "data:image/[redacted]") {
+		t.Fatal("upstream validation exposed tool screenshot bytes")
+	}
+}
 
 func TestImageScopeDoesNotTrustAccountFingerprintSession(t *testing.T) {
 	start := &pluginv1.ForwardRequestStart{AccountId: 7, Headers: map[string]*pluginv1.HeaderValues{

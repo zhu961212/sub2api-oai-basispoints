@@ -1,11 +1,10 @@
 /* 配置页脚本：配置模型与账号路由。图片和截图直接随对话发送，无需额外配置。
  *
  * 语义：
- *   - 账号一个都不勾 → 不做账号限制：命中插件灰度的账号可走 Basis Points；
- *   - 勾选若干账号 → 白名单：只有这些账号可走 Basis Points，其他账号的请求由插件
- *     原样透传到宿主原本指定的上游（等同于没有启用插件）。
+ *   - 新增账号默认走 Basis Points，取消勾选的账号保存在排除名单里。
+ *   - 旧账号白名单在成功读取目录后随第一次保存迁移，保留原有可见账号选择。
  *   - 只转发选中的模型，默认 gpt-6-astra、gpt-5.6-sol，保留各自模型名。
- *   - 模型全部取消勾选 → 所有模型原样透传（与账号留空的语义不同）。
+ *   - 模型全部取消勾选 → 所有模型原样透传，包括未来新增的账号。
  *
  * 无论是否勾选，**凭据与代理始终来自宿主本次调度的那个账号**：宿主带了出站令牌
  * 就直接用；宿主只负责调度、令牌由插件取时，插件按同一个账号解析身份（连同该账号
@@ -31,6 +30,8 @@
     "enabled_models",
     "timeout_seconds",
     "account_ids",
+    "auto_select_new_accounts",
+    "excluded_account_ids",
     "max_response_bytes",
     "auth_mode",
     "tools_version_id",
@@ -43,6 +44,12 @@
   var bridge = bridgeFactory.create({});
   var loaded = {};
   var selectedIDs = [];
+  var excludedIDs = [];
+  var autoSelectNewAccounts = false;
+  var accountDirectoryReady = false;
+  var knownAccountIDs = [];
+  var statusRequestID = 0;
+  var statusAppliedID = 0;
   var selectedModels = DEFAULT_MODELS.slice();
   var accounts = [];
   var pollTimer = null;
@@ -200,6 +207,28 @@
     return account && Number.isSafeInteger(account.id) && account.id > 0;
   }
 
+  function setAccountSelected(accountID, selected) {
+    selectedIDs = selectedIDs.filter(function (value) { return value !== accountID; });
+    excludedIDs = excludedIDs.filter(function (value) { return value !== accountID; });
+    if (selected) selectedIDs.push(accountID);
+    else excludedIDs.push(accountID);
+  }
+
+  function syncAutomaticAccounts() {
+    if (!autoSelectNewAccounts) return;
+    selectedIDs = selectedIDs.filter(function (value) { return excludedIDs.indexOf(value) < 0; });
+    accounts.forEach(function (account) {
+      if (excludedIDs.indexOf(account.id) < 0 && !isSelected(account.id)) selectedIDs.push(account.id);
+    });
+  }
+
+  function adoptSubmittedAccountPolicy(config) {
+    if (config.auto_select_new_accounts !== true || autoSelectNewAccounts) return;
+    autoSelectNewAccounts = true;
+    excludedIDs = configAccountIDs(config, "excluded_account_ids");
+    syncAutomaticAccounts();
+  }
+
   function updateAccountActions() {
     var hasUnselectedAccount = accounts.some(function (account) {
       return isSelectableAccount(account) && !isSelected(account.id);
@@ -214,7 +243,7 @@
     // 只补选当前列表中的账号；保留已保存但暂未出现在状态列表里的账号。
     accounts.forEach(function (account) {
       if (isSelectableAccount(account) && !isSelected(account.id)) {
-        selectedIDs.push(account.id);
+        setAccountSelected(account.id, true);
       }
     });
     renderAccountList();
@@ -251,13 +280,7 @@
           return;
         }
         var value = Number.parseInt(box.value, 10);
-        var at = selectedIDs.indexOf(value);
-        if (box.checked && at < 0) {
-          selectedIDs.push(value);
-        }
-        if (!box.checked && at >= 0) {
-          selectedIDs.splice(at, 1);
-        }
+        setAccountSelected(value, box.checked);
         renderAccountHint();
       });
       var text = document.createElement("span");
@@ -272,18 +295,19 @@
     updateAccountActions();
     var hint = id("account-hint");
     var count = selectedIDs.length;
-    if (count === 0) {
-      hint.textContent = "账号未勾选 = 不做账号限制：命中插件灰度的账号可使用上方选中的模型走 Basis Points。";
-      return;
-    }
     hint.textContent =
-      "已勾选 " + count + " 个账号 = 只有这些账号可使用上方选中的模型走 Basis Points；其他账号的请求原样透传给宿主的上游。";
+      "已勾选 " + count + " 个账号；取消勾选的账号原样透传。" +
+      (loaded.auto_select_new_accounts === true
+        ? "新增账号会自动勾选并使用 BPS，无需再次打开配置页；全部取消只排除已有账号。"
+        : (!autoSelectNewAccounts && !accountDirectoryReady
+          ? "尚未成功获取账号目录，暂时保留旧白名单；获取目录后保存一次即可启用新增账号自动使用 BPS。"
+          : "请保存一次以启用新增账号自动使用 BPS，之后无需再次打开配置页。"));
   }
 
   function renderModelHint() {
     id("model-hint").textContent = selectedModels.length
       ? "已选择 " + selectedModels.length + " 个模型走 Basis Points，保留各自模型名；未选模型原样透传。默认选择 gpt-6-astra 和 gpt-5.6-sol。"
-      : "未选择任何模型：所有模型原样透传，不走 Basis Points。账号留空仍表示不限制账号。";
+      : "未选择任何模型：所有模型原样透传，不走 Basis Points。";
   }
 
   function renderModelList() {
@@ -325,6 +349,18 @@
       }
     });
     config.account_ids = selectedIDs.length ? selectedIDs.slice() : [];
+    // 旧非空白名单必须先拿到有效目录，才能保留已知未勾选账号的透传行为。
+    if (autoSelectNewAccounts || accountDirectoryReady) {
+      config.auto_select_new_accounts = true;
+      config.excluded_account_ids = excludedIDs.slice();
+      if (!autoSelectNewAccounts) {
+        knownAccountIDs.forEach(function (accountID) {
+          var at = config.excluded_account_ids.indexOf(accountID);
+          if (isSelected(accountID) && at >= 0) config.excluded_account_ids.splice(at, 1);
+          if (!isSelected(accountID) && at < 0) config.excluded_account_ids.push(accountID);
+        });
+      }
+    }
     config.enabled_models = MODEL_IDS.filter(function (model) {
       return selectedModels.indexOf(model) >= 0;
     });
@@ -336,8 +372,8 @@
     return config;
   }
 
-  function configAccountIDs(config) {
-    var ids = Array.isArray(config.account_ids) ? config.account_ids : [];
+  function configAccountIDs(config, key) {
+    var ids = Array.isArray(config[key || "account_ids"]) ? config[key || "account_ids"] : [];
     var normalized = [];
     ids.forEach(function (value) {
       if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
@@ -373,9 +409,20 @@
     });
   }
 
+  function sameAccountPolicy(config, expected) {
+    if (!sameAccountIDs(config, expected.account_ids)) return false;
+    if ((config.auto_select_new_accounts === true) !== (expected.auto_select_new_accounts === true)) return false;
+    var actual = configAccountIDs(config, "excluded_account_ids");
+    var excluded = configAccountIDs(expected, "excluded_account_ids");
+    return actual.length === excluded.length && excluded.every(function (value) { return actual.indexOf(value) >= 0; });
+  }
+
   function applyConfig(config) {
     loaded = config && typeof config === "object" && !Array.isArray(config) ? Object.assign({}, config) : {};
     selectedIDs = configAccountIDs(loaded);
+    excludedIDs = configAccountIDs(loaded, "excluded_account_ids");
+    autoSelectNewAccounts = loaded.auto_select_new_accounts === true || selectedIDs.length === 0;
+    syncAutomaticAccounts();
     selectedModels = configModels(loaded);
     renderModelList();
     renderAccountList();
@@ -399,14 +446,20 @@
     // 每个账号只渲染一个复选框，避免重复状态行显示不同的勾选状态。
     // 过滤后再判断空列表，保留已保存但当前不可见的账号选择。
     var seenIDs = [];
-    accounts = (Array.isArray(details.accounts) ? details.accounts : []).filter(function (account) {
+    var directory = Array.isArray(details.accounts) ? details.accounts : [];
+    // 旧宿主把目录查询失败也显示成 []；空列表不能作为白名单迁移依据。
+    if (directory.some(isSelectableAccount)) accountDirectoryReady = true;
+    accounts = directory.filter(function (account) {
       if (!isSelectableAccount(account) || seenIDs.indexOf(account.id) >= 0) {
         return false;
       }
       seenIDs.push(account.id);
+      if (knownAccountIDs.indexOf(account.id) < 0) knownAccountIDs.push(account.id);
       return true;
     });
+    syncAutomaticAccounts();
     renderAccountList();
+    renderAccountHint();
     if (details.degradation_check) {
       renderDegradationResult(details.degradation_check);
     }
@@ -420,7 +473,9 @@
     if (Array.isArray(activeModels)) {
       line.push(activeModels.length ? "已启用模型 " + activeModels.join(", ") : "未启用模型（全部透传）");
     }
-    if (Array.isArray(details.account_ids) && details.account_ids.length) {
+    if (details.auto_select_new_accounts === true) {
+      line.push("新增账号自动使用 BPS");
+    } else if (Array.isArray(details.account_ids) && details.account_ids.length) {
       line.push("固定 #" + details.account_ids.join(" #"));
     }
     line.push(snapshot.message || (healthy ? "ready" : "未运行"));
@@ -429,10 +484,17 @@
   }
 
   function refreshStatus() {
+    var requestID = ++statusRequestID;
     return bridge
       .status()
-      .then(renderStatus)
+      .then(function (status) {
+        if (requestID < statusAppliedID) return;
+        statusAppliedID = requestID;
+        renderStatus(status);
+      })
       .catch(function (error) {
+        if (requestID < statusAppliedID) return;
+        statusAppliedID = requestID;
         setChip("宿主未响应", "warn");
         id("version-line").textContent = error.message + "。" + diagnosis();
         scheduleResize();
@@ -485,6 +547,7 @@
       return;
     }
     var submitted = readForm();
+    adoptSubmittedAccountPolicy(submitted);
     saving = true;
     updateControls();
     var writeAcknowledged = false;
@@ -492,8 +555,8 @@
     bridge
       .saveConfig(submitted)
       .then(function (normalized) {
-        if (!sameAccountIDs(normalized, submitted.account_ids)) {
-          throw new Error("宿主返回的账号选择与提交内容不一致");
+        if (!sameAccountPolicy(normalized, submitted)) {
+          throw new Error("宿主返回的账号选择、自动接入模式或排除名单与提交内容不一致");
         }
         if (!sameModels(normalized, submitted.enabled_models)) {
           throw new Error("宿主返回的模型选择与提交内容不一致");
@@ -503,8 +566,8 @@
         return bridge.loadConfig();
       })
       .then(function (persisted) {
-        if (!sameAccountIDs(persisted, submitted.account_ids)) {
-          throw new Error("重新读取的账号选择与提交内容不一致，请重试或检查宿主日志");
+        if (!sameAccountPolicy(persisted, submitted)) {
+          throw new Error("重新读取的账号选择、自动接入模式或排除名单与提交内容不一致，请重试或检查宿主日志");
         }
         if (!sameModels(persisted, submitted.enabled_models)) {
           throw new Error("重新读取的模型选择与提交内容不一致，请重试或检查宿主日志");
@@ -539,19 +602,27 @@
       return;
     }
     var trigger = readForm();
+    adoptSubmittedAccountPolicy(trigger);
     trigger.degradation_check = true;
     var triggerSaved = false;
     var finalSaved = false;
     var check;
-    var selectedForCheck = selectedIDs.slice();
+    var finalConfig;
+    // 只调整检测启动时已知账号，检测和保存途中新增账号继续自动接入。
+    var checkedAccountIDs = knownAccountIDs.concat(trigger.account_ids).filter(function (value, index, values) {
+      return values.indexOf(value) === index;
+    });
     degradationChecking = true;
     saving = true;
     updateControls();
     setHint("正在逐个账号发送检测问题，请稍候…");
     bridge
       .saveConfig(trigger)
-      .then(function () {
+      .then(function (normalized) {
         triggerSaved = true;
+        if (!sameAccountPolicy(normalized, trigger) || !sameModels(normalized, trigger.enabled_models)) {
+          throw new Error("宿主返回的账号路由或模型选择与检测前不一致");
+        }
         setHint("检测请求已启动，正在等待账号回答…");
         return bridge.testConfig();
       })
@@ -562,23 +633,33 @@
           throw new Error("降智检测尚未完成，请稍后重试");
         }
         var degraded = confirmedDegradedIDs(check);
-        // 空结果不能写成 account_ids=[] 来表示“选择零账号”：在插件配置
-        // 语义里空数组代表不限制账号。没有降智账号时保留现有选择，避免
-        // 一键检测反而把全部健康账号放进插件路由。
+        finalConfig = Object.assign({}, trigger, { degradation_check: false });
+        // 没有有效疑似账号时保持原有选择；检测失败不代表降智。
         if (degraded.length > 0) {
-          selectedForCheck = degraded.slice();
+          finalConfig.account_ids = degraded.slice();
+          if (trigger.auto_select_new_accounts === true) {
+            finalConfig.excluded_account_ids = trigger.excluded_account_ids.filter(function (value) {
+              return degraded.indexOf(value) < 0;
+            });
+            checkedAccountIDs.forEach(function (accountID) {
+              if (degraded.indexOf(accountID) < 0 && finalConfig.excluded_account_ids.indexOf(accountID) < 0) {
+                finalConfig.excluded_account_ids.push(accountID);
+              }
+            });
+            selectedIDs.forEach(function (accountID) {
+              if (checkedAccountIDs.indexOf(accountID) < 0 && finalConfig.account_ids.indexOf(accountID) < 0 &&
+                  finalConfig.excluded_account_ids.indexOf(accountID) < 0) finalConfig.account_ids.push(accountID);
+            });
+          }
         }
-        var finalConfig = readForm();
-        finalConfig.account_ids = selectedForCheck.slice();
-        finalConfig.degradation_check = false;
         setHint(
           degraded.length > 0
             ? "检测完成，正在保存 " + degraded.length + " 个降智账号…"
             : "没有可自动选择的检测结果，正在保留原账号选择并清除检测标记…"
         );
         return bridge.saveConfig(finalConfig).then(function (normalized) {
-          if (!sameAccountIDs(normalized, selectedForCheck)) {
-            throw new Error("宿主返回的降智账号选择与检测结果不一致");
+          if (!sameAccountPolicy(normalized, finalConfig) || !sameModels(normalized, finalConfig.enabled_models)) {
+            throw new Error("宿主返回的降智账号路由或模型选择与检测结果不一致");
           }
           finalSaved = true;
           return bridge.loadConfig();
@@ -589,8 +670,8 @@
           throw new Error("宿主未返回降智检测结果");
         }
         var degraded = confirmedDegradedIDs(check);
-        if (!sameAccountIDs(persisted, selectedForCheck)) {
-          throw new Error("重新读取的降智账号选择与检测结果不一致");
+        if (!sameAccountPolicy(persisted, finalConfig)) {
+          throw new Error("重新读取的降智账号选择、自动接入模式或排除名单与检测结果不一致");
         }
         if (!sameModels(persisted, selectedModels)) {
           throw new Error("重新读取的模型选择与检测前不一致");
@@ -609,8 +690,7 @@
       .catch(function (error) {
         // 检测或收尾失败时也清除触发位，避免下次宿主启动重复检测。
         if (triggerSaved && !finalSaved) {
-          var cleanup = readForm();
-          cleanup.degradation_check = false;
+          var cleanup = Object.assign({}, trigger, { degradation_check: false });
           return bridge.saveConfig(cleanup).catch(function () {}).then(function () {
             throw error;
           });

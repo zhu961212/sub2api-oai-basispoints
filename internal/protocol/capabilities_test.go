@@ -95,7 +95,6 @@ func TestCapabilityImagesPreserveHTTPSAndRejectUnsupportedSources(t *testing.T) 
 		}
 	}
 	for _, invalid := range []map[string]any{
-		{"image_url": "data:image/png;base64,PRIVATE"},
 		{"image_url": "http://images.example/PRIVATE"},
 		{"image_url": "file:///PRIVATE.png"},
 		{"image_url": "https:///PRIVATE.png"},
