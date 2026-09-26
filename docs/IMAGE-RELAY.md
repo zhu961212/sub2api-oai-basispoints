@@ -55,7 +55,7 @@
 
 - 400 invalid_image / unsupported_capability：按 path=input[n].content[m] 或 output[m] 检查图片数据、大小、引用和 detail。错误不回显 Base64、真实文件 ID 或图片内容。
 - 401 / 403 attachment_upload_error：当前账号的原生附件请求被上游拒绝，检查该账号授权和访问权限。
-- 429 attachment_upload_error：附件接口限流，稍后重试。
+- PLUGIN_RATE_LIMITED：BPS Responses 或附件接口返回 HTTP 429，稍后重试。0.5.22 起通过插件错误帧隔离，避免误暂停宿主 Codex 账号；当前官方宿主通常返回 502 或流式失败，原始 429 可在宿主诊断查看。
 - 502 invalid_attachment_response / attachment_transport：附件接口返回无效文件 ID、异常响应，或当前账号的代理/网络请求失败。
 - 413 request_too_large / 503 image_request_busy / attachment_busy：减小图片请求或稍后重试。
 

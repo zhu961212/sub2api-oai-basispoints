@@ -106,6 +106,8 @@ function createPage(options = {}) {
     "version-line": "footer",
     "save-button": "button",
     "select-all-button": "button",
+    "degradation-check-button": "button",
+    "degradation-result": "div",
     "retry-button": "button",
   };
   for (const [id, tagName] of Object.entries(tags)) {
@@ -120,11 +122,13 @@ function createPage(options = {}) {
   ids["model-fields"].appendChild(ids["model-list"]);
   ids["model-fields"].appendChild(ids["model-hint"]);
   ids["account-fields"].appendChild(ids["select-all-button"]);
+  ids["account-fields"].appendChild(ids["degradation-check-button"]);
   ids["account-fields"].appendChild(ids["account-list"]);
   ids["account-fields"].appendChild(ids["account-hint"]);
+  ids["account-fields"].appendChild(ids["degradation-result"]);
   ids["config-form"].appendChild(ids["save-button"]);
   ids["config-form"].appendChild(ids["retry-button"]);
-  const calls = { load: 0, save: [], status: 0, ready: 0 };
+  const calls = { load: 0, save: [], test: 0, status: 0, ready: 0 };
   const status = options.status || {
     healthy: true,
     message: "ready",
@@ -149,6 +153,13 @@ function createPage(options = {}) {
       if (options.save) return options.save(clone(config), store);
       store.config = clone(config);
       return Promise.resolve(clone(store.config));
+    },
+    testConfig() {
+      calls.test++;
+      if (options.test) return options.test(calls.test, store);
+      return Promise.resolve({ status_json: JSON.stringify({
+        degradation_check: { completed: true, degraded_account_ids: [], results: [] },
+      }) });
     },
   };
   const windowListeners = new Map();
@@ -187,6 +198,7 @@ function createPage(options = {}) {
     },
     save: () => ids["save-button"].click(),
     selectAll: () => ids["select-all-button"].click(),
+    degradationCheck: () => ids["degradation-check-button"].click(),
     pollStatus: () => pollStatus(),
     retry: () => ids["retry-button"].click(),
   };
@@ -372,6 +384,147 @@ test("select all is disabled when the list is empty and preserves hidden saved I
   page.save();
   await flush();
   assert.deepEqual(page.calls.save[0].account_ids, [99]);
+});
+
+test("degradation check selects returned degraded accounts and clears its trigger", async () => {
+  const store = { config: { account_ids: [1], enabled_models: defaultModels, degradation_check: false } };
+  const page = createPage({
+    store,
+    test: () => Promise.resolve({ status_json: JSON.stringify({
+      degradation_check: {
+        completed: true,
+        expected: "苹果17",
+        degraded_account_ids: [2],
+        results: [
+          { account_id: 1, status: "ok", answer: "苹果17" },
+          { account_id: 2, status: "degraded", answer: "苹果16" },
+          { account_id: 3, status: "skipped", error: "account is not schedulable" },
+        ],
+      },
+    }) }),
+  });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.equal(page.calls.test, 1);
+  assert.deepEqual(page.calls.save[0].degradation_check, true);
+  assert.deepEqual(page.calls.save[1].account_ids, [2]);
+  assert.equal(page.calls.save[1].degradation_check, false);
+  assert.deepEqual(page.store.config.account_ids, [2]);
+  assert.equal(page.store.config.degradation_check, false);
+  assert.deepEqual(page.selected(), [2]);
+  assert.match(page.ids["form-hint"].textContent, /已自动选择 1 个降智账号/);
+  assert.match(page.ids["degradation-result"].children.map((item) => item.textContent).join(" "), /#2 · 疑似降智/);
+});
+
+test("degradation check keeps the existing account scope when none are degraded", async () => {
+  const store = { config: { account_ids: [1], enabled_models: defaultModels, degradation_check: false } };
+  const page = createPage({
+    store,
+    test: () => Promise.resolve({ status_json: JSON.stringify({
+      degradation_check: { completed: true, degraded_account_ids: [], results: [] },
+    }) }),
+  });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.deepEqual(page.calls.save[1].account_ids, [1]);
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.match(page.ids["form-hint"].textContent, /保留原账号选择/);
+});
+
+test("degradation check excludes failed skipped empty and conflicting verdicts", async () => {
+  const store = { config: { account_ids: [1], enabled_models: defaultModels, degradation_check: false } };
+  const page = createPage({
+    store,
+    test: () => Promise.resolve({ status_json: JSON.stringify({
+      degradation_check: {
+        completed: true,
+        degraded_account_ids: [2, 3, 4, 5, 6, 7, 8, 99],
+        results: [
+          { account_id: 2, status: "error", error: "HTTP 429" },
+          { account_id: 3, status: "error", error: "HTTP 401" },
+          { account_id: 4, status: "error", error: "HTTP 403" },
+          { account_id: 5, status: "error", error: "deadline exceeded" },
+          { account_id: 6, status: "skipped" },
+          { account_id: 7, status: "degraded", answer: "   " },
+          { account_id: 8, status: "degraded", answer: "苹果16" },
+          { account_id: 8, status: "error", error: "HTTP 429" },
+        ],
+      },
+    }) }),
+  });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.deepEqual(page.calls.save[1].account_ids, [1]);
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.deepEqual(page.selected(), [1]);
+  assert.equal(page.store.config.degradation_check, false);
+});
+
+test("all failed degradation probes report no valid answer and preserve scope", async () => {
+  const store = { config: { account_ids: [1], enabled_models: defaultModels } };
+  const page = createPage({
+    store,
+    test: () => Promise.resolve({ status_json: JSON.stringify({
+      degradation_check: {
+        completed: true, degraded_account_ids: [],
+        results: [{ account_id: 1, status: "error", error: "HTTP 429" }],
+      },
+    }) }),
+  });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.match(page.ids["form-hint"].textContent, /未获得有效回答/);
+  assert.match(page.ids["form-hint"].className, /hint-error/);
+  assert.match(page.ids["degradation-result"].children.map((item) => item.textContent).join(" "), /未获得有效回答/);
+});
+
+test("a failed degradation result save restores the original scope", async () => {
+  let saves = 0;
+  const store = { config: { account_ids: [1], enabled_models: defaultModels } };
+  const page = createPage({
+    store,
+    save: (config, target) => {
+      saves++;
+      if (saves === 2) return Promise.reject(new Error("save unavailable"));
+      target.config = clone(config);
+      return Promise.resolve(clone(target.config));
+    },
+    test: () => Promise.resolve({ status_json: JSON.stringify({
+      degradation_check: {
+        completed: true, degraded_account_ids: [2],
+        results: [{ account_id: 2, status: "degraded", answer: "苹果16" }],
+      },
+    }) }),
+  });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.equal(page.calls.save.length, 3);
+  assert.deepEqual(page.calls.save[1].account_ids, [2]);
+  assert.deepEqual(page.calls.save[2].account_ids, [1]);
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.deepEqual(page.selected(), [1]);
+  assert.equal(page.store.config.degradation_check, false);
+  assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
+  assert.equal(page.ids["save-button"].disabled, false);
+});
+
+test("a rejected degradation test clears its trigger without changing account scope", async () => {
+  const store = { config: { account_ids: [1], enabled_models: defaultModels } };
+  const page = createPage({ store, test: () => Promise.reject(new Error("test timed out")) });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.deepEqual(page.selected(), [1]);
+  assert.equal(page.store.config.degradation_check, false);
+  assert.match(page.ids["form-hint"].textContent, /降智检测失败/);
+  assert.equal(page.ids["save-button"].disabled, false);
 });
 
 test("an invalid-only account list shows the empty state and retains saved selections", async () => {
@@ -617,6 +770,13 @@ test("automatic images need no configuration controls", async () => {
   await flush();
   assert.deepEqual(page.calls.save[0], { account_ids: [], enabled_models: defaultModels });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
+});
+
+test("degradation check control is wired through the existing bridge", () => {
+  assert.match(htmlSource, /id="degradation-check-button"/);
+  assert.match(htmlSource, /id="degradation-result"/);
+  assert.match(appSource, /handleDegradationCheck/);
+  assert.match(appSource, /degradation_check/);
 });
 
 test("opening configuration does not save before loading or mutate stored settings", async () => {

@@ -318,6 +318,23 @@ func TestCloneIsDeepCopy(t *testing.T) {
 	}
 }
 
+func TestDegradationCheckFlagIsTransientButStrictlyParsed(t *testing.T) {
+	defaultConfig, err := Parse([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultConfig.DegradationCheck {
+		t.Fatal("degradation check must be disabled by default")
+	}
+	requested, err := Parse([]byte(`{"degradation_check":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !requested.DegradationCheck {
+		t.Fatal("degradation check flag was not preserved")
+	}
+}
+
 func TestNormalizeEffortTable(t *testing.T) {
 	cases := []struct {
 		input any

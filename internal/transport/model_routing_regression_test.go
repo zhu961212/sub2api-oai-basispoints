@@ -116,6 +116,40 @@ func TestUnsupportedModelsPreserveHostPassthrough(t *testing.T) {
 	}
 }
 
+func TestChannelMonitorChallengeUsesSelectedModelRouting(t *testing.T) {
+	const marker = "Calculate and respond with ONLY the number, nothing else."
+	body := []byte(`{"model":"gpt-6-astra","messages":[{"role":"user","content":"` + marker + `\n\nQ: 3 + 5 = ?\nA:"}],"stream":false}`)
+	var hostHits, basisHits atomic.Int32
+	var gotBody []byte
+	hostUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hostHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"monitor","choices":[{"message":{"content":"8"}}]}`))
+	}))
+	defer hostUpstream.Close()
+	basisPoints := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		basisHits.Add(1)
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(relayTestCompletedResponse())
+	}))
+	defer basisPoints.Close()
+
+	transport := New()
+	defer transport.Shutdown()
+	applyConfig(t, transport, map[string]any{"responses_url": basisPoints.URL, "enabled_models": []string{"gpt-6-astra"}, "rewrite_tools": false, "transform_responses": false})
+	result := runForward(t, transport, requestFrames(t, hostUpstream.URL+"/v1/chat/completions", token(t, "monitor-account"), nil, body))
+	if result.errFrame != nil || result.status != http.StatusOK || !result.ended {
+		t.Fatalf("challenge request did not follow its selected model: %#v", result)
+	}
+	if hostHits.Load() != 0 || basisHits.Load() != 1 {
+		t.Fatalf("challenge routing host=%d basis=%d, want host=0 basis=1", hostHits.Load(), basisHits.Load())
+	}
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("probe body changed: got %s want %s", gotBody, body)
+	}
+}
+
 func TestSupportedModelRoutingKeepsWhitelistAndRequestedUpstream(t *testing.T) {
 	type routingCase struct {
 		name, model string

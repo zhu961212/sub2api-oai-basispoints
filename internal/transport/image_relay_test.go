@@ -308,6 +308,13 @@ func TestImageRelayUploadFailureStopsConversation(t *testing.T) {
 			defer transport.Shutdown()
 			applyConfig(t, transport, map[string]any{"responses_url": upstream.URL + "/basispoints/api/responses", "rewrite_tools": false, "transform_responses": false})
 			result := runForward(t, transport, requestFrames(t, upstream.URL, token(t, "acct-upload-failure"), nil, relayTestBody(inlineImage)))
+			if tt.status == http.StatusTooManyRequests {
+				assertBasisPointsRateLimit(t, result)
+				if uploads.Load() != 1 || conversations.Load() != 0 {
+					t.Fatalf("upload rate limit was retried: uploads=%d conversations=%d", uploads.Load(), conversations.Load())
+				}
+				return
+			}
 			if result.errFrame != nil || result.status != tt.want || !result.ended || uploads.Load() != 1 || conversations.Load() != 0 {
 				t.Fatalf("upload failure was not surfaced safely: result=%+v uploads=%d conversations=%d", result, uploads.Load(), conversations.Load())
 			}

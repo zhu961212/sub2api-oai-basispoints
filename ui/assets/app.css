@@ -224,6 +224,35 @@ select:focus {
   font-size: 12px;
 }
 
+.degradation-result {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.degradation-result:empty {
+  display: none;
+}
+
+.degradation-result .result-summary {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.degradation-result .result-degraded {
+  color: var(--err-text);
+}
+
+.degradation-result .result-ok {
+  color: var(--ok-text);
+}
+
+.degradation-result .result-error {
+  color: var(--warn-text);
+}
+
 button {
   padding: 7px 16px;
   border: 1px solid var(--border);

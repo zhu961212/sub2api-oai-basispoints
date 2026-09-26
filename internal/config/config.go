@@ -15,7 +15,7 @@ import (
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.5.20"
+	Version = "0.5.22"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -60,12 +60,18 @@ type Config struct {
 	TimeoutSeconds int      `json:"timeout_seconds"`
 	// AccountIDs 限定使用这些账号（在它们之间轮询）。为空表示不限制，
 	// 完全跟随宿主调度。
-	AccountIDs         []int64 `json:"account_ids"`
-	MaxResponseBytes   int     `json:"max_response_bytes"`
-	AuthMode           string  `json:"auth_mode"`
-	ToolsVersionID     string  `json:"tools_version_id,omitempty"`
-	RewriteTools       bool    `json:"rewrite_tools"`
-	TransformResponses bool    `json:"transform_responses"`
+	AccountIDs []int64 `json:"account_ids"`
+	// DegradationCheck is a one-shot request marker consumed by TestConfig.
+	// The UI sets it immediately before config.test and clears it after the
+	// result has been applied. It is deliberately persisted by the host for the
+	// duration of that two-step bridge operation because TestConfig receives the
+	// saved configuration, not arbitrary UI payload.
+	DegradationCheck   bool   `json:"degradation_check,omitempty"`
+	MaxResponseBytes   int    `json:"max_response_bytes"`
+	AuthMode           string `json:"auth_mode"`
+	ToolsVersionID     string `json:"tools_version_id,omitempty"`
+	RewriteTools       bool   `json:"rewrite_tools"`
+	TransformResponses bool   `json:"transform_responses"`
 }
 
 // Default 返回一份完整可用的默认配置。宿主极少提交空对象，但空对象必须

@@ -467,6 +467,28 @@ func (t *Transport) TestConfig(ctx context.Context, r *pluginv1.TestConfigReques
 	if err != nil {
 		return &pluginv1.TestConfigResponse{Success: false, Message: safeError(err)}, nil
 	}
+	if c.DegradationCheck {
+		started := time.Now()
+		check, checkErr := t.runDegradationCheck(ctx, c)
+		statusJSON := mergeDegradationStatus(healthStatusJSON(c, t.accountDirectory(ctx)), check)
+		if checkErr != nil {
+			return &pluginv1.TestConfigResponse{
+				Success:    false,
+				Message:    safeError(checkErr),
+				LatencyMs:  time.Since(started).Milliseconds(),
+				StatusJson: statusJSON,
+			}, nil
+		}
+		// A completed check is a successful operation even when one or more
+		// accounts answered incorrectly. The per-account verdicts are in
+		// status_json; returning success=false would make UI Bridge discard them.
+		return &pluginv1.TestConfigResponse{
+			Success:    true,
+			Message:    fmt.Sprintf("degradation check completed: %d degraded account(s)", len(check.DegradedAccountIDs)),
+			LatencyMs:  time.Since(started).Milliseconds(),
+			StatusJson: statusJSON,
+		}, nil
+	}
 	started := time.Now()
 	reachable, detail := probeEndpoint(ctx, c)
 	return &pluginv1.TestConfigResponse{
@@ -660,6 +682,9 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		return sendError(stream, "upstream_transport", safeTransportError(err), true)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return sendBasisPointsRateLimit(stream)
+	}
 	if imagesRewritten && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
 		return sendImageUpstreamError(stream, resp, cfg.MaxResponseBytes)
 	}

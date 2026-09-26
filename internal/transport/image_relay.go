@@ -50,6 +50,9 @@ func sendImageRelayError(stream pluginv1.TransportPlugin_ForwardServer, err erro
 			kind = "server_error"
 		}
 	}
+	if status == http.StatusTooManyRequests {
+		return sendBasisPointsRateLimit(stream)
+	}
 	headers := make(http.Header)
 	if status == http.StatusServiceUnavailable {
 		headers.Set("Retry-After", "1")

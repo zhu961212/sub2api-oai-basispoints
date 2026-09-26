@@ -6,7 +6,7 @@
 
 ## 已准备的源码包
 
-在项目根目录运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.5.20-github-source.zip 和配套 SHA-256。脚本从当前工作区导出源码，包含尚未提交的新文件；不会复制 .git、build、dist、发布密钥、常见凭据文件或本地缓存。解压包后，以内层项目目录作为仓库根目录。
+在项目根目录运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.5.22-github-source.zip 和配套 SHA-256。脚本从当前工作区导出源码，包含尚未提交的新文件；不会复制 .git、build、dist、发布密钥、常见凭据文件或本地缓存。解压包后，以内层项目目录作为仓库根目录。
 
 README、插件清单介绍、配置页和本文均包含 **交流群：1107265919**；GitHub 仓库 About 或 Release 介绍也可填写：
 
@@ -106,15 +106,15 @@ git push -u origin main
 
 ## 6. 发布安装包
 
-源码上传与安装包发布分开进行。需要发布 0.5.20 时：
+源码上传与安装包发布分开进行。需要发布 0.5.22 时：
 
 1. 确认源码、manifest.source.json 版本、测试结果和发布记录一致。
 2. 按 [README](../README.md) 生成签名安装包，用配套公钥独立验包。
-3. 在 GitHub Releases 为审核后的提交创建 v0.5.20 标签和 Release。
-4. 上传 .s2plugin 与配套 .s2plugin.sha256，正文参考 [0.5.20 发布记录](release-0.5.20-2026-09-26.md)。
+3. 在 GitHub Releases 为审核后的提交创建 v0.5.22 标签和 Release。
+4. 上传 .s2plugin 与配套 .s2plugin.sha256，正文参考 [0.5.22 发布记录](release-0.5.22-2026-09-26.md)。
 5. 向部署者提供 key_id 和用于验签的发布公钥；**绝不发布私钥**。
 
-0.5.20 的发布正文应说明六模型按 GPT-6 与 GPT-5.6 分两排显示，默认只启用 `gpt-6-astra` 和 `gpt-5.6-sol`；只有已选且命中灰度、符合账号白名单的模型转发到 Basis Points，上游保留请求模型名。明确区分空模型选择（全部透传）与空账号选择（不限制账号）；未选模型和旧别名原样透传。如实记录本次本地测试、构建和验签结果，未完成的真实上游验证不得写成已通过。正式发布复用原发布密钥，key_id 为 `oai-basispoints-v1`，并用配套公钥独立验签。不要用旧自托管路径的性能数字或 0.5.15 安装包哈希充当本次结果。
+0.5.22 的发布正文应说明 BPS Responses/附件 429 通过 PLUGIN_RATE_LIMITED 错误帧隔离，兼容原官方宿主且不会误暂停账号；官方宿主通常向客户端返回 502 或流式失败。固定算术 challenge 扫描与绕行已删除，账号选择白名单保留。记录六模型真实测试、一键降智检查、本地测试及安装包验签的实际结果，不把未完成项写成通过。复用原发布密钥和 oai-basispoints-v1 key_id，独立验签。
 
 历史发布记录中的哈希对应当次构建。重新构建后的产物应重新计算、核验，并更新实际发布附件的校验信息；不能直接套用历史哈希。
 

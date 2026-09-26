@@ -1,0 +1,357 @@
+package transport
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
+	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
+)
+
+// This user-selected heuristic asks for an answer without supplying a candidate.
+// It is an account-routing aid, not a reliable measure of model intelligence.
+const (
+	degradationCheckPrompt   = "不联网，不猜测，直接说出你知道的最新苹果手机。只输出手机型号，不要解释。"
+	degradationExpectedReply = "苹果17"
+	// PluginManager.Test gives the whole operation 30 seconds. Keep enough
+	// room for several account batches while allowing a slow account to fail
+	// independently instead of holding the UI step-up request open.
+	degradationCheckTimeout  = 8 * time.Second
+	degradationCheckBudget   = 24 * time.Second
+	degradationCheckParallel = 8
+)
+
+type degradationAccountResult struct {
+	AccountID int64  `json:"account_id"`
+	Name      string `json:"name,omitempty"`
+	Status    string `json:"status"` // ok, degraded, error, skipped
+	Answer    string `json:"answer,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type degradationCheckResult struct {
+	Completed          bool                       `json:"completed"`
+	Expected           string                     `json:"expected"`
+	Prompt             string                     `json:"prompt"`
+	Results            []degradationAccountResult `json:"results"`
+	DegradedAccountIDs []int64                    `json:"degraded_account_ids"`
+}
+
+// runDegradationCheck sends one real request per account through that
+// account's own token and proxy. It deliberately ignores the configured
+// account whitelist: the operation's purpose is to discover the accounts that
+// should become the next whitelist. Administratively unavailable accounts are
+// reported as skipped and are never probed.
+func (t *Transport) runDegradationCheck(ctx context.Context, c protocol.Config) (degradationCheckResult, error) {
+	return t.runDegradationCheckWithBudget(ctx, c, degradationCheckBudget)
+}
+
+func (t *Transport) runDegradationCheckWithBudget(ctx context.Context, c protocol.Config, budget time.Duration) (degradationCheckResult, error) {
+	// Bound the complete scan, including queued batches and account enumeration,
+	// so the host can return results before its 30-second TestConfig deadline.
+	scanCtx, cancelScan := context.WithTimeout(ctx, budget)
+	defer cancelScan()
+	result := degradationCheckResult{
+		Expected:           degradationExpectedReply,
+		Prompt:             degradationCheckPrompt,
+		Results:            []degradationAccountResult{},
+		DegradedAccountIDs: []int64{},
+	}
+
+	t.mu.RLock()
+	host, base, closed := t.host, t.client, t.closed
+	t.mu.RUnlock()
+	if closed {
+		return result, errTransportStopped
+	}
+	if host == nil {
+		return result, fmt.Errorf("host services are unavailable; cannot enumerate accounts")
+	}
+	if base == nil {
+		return result, fmt.Errorf("HTTP client is unavailable")
+	}
+	model := degradationModel(c)
+
+	accountsResponse, err := host.ListAccounts(scanCtx, &pluginv1.ListAccountsRequest{Platform: "openai", AccountType: "oauth"})
+	if err != nil {
+		return result, fmt.Errorf("list accounts failed")
+	}
+	accounts := make([]degradationAccount, 0)
+	if accountsResponse != nil {
+		for _, account := range accountsResponse.GetAccounts() {
+			if account == nil || account.GetId() <= 0 {
+				continue
+			}
+			accounts = append(accounts, degradationAccount{
+				id: account.GetId(), name: account.GetName(), schedulable: account.GetSchedulable(),
+			})
+		}
+		// HostService v1 only populated account_ids. Keep this fallback so the
+		// feature remains useful against an older host; such rows have no name.
+		if len(accounts) == 0 {
+			for _, id := range accountsResponse.GetAccountIds() {
+				if id > 0 {
+					accounts = append(accounts, degradationAccount{id: id, schedulable: true})
+				}
+			}
+		}
+	}
+	if len(accounts) == 0 {
+		return result, fmt.Errorf("no OpenAI OAuth accounts available for degradation check")
+	}
+	result.Results = make([]degradationAccountResult, len(accounts))
+	sem := make(chan struct{}, degradationCheckParallel)
+	var wg sync.WaitGroup
+	for index, account := range accounts {
+		result.Results[index] = degradationAccountResult{AccountID: account.id, Name: account.name}
+		if !account.schedulable {
+			result.Results[index].Status = "skipped"
+			result.Results[index].Error = "account is not schedulable"
+			continue
+		}
+		wg.Add(1)
+		go func(index int, account degradationAccount) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-scanCtx.Done():
+				result.Results[index].Status = "error"
+				result.Results[index].Error = "degradation check deadline reached or canceled"
+				return
+			}
+			defer func() { <-sem }()
+			checkCtx, cancel := context.WithTimeout(scanCtx, degradationCheckTimeout)
+			defer cancel()
+			status, answer, checkErr := t.checkDegradationAccount(checkCtx, c, host, base, account.id, model)
+			result.Results[index].Status = status
+			result.Results[index].Answer = answer
+			if checkErr != nil {
+				result.Results[index].Error = safeError(checkErr)
+			}
+		}(index, account)
+	}
+	wg.Wait()
+	for _, account := range result.Results {
+		if account.Status == "degraded" {
+			result.DegradedAccountIDs = append(result.DegradedAccountIDs, account.AccountID)
+		}
+	}
+	result.Completed = ctx.Err() == nil
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+	return result, nil
+}
+
+type degradationAccount struct {
+	id          int64
+	name        string
+	schedulable bool
+}
+
+func degradationModel(c protocol.Config) string {
+	for _, model := range c.EnabledModels {
+		if c.HandlesModel(model) {
+			return strings.TrimSpace(model)
+		}
+	}
+	return protocol.DefaultModelID
+}
+
+func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Config, host pluginv1.HostServiceClient, base *http.Client, accountID int64, model string) (string, string, error) {
+	start := &pluginv1.ForwardRequestStart{AccountId: accountID}
+	headers, proxyURL, err := prepareHeaders(ctx, start, host, c.AuthMode)
+	if err != nil {
+		return "error", "", err
+	}
+	requestClient, err := t.clientForProxy(base, proxyURL)
+	if err != nil {
+		return "error", "", err
+	}
+	// Match real forwarding: Basis Points expects normalized input, explicit
+	// model selection and streamed Responses output.
+	upstreamBody, err := protocol.PrepareResponsesBody(map[string]any{
+		"model":            model,
+		"input":            degradationCheckPrompt,
+		"reasoning_effort": "low",
+	}, c)
+	if err != nil {
+		return "error", "", fmt.Errorf("cannot prepare check request")
+	}
+	body := protocol.JSONBytes(upstreamBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ResponsesURL, bytes.NewReader(body))
+	if err != nil {
+		return "error", "", fmt.Errorf("cannot create check request")
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := requestClient.Do(req)
+	if err != nil {
+		return "error", "", fmt.Errorf("%s", safeTransportError(err))
+	}
+	defer resp.Body.Close()
+	responseBody, err := readLimited(resp.Body, c.MaxResponseBytes)
+	if err != nil {
+		return "error", "", fmt.Errorf("%s", safeError(err))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "error", "", fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
+	}
+	answer, err := degradationAnswer(responseBody, resp.Header.Get("Content-Type"))
+	if err != nil {
+		return "error", "", err
+	}
+	if isExpectedDegradationAnswer(answer) {
+		return "ok", answer, nil
+	}
+	return "degraded", answer, nil
+}
+
+// isExpectedDegradationAnswer accepts the variants shown by capable models
+// ("苹果17", "iPhone 17 系列", or "Apple 17"). Explanations are harmless
+// when they identify the 17 generation; older generations and answers without
+// that generation are classified as degraded.
+func isExpectedDegradationAnswer(answer string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(answer))
+	normalized = strings.NewReplacer(
+		" ", "", "\t", "", "\r", "", "\n", "", "　", "",
+		"-", "", "_", "",
+	).Replace(normalized)
+	return strings.Contains(normalized, "苹果17") ||
+		strings.Contains(normalized, "iphone17") ||
+		strings.Contains(normalized, "apple17")
+}
+
+// degradationAnswer accepts both the JSON and SSE forms returned by Responses
+// gateways. Chat-completions-shaped responses are accepted as a compatibility
+// fallback because some configured upstreams expose both protocols.
+func degradationAnswer(body []byte, contentType string) (string, error) {
+	trimmed := bytes.TrimSpace(body)
+	var object map[string]any
+	var err error
+	if strings.Contains(strings.ToLower(contentType), "text/event-stream") ||
+		bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("data:")) {
+		object, err = protocol.ParseFinalStreamResponse(body)
+	} else {
+		object, err = protocol.RawObject(body)
+	}
+	if err != nil {
+		return "", fmt.Errorf("invalid upstream response")
+	}
+	if nested, ok := object["response"].(map[string]any); ok {
+		object = nested
+	}
+	if responseError, exists := object["error"]; exists && responseError != nil {
+		return "", fmt.Errorf("upstream response contains an error")
+	}
+	if status, ok := object["status"].(string); ok && status != "" && status != "completed" {
+		return "", fmt.Errorf("upstream response did not complete")
+	}
+	if choices, ok := object["choices"].([]any); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			if reason, ok := choice["finish_reason"].(string); ok && reason != "" && reason != "stop" {
+				return "", fmt.Errorf("upstream response did not complete")
+			}
+		}
+	}
+	if answer := strings.TrimSpace(responsesOutputText(object)); answer != "" {
+		return answer, nil
+	}
+	return "", fmt.Errorf("upstream response contains no output text")
+}
+
+func responsesOutputText(object map[string]any) string {
+	if text, ok := object["output_text"].(string); ok {
+		return text
+	}
+	if output, ok := object["output"].([]any); ok {
+		for _, value := range output {
+			item, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text := outputItemText(item); text != "" {
+				return text
+			}
+		}
+	}
+	if choices, ok := object["choices"].([]any); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			if message, ok := choice["message"].(map[string]any); ok {
+				if text := contentText(message["content"]); text != "" {
+					return text
+				}
+			}
+			if text, ok := choice["text"].(string); ok {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func outputItemText(item map[string]any) string {
+	if text, ok := item["text"].(string); ok && item["type"] == "output_text" {
+		return text
+	}
+	content, ok := item["content"].([]any)
+	if !ok {
+		return ""
+	}
+	var builder strings.Builder
+	for _, value := range content {
+		part, ok := value.(map[string]any)
+		if !ok || part["type"] != "output_text" {
+			continue
+		}
+		if text, ok := part["text"].(string); ok {
+			builder.WriteString(text)
+		}
+	}
+	return builder.String()
+}
+
+func contentText(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return ""
+	}
+	var builder strings.Builder
+	for _, item := range items {
+		part, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text, ok := part["text"].(string); ok {
+			builder.WriteString(text)
+		}
+	}
+	return builder.String()
+}
+
+func mergeDegradationStatus(statusJSON string, check degradationCheckResult) string {
+	var status map[string]any
+	if err := json.Unmarshal([]byte(statusJSON), &status); err != nil || status == nil {
+		status = make(map[string]any)
+	}
+	status["degradation_check"] = check
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		return statusJSON
+	}
+	return string(encoded)
+}

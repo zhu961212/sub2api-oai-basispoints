@@ -2,8 +2,8 @@
   "schema_version": 1,
   "id": "local.oai-basispoints",
   "name": "OpenAI Basis Points 传输",
-  "version": "0.5.20",
-  "description": "适用于 Sub2API 官方版的插件，通过 OpenAI Excel（Basis Points）官方入口使用账号可用的官方模型。支持选择 gpt-6-astra、gpt-6-sol、gpt-6-luna、gpt-5.6-sol、gpt-5.6-terra、gpt-5.6-luna 六个模型，默认勾选 gpt-6-astra 和 gpt-5.6-sol。仅转发已选、命中 OpenAI OAuth 插件灰度且符合账号白名单的请求，上游保留请求模型名；未选模型、其他模型和旧 -excel 别名原样透传。清空模型选择表示全部透传，清空账号选择表示不限制账号。支持自动图片上传、客户端工具适配与流式响应还原。始终使用宿主当前调度账号的凭据与代理，账号调度、Token 生命周期、用量与计费由 Sub2API 负责。交流群：1107265919。",
+  "version": "0.5.22",
+  "description": "适用于 Sub2API 官方版的插件，通过 OpenAI Excel（Basis Points）官方入口使用账号可用的官方模型。支持选择 gpt-6-astra、gpt-6-sol、gpt-6-luna、gpt-5.6-sol、gpt-5.6-terra、gpt-5.6-luna 六个模型，默认勾选 gpt-6-astra 和 gpt-5.6-sol。仅转发已选、命中 OpenAI OAuth 插件灰度且符合账号白名单的请求，上游保留请求模型名；未选模型、其他模型和旧 -excel 别名原样透传。清空模型选择表示全部透传，清空账号选择表示不限制账号。支持自动图片上传、客户端工具适配、流式响应还原与一键检测降智账号。始终使用宿主当前调度账号的凭据与代理，账号调度、Token 生命周期、用量与计费由 Sub2API 负责。交流群：1107265919。",
   "author": "wangyunjeff",
   "requires": {
     "sub2api": ">=0.2.8 <0.3.0",

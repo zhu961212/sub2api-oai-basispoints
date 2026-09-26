@@ -4,11 +4,25 @@
 
 [GitHub 仓库](https://github.com/zhu961212/sub2api-oai-basispoints) · [发布下载](https://github.com/zhu961212/sub2api-oai-basispoints/releases)
 
-当前版本：**0.5.20** · 插件 ID：**local.oai-basispoints**
+当前版本：**0.5.22** · 插件 ID：**local.oai-basispoints**
 
 适用于 Sub2API 官方版的插件，通过 OpenAI Excel（Basis Points）官方入口使用账号可用的官方模型。插件为 OpenAI OAuth 出站请求提供传输适配：改写客户端工具目录，还原工具调用与 Responses/SSE 响应。账号调度、Token 生命周期、用量统计及计费仍由宿主负责；插件不刷新或持久化令牌。
 
 本项目为第三方适配代码，不代表 OpenAI 或 Sub2API 的官方发布、授权或支持。
+
+## 0.5.22 更新
+
+- 修复 Basis Points 的 HTTP 429 被宿主误记为 Codex 全账号限流：普通请求、带图片请求和附件上传限流统一返回插件错误，不触发宿主账号冷却或自动换号。真实 Codex 透传的 429 仍保留原有限流保护。
+- 兼容官方宿主，无需修改或重新编译宿主。当前官方宿主把这类插件错误返回为 502（流式请求可能显示失败事件），宿主诊断中的错误码为 PLUGIN_RATE_LIMITED，说明中保留原始 HTTP 429。BPS 配额仍需等待上游恢复。
+- [0.5.22 修复记录与升级说明](docs/release-0.5.22-2026-09-26.md)。
+- 删除固定算术 challenge 的提示词扫描与特殊绕行，监控请求与普通请求统一遵循模型选择和账号白名单。
+- 一键检测改用正式请求协议，限制整体扫描时间；429、超时、空白或未完成回答不再被误选为疑似降智，保存失败保留原账号选择。六模型真实转发及一键检测已通过，详见修复记录。
+
+## 0.5.21 更新
+
+- 配置页新增**一键检测降智账号**：给每个当前可调度的 OpenAI OAuth 账号发一次真实请求，答案不指向“苹果17”的账号判为降智；检测结束后自动把降智账号保存为账号白名单，没有降智账号则保留原有选择。
+- 当时增加了渠道监控 challenge 绕行；该临时规则已在 0.5.22 删除，由统一的 BPS 429 隔离替代。
+- [0.5.21 发布记录](docs/release-0.5.21-2026-09-26.md)。
 
 ## 0.5.20 更新
 
@@ -88,7 +102,7 @@ TestLive 系列属于可选真实上游测试，设置 BASISPOINTS_LIVE_TOKEN �
 
 ## GitHub 源码准备
 
-运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.5.20-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
+运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.5.22-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
 
 ## 构建、签名与验包
 
@@ -110,12 +124,12 @@ Linux：
 bash ./build.sh -signing-key ../basispoints-private/publisher.private -key-id my-publisher-v1
 ~~~
 
-构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.5.20.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
+构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.5.22.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
 
 显式传入配套公钥进行独立验包：
 
 ~~~powershell
-python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.5.20.s2plugin --public-key ../basispoints-private/publisher.public
+python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.5.22.s2plugin --public-key ../basispoints-private/publisher.public
 ~~~
 
 校验器检查包内容、文件哈希及 manifest 原始字节的 Ed25519 签名。构建脚本发现 Python 时会自动验包，但自动验签取决于其默认公钥路径；使用仓库外密钥时仍应执行上面的显式验签命令。
@@ -129,13 +143,14 @@ plugins:
     my-publisher-v1: BASE64_ED25519_PUBLIC_KEY
 ~~~
 
-在 Sub2API 插件管理页安装 0.5.20，打开配置页选择模型和账号并保存，再配置灰度并启用插件。详细步骤见 [使用说明](docs/使用说明.md)。
+在 Sub2API 插件管理页安装 0.5.22，打开配置页选择模型和账号并保存，再配置灰度并启用插件。详细步骤见 [使用说明](docs/使用说明.md)。
 
 ## 配置页与全选
 
 在配置页勾选允许走 Basis Points 的模型和账号，点击保存；显示“已保存，并已重新读取确认”后生效。默认模型为 `gpt-6-astra` 和 `gpt-5.6-sol`，其余 4 个可按需勾选。
 
 - **全选列表账号**：一次勾选当前列表账号，并保留已保存但暂未显示的账号；点击全选后仍需保存。
+- **一键检测降智账号**：点击后，遍历所有当前可调度的 OpenAI OAuth 账号，不受原账号白名单限制，使用已勾选模型中的第一个（未选时使用默认 Astra）请求配置的 BPS Responses 端点，不检测原生 Codex。每个请求使用该账号的凭据和关联代理，无代理时直连。有效回答指向“苹果17”才通过现有自定义规则；其余有效回答标记为疑似降智，自动勾选并保存为插件账号白名单。401/403/429、超时、空白或未完成回答只记为检测失败，不会被选中。没有疑似降智账号时保留原选择，保存失败时恢复原选择。该功能由按钮触发，不在后台定时扫描；每个被检测账号消耗一次上游请求额度。
 - 读取、保存及回读期间锁定操作；列表为空或已全选时禁用全选按钮。
 - 重复账号按有效 ID 去重；保存失败时保留当前选择，可重试。
 - 清空账号勾选表示**不限制账号**；清空模型勾选并保存则表示**全部透传**。也可在宿主停用插件或调整灰度。
@@ -152,7 +167,7 @@ plugins:
 
 无需填写域名、端口或目录，也无需添加反向代理。图片请求的资源边界、错误处理和协议来源见 [自动发送图片说明](docs/IMAGE-RELAY.md)。
 
-0.5.15 的 [图片性能报告](docs/PERFORMANCE-0.5.15.md) 记录的是旧自托管路径，仅作为历史数据保留，不能用来证明当前原生上传的速度。本次版本的实际验证结果见 [0.5.20 发布记录](docs/release-0.5.20-2026-09-26.md)；尚未用真实 OAuth 账号验证上游图片识别。
+0.5.15 的 [图片性能报告](docs/PERFORMANCE-0.5.15.md) 记录的是旧自托管路径，仅作为历史数据保留，不能用来证明当前原生上传的速度。图片相关的实际验证结果见 [0.5.20 发布记录](docs/release-0.5.20-2026-09-26.md)；尚未用真实 OAuth 账号验证上游图片识别。
 
 ## 常见工具目录错误
 
@@ -163,7 +178,7 @@ Basis Points returned an unknown client tool absent from the active catalog
 
 该错误表示返回的调用无法匹配本轮客户端声明的工具目录。部分客户端的提示仍用 exec_command 固定示例，但本轮可能只声明 functions.exec 执行器。0.5.15 按实际目录生成调用格式指引，区分执行器与其内部 helper、自定义工具的原始 input 与中转信封中的 args。
 
-更新后需在宿主重新加载插件，确认运行版本为 0.5.20，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
+更新后需在宿主重新加载插件，确认运行版本为 0.5.22，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
 
 首次工具交互若上游仍返回一个目录外的中转调用，并且尚未向客户端发出任何工具，0.5.15 最多追加一次带当前目录与拒绝原因的纠正请求。它沿用原账号、模型、历史和图片引用；错误工具不会执行。纠正后的结果仍须通过原有目录和参数校验，两次请求的用量合并记录。
 

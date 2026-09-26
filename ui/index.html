@@ -25,9 +25,12 @@
           <span class="name">走 Basis Points 的账号</span>
           <div class="actions account-actions">
             <button id="select-all-button" type="button" class="ghost" disabled>全选列表账号</button>
+            <button id="degradation-check-button" type="button" class="ghost" disabled>一键检测降智账号</button>
           </div>
           <div id="account-list" class="check-list"></div>
           <span id="account-hint" class="hint">默认留空 = 不限制账号；勾选后只有选中的账号可走 Basis Points。</span>
+          <span class="hint">检测会向可用账号发送真实请求，可能消耗额度。按自定义“苹果17”回答规则筛选疑似账号，不代表可靠智力测评；限流、鉴权失败、超时和跳过均不会判为降智。</span>
+          <div id="degradation-result" class="degradation-result" aria-live="polite"></div>
         </fieldset>
 
         <p class="hint">支持直接发送图片和截图，无需额外配置。交流群：1107265919。</p>

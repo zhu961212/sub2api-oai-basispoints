@@ -36,6 +36,8 @@
     "tools_version_id",
     "rewrite_tools",
     "transform_responses",
+    // 一键降智检测的瞬时触发位。检测完成后总会清零，不参与普通路由配置。
+    "degradation_check",
   ];
 
   var bridge = bridgeFactory.create({});
@@ -48,6 +50,7 @@
   var saving = false;
   var configReady = false;
   var loading = false;
+  var degradationChecking = false;
 
   function id(name) {
     return document.getElementById(name);
@@ -79,12 +82,16 @@
   }
 
   function updateControls() {
-    var locked = !configReady || saving || loading;
+    var locked = !configReady || saving || loading || degradationChecking;
     id("save-button").disabled = locked;
     id("account-fields").disabled = locked;
     id("model-fields").disabled = locked;
     id("retry-button").hidden = configReady || loading;
     id("retry-button").disabled = loading || saving;
+    var degradationButton = id("degradation-check-button");
+    if (degradationButton) {
+      degradationButton.disabled = locked || !accounts.some(isSelectableAccount);
+    }
     updateAccountActions();
   }
 
@@ -95,6 +102,94 @@
     }
     parts.push(account.schedulable ? "可用" : (account.status || "暂停"));
     return parts.join(" · ");
+  }
+
+  function degradationStatusLabel(status) {
+    switch (status) {
+      case "ok": return "符合检测规则";
+      case "degraded": return "疑似降智";
+      case "skipped": return "跳过";
+      case "error": return "检测失败";
+      default: return status || "未知";
+    }
+  }
+
+  function confirmedDegradedIDs(check) {
+    var results = Array.isArray(check.results) ? check.results : [];
+    var ids = Array.isArray(check.degraded_account_ids) ? check.degraded_account_ids : [];
+    return ids.filter(function (value, index, values) {
+      return Number.isSafeInteger(value) && value > 0 && values.indexOf(value) === index &&
+        results.some(function (result) {
+          return result && result.account_id === value && result.status === "degraded" &&
+            typeof result.answer === "string" && result.answer.trim() !== "";
+        }) && !results.some(function (result) {
+          return result && result.account_id === value && result.status !== "degraded";
+        });
+    });
+  }
+
+  function answeredDegradationCount(check) {
+    return (Array.isArray(check.results) ? check.results : []).filter(function (result) {
+      return result && (result.status === "ok" || result.status === "degraded") &&
+        typeof result.answer === "string" && result.answer.trim() !== "";
+    }).length;
+  }
+
+  function renderDegradationResult(check) {
+    var container = id("degradation-result");
+    if (!container) {
+      return;
+    }
+    container.textContent = "";
+    if (!check || typeof check !== "object") {
+      return;
+    }
+    var results = Array.isArray(check.results) ? check.results : [];
+    var degraded = confirmedDegradedIDs(check);
+    if (check.completed !== true && check.state !== "done") {
+      var state = document.createElement("span");
+      state.className = "result-summary";
+      state.textContent = check.state === "running" ? "正在检测账号…" : "降智检测尚未完成";
+      container.appendChild(state);
+      return;
+    }
+    var summary = document.createElement("span");
+    summary.className = "result-summary";
+    summary.textContent = answeredDegradationCount(check) > 0
+      ? "检测完成：" + degraded.length + " 个疑似降智账号（按自定义“苹果17”规则，不代表可靠智力测评）"
+      : "检测结束：未获得有效回答，保留原账号选择。失败或跳过不等于降智。";
+    container.appendChild(summary);
+    results.forEach(function (result) {
+      if (!result || typeof result !== "object") {
+        return;
+      }
+      var line = document.createElement("span");
+      var status = String(result.status || "");
+      line.className = status === "degraded" ? "result-degraded" :
+        (status === "ok" ? "result-ok" : "result-error");
+      var accountID = Number.isSafeInteger(result.account_id) ? "#" + result.account_id : "账号";
+      var detail = result.answer || result.error || "";
+      line.textContent = accountID + " · " + degradationStatusLabel(status) +
+        (detail ? " · " + String(detail).slice(0, 160) : "");
+      container.appendChild(line);
+    });
+  }
+
+  function degradationCheckFromResult(result) {
+    var snapshot = result && typeof result === "object" ? result : {};
+    var raw = snapshot.status_json;
+    if (typeof raw === "string" && raw) {
+      try {
+        snapshot = JSON.parse(raw) || {};
+      } catch (error) {
+        throw new Error("宿主返回的降智检测结果不是有效 JSON");
+      }
+    }
+    var check = snapshot.degradation_check;
+    if (!check || typeof check !== "object" || Array.isArray(check)) {
+      throw new Error("宿主未返回降智检测结果，请确认插件已更新");
+    }
+    return check;
   }
 
   function isSelected(accountID) {
@@ -233,6 +328,11 @@
     config.enabled_models = MODEL_IDS.filter(function (model) {
       return selectedModels.indexOf(model) >= 0;
     });
+    // 该字段只是 config.test 的一次性触发位，普通保存和检测收尾都必须清零。
+    // 旧版宿主没有这个字段时不要凭空扩展保存载荷。
+    if (Object.prototype.hasOwnProperty.call(loaded, "degradation_check")) {
+      config.degradation_check = false;
+    }
     return config;
   }
 
@@ -307,6 +407,10 @@
       return true;
     });
     renderAccountList();
+    if (details.degradation_check) {
+      renderDegradationResult(details.degradation_check);
+    }
+    updateControls();
 
     var line = [];
     if (details.plugin_version) {
@@ -420,6 +524,110 @@
       });
   }
 
+  // 通过宿主已有的 config.save/config.test 通道触发一次性账号检测。
+  // config.test 的请求本身没有可选参数，因此触发位先随配置保存，再由插件
+  // 在 TestConfig 中执行真实请求并把结果放进 status_json；检测完成后立即清零。
+  function handleDegradationCheck(event) {
+    if (event) {
+      event.preventDefault();
+    }
+    if (saving || loading || degradationChecking || !configReady) {
+      return;
+    }
+    if (typeof bridge.testConfig !== "function") {
+      setHint("当前宿主不支持账号降智检测，请升级插件管理页。", "error");
+      return;
+    }
+    var trigger = readForm();
+    trigger.degradation_check = true;
+    var triggerSaved = false;
+    var finalSaved = false;
+    var check;
+    var selectedForCheck = selectedIDs.slice();
+    degradationChecking = true;
+    saving = true;
+    updateControls();
+    setHint("正在逐个账号发送检测问题，请稍候…");
+    bridge
+      .saveConfig(trigger)
+      .then(function () {
+        triggerSaved = true;
+        setHint("检测请求已启动，正在等待账号回答…");
+        return bridge.testConfig();
+      })
+      .then(function (result) {
+        check = degradationCheckFromResult(result);
+        renderDegradationResult(check);
+        if (check.completed !== true && check.state !== "done") {
+          throw new Error("降智检测尚未完成，请稍后重试");
+        }
+        var degraded = confirmedDegradedIDs(check);
+        // 空结果不能写成 account_ids=[] 来表示“选择零账号”：在插件配置
+        // 语义里空数组代表不限制账号。没有降智账号时保留现有选择，避免
+        // 一键检测反而把全部健康账号放进插件路由。
+        if (degraded.length > 0) {
+          selectedForCheck = degraded.slice();
+        }
+        var finalConfig = readForm();
+        finalConfig.account_ids = selectedForCheck.slice();
+        finalConfig.degradation_check = false;
+        setHint(
+          degraded.length > 0
+            ? "检测完成，正在保存 " + degraded.length + " 个降智账号…"
+            : "没有可自动选择的检测结果，正在保留原账号选择并清除检测标记…"
+        );
+        return bridge.saveConfig(finalConfig).then(function (normalized) {
+          if (!sameAccountIDs(normalized, selectedForCheck)) {
+            throw new Error("宿主返回的降智账号选择与检测结果不一致");
+          }
+          finalSaved = true;
+          return bridge.loadConfig();
+        });
+      })
+      .then(function (persisted) {
+        if (!check) {
+          throw new Error("宿主未返回降智检测结果");
+        }
+        var degraded = confirmedDegradedIDs(check);
+        if (!sameAccountIDs(persisted, selectedForCheck)) {
+          throw new Error("重新读取的降智账号选择与检测结果不一致");
+        }
+        if (!sameModels(persisted, selectedModels)) {
+          throw new Error("重新读取的模型选择与检测前不一致");
+        }
+        applyConfig(persisted);
+        setHint(
+          degraded.length > 0
+            ? "检测完成，已自动选择 " + degraded.length + " 个降智账号。"
+            : (answeredDegradationCount(check) > 0
+              ? "检测完成，已回答账号未发现降智，已保留原账号选择。"
+              : "检测结束，未获得有效回答，已保留原账号选择；失败或跳过不等于降智。"),
+          answeredDegradationCount(check) > 0 ? "ok" : "error"
+        );
+        return refreshStatus();
+      })
+      .catch(function (error) {
+        // 检测或收尾失败时也清除触发位，避免下次宿主启动重复检测。
+        if (triggerSaved && !finalSaved) {
+          var cleanup = readForm();
+          cleanup.degradation_check = false;
+          return bridge.saveConfig(cleanup).catch(function () {}).then(function () {
+            throw error;
+          });
+        }
+        throw error;
+      })
+      .catch(function (error) {
+        setHint("降智检测失败：" + error.message + "。" + diagnosis(), "error");
+      })
+      .then(function () {
+        degradationChecking = false;
+        saving = false;
+        updateControls();
+        scheduleResize();
+      });
+  }
+
   function boot() {
     bridge.ready();
     renderModelList();
@@ -427,6 +635,10 @@
     // 通过普通按钮点击发 bridge 消息，兼容宿主的 form-action 'none'。
     id("save-button").addEventListener("click", handleSave);
     id("select-all-button").addEventListener("click", selectAllAccounts);
+    var degradationButton = id("degradation-check-button");
+    if (degradationButton) {
+      degradationButton.addEventListener("click", handleDegradationCheck);
+    }
     id("config-form").addEventListener("submit", function (event) {
       event.preventDefault();
     });
