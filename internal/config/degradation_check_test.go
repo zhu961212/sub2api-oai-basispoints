@@ -2,7 +2,6 @@ package config
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -43,7 +42,13 @@ func TestDegradationAccountSelectorValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "degradation_check") {
-		t.Fatal("ordinary configuration contains a degradation check command")
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"degradation_check", "degradation_check_account_id", "degradation_check_account_ids"} {
+		if _, exists := fields[key]; exists {
+			t.Fatalf("ordinary configuration contains command %s", key)
+		}
 	}
 }

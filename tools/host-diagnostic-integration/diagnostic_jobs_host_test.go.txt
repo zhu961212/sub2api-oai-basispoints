@@ -1,5 +1,6 @@
 // Added through a test-only Go overlay in the pinned upstream service package.
 // The original host manager, runtime, and host service implementations run here.
+// run.py separately builds the plugin with a loopback-only native probe overlay.
 package service
 
 import (
@@ -131,6 +132,8 @@ type bpsDiagnosticHarness struct {
 
 func newBPSDiagnosticHarness(t *testing.T) *bpsDiagnosticHarness {
 	t.Helper()
+	require.Equal(t, "loopback-v1", os.Getenv("BPS_DIAGNOSTIC_SOURCE_OVERLAY"),
+		"only run with the isolated source build from tools/host-diagnostic-integration/run.py")
 	binary := os.Getenv("BPS_DIAGNOSTIC_PLUGIN_BINARY")
 	require.NotEmpty(t, binary, "run with tools/host-diagnostic-integration/run.py")
 	data, err := os.ReadFile(binary)
@@ -140,6 +143,11 @@ func newBPSDiagnosticHarness(t *testing.T) *bpsDiagnosticHarness {
 	h.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/backend-api/codex/responses" {
+			t.Errorf("unexpected fixture request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		var payload struct {
@@ -168,6 +176,9 @@ func newBPSDiagnosticHarness(t *testing.T) *bpsDiagnosticHarness {
 		_, _ = w.Write([]byte(`{"output_text":"iPhone 17"}`))
 	}))
 	t.Cleanup(h.upstream.Close)
+	// The overlaid plugin inherits this origin when h.start spawns it. A missing
+	// or non-loopback value aborts that test binary before any request can run.
+	t.Setenv("BPS_DIAGNOSTIC_NATIVE_FIXTURE_URL", h.upstream.URL)
 	installation := &PluginInstallation{ID: 73, PluginKey: os.Getenv("BPS_DIAGNOSTIC_PLUGIN_ID"),
 		Version: os.Getenv("BPS_DIAGNOSTIC_PLUGIN_VERSION"), BinaryPath: binary, BinarySHA256: hex.EncodeToString(checksum[:])}
 	h.repo = &bpsDiagnosticRepo{installation: installation}
@@ -324,7 +335,7 @@ func TestBasispointsUnpatchedHostDiagnostics(t *testing.T) {
 		h.requestMu.Lock()
 		requests := append([]bpsDiagnosticRequest(nil), h.requests...)
 		h.requestMu.Unlock()
-		require.Equal(t, []bpsDiagnosticRequest{{"synthetic-account-7", "gpt-5.6-sol"}}, requests)
+		require.Equal(t, []bpsDiagnosticRequest{{"synthetic-account-7", "gpt-5.4"}}, requests)
 		oldOwner := h.status().Tasks.Owner
 		h.manager.runtimes[73].kill()
 		h.start()

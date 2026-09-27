@@ -85,14 +85,14 @@ func TestDegradationCheckNeverClassifiesHTTPFailures(t *testing.T) {
 			if verdict != "error" || answer != "" || err == nil {
 				t.Fatalf("HTTP failure classified: status=%s answer=%q err=%v", verdict, answer, err)
 			}
-			if blocked := transport.isBPSAccountDisabled(1, protocol.DefaultConfig()); blocked != (status == http.StatusForbidden) {
-				t.Fatalf("HTTP %d disabled BPS=%t", status, blocked)
+			if transport.isBPSAccountDisabled(1, protocol.DefaultConfig()) {
+				t.Fatalf("native HTTP %d must not disable BPS", status)
 			}
 		})
 	}
 }
 
-func TestDegradationForbiddenSignalDisablesFutureChecks(t *testing.T) {
+func TestNativeDegradationForbiddenSignalNeverDisablesBPS(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprint(stream), func(t *testing.T) {
 			transport := New()
@@ -110,12 +110,12 @@ func TestDegradationForbiddenSignalDisablesFutureChecks(t *testing.T) {
 				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {contentType}}, Body: io.NopCloser(strings.NewReader(body))}, nil
 			})}
 			verdict, _, err := transport.checkDegradationAccount(context.Background(), protocol.DefaultConfig(), host, client, 1, protocol.DefaultModelID)
-			if verdict != "error" || err == nil || !transport.isBPSAccountDisabled(1, protocol.DefaultConfig()) {
+			if verdict != "error" || err == nil || transport.isBPSAccountDisabled(1, protocol.DefaultConfig()) {
 				t.Fatalf("first forbidden response: verdict=%s err=%v", verdict, err)
 			}
 			verdict, _, err = transport.checkDegradationAccount(context.Background(), protocol.DefaultConfig(), host, client, 1, protocol.DefaultModelID)
-			if verdict != "skipped" || err == nil || calls != 1 {
-				t.Fatalf("disabled account was probed again: verdict=%s calls=%d err=%v", verdict, calls, err)
+			if verdict != "error" || err == nil || calls != 2 {
+				t.Fatalf("native forbidden response incorrectly blocked future probe: verdict=%s calls=%d err=%v", verdict, calls, err)
 			}
 		})
 	}

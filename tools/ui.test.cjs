@@ -15,6 +15,7 @@ const htmlSource = fs.readFileSync(path.join(root, "ui/index.html"), "utf8");
 const modelIDs = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const modelCatalogIDs = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna"];
 const defaultModels = ["gpt-6-astra", "gpt-5.6-sol"];
+const defaultAutoDegradation = { auto_degradation_enabled: false, auto_degradation_interval_minutes: 30, auto_degradation_manual_revision: 0, degradation_check_model: "gpt-5.4", native_timezone_by_ip: false };
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const deferred = () => {
   let resolve;
@@ -123,6 +124,13 @@ function createPage(options = {}) {
     "select-all-button": "button",
     "degradation-check-button": "button",
     "bps-403-toggle": "button",
+    "auto-degradation-fields": "fieldset",
+    "auto-degradation-toggle": "button",
+    "auto-degradation-interval": "input",
+    "degradation-check-model": "input",
+    "auto-degradation-status": "span",
+    "native-environment-fields": "fieldset",
+    "native-timezone-toggle": "button",
     "degradation-result": "div",
     "account-check-hint": "span",
     "diagnostic-task-status": "span",
@@ -137,6 +145,12 @@ function createPage(options = {}) {
   }
   ids["config-form"].appendChild(ids["account-fields"]);
   ids["config-form"].appendChild(ids["model-fields"]);
+  ids["config-form"].appendChild(ids["auto-degradation-fields"]);
+  ids["config-form"].appendChild(ids["native-environment-fields"]);
+  ids["native-environment-fields"].appendChild(ids["native-timezone-toggle"]);
+  for (const id of ["auto-degradation-toggle", "auto-degradation-interval", "degradation-check-model", "auto-degradation-status"]) {
+    ids["auto-degradation-fields"].appendChild(ids[id]);
+  }
   ids["model-fields"].appendChild(ids["model-list"]);
   ids["model-fields"].appendChild(ids["model-hint"]);
   ids["account-fields"].appendChild(ids["select-all-button"]);
@@ -244,6 +258,8 @@ function createPage(options = {}) {
     selectAll: () => ids["select-all-button"].click(),
     degradationCheck: () => ids["degradation-check-button"].click(),
     toggle403: () => ids["bps-403-toggle"].click(),
+    toggleAutoDegradation: () => ids["auto-degradation-toggle"].click(),
+    toggleNativeTimezone: () => ids["native-timezone-toggle"].click(),
     checkAccount: (accountID) => {
       const button = accountRow(accountID).button;
       assert.ok(button, "Account #" + accountID + " must have its own diagnostic button");
@@ -254,6 +270,333 @@ function createPage(options = {}) {
     retry: () => ids["retry-button"].click(),
   };
 }
+
+test("request timezone toggle defaults off and saves its legacy key independently of automatic diagnostics", async () => {
+  const page = createPage({ scoped: true, store: { config: { account_ids: [1], auto_degradation_enabled: true, auto_degradation_manual_revision: 12 } } });
+  await flush();
+  assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "false");
+  assert.equal(page.ids["native-timezone-toggle"].textContent, "请求时区跟随出口 IP：已关闭");
+  assert.ok(htmlSource.includes('<legend class="name">请求环境</legend>'));
+  assert.match(htmlSource, /此开关只控制原生 Codex 和 BPS 业务请求的时区，独立于“自动检测与切换”/);
+  assert.match(htmlSource, /降智检测始终只请求原生 Codex，不检测 BPS/);
+  assert.match(htmlSource, /ipapi.co.*6 小时.*5 分钟/);
+  assert.match(htmlSource, /关闭时不查询 IP.*失败保留原请求/);
+  assert.match(htmlSource, /不保证改善降智/);
+  page.toggleNativeTimezone();
+  assert.match(page.ids["native-timezone-toggle"].textContent, /已开启.*待保存/);
+  assert.equal(page.calls.save.length, 0);
+  assert.equal(page.calls.test, 0);
+  page.pollStatus();
+  await flush();
+  assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "true");
+  page.checkAccount(1);
+  await flush();
+  assert.equal(page.calls.scoped[0].native_timezone_by_ip, true, "The manual diagnostic uses the current explicit form choice");
+  assert.equal(page.calls.save.length, 0);
+  page.save();
+  await flush();
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
+  assert.equal(page.store.config.native_timezone_by_ip, true);
+  assert.equal(page.store.config.auto_degradation_enabled, true);
+  assert.equal(page.store.config.auto_degradation_manual_revision, 12);
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  const reopened = createPage({ store: page.store });
+  await flush();
+  assert.equal(reopened.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "true");
+  reopened.toggleNativeTimezone();
+  reopened.save();
+  await flush();
+  assert.equal(reopened.store.config.native_timezone_by_ip, false);
+  assert.equal(reopened.store.config.auto_degradation_enabled, true);
+  assert.equal(reopened.store.config.auto_degradation_manual_revision, 12);
+});
+
+test("request timezone setting must survive save acknowledgement and verification", async t => {
+  for (const phase of ["save", "load"]) {
+    await t.test(phase, async () => {
+      const page = createPage({
+        save: (config, store) => { store.config = clone(config); return Promise.resolve(phase === "save" ? { ...config, native_timezone_by_ip: false } : config); },
+        load: (count, store) => Promise.resolve(count > 1 && phase === "load" ? { ...store.config, native_timezone_by_ip: false } : clone(store.config)),
+      });
+      await flush();
+      page.toggleNativeTimezone();
+      page.save();
+      await flush();
+      assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
+      assert.match(page.ids["form-hint"].textContent, /请求时区开关.*不一致/);
+      assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "true");
+      assert.equal(page.ids["native-timezone-toggle"].disabled, false);
+    });
+  }
+});
+
+test("request timezone toggle stays locked while loading saving and verifying", async () => {
+  const initial = deferred();
+  const saving = deferred();
+  const verification = deferred();
+  const page = createPage({ load: number => number === 1 ? initial.promise : verification.promise, save: () => saving.promise });
+  await flush();
+  page.ids["native-timezone-toggle"].emit("click");
+  assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "false");
+  initial.resolve({ account_ids: [1], native_timezone_by_ip: false });
+  await flush();
+  page.toggleNativeTimezone();
+  page.save();
+  assert.equal(page.ids["native-environment-fields"].disabled, true);
+  page.ids["native-timezone-toggle"].emit("click");
+  assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "true");
+  saving.resolve(clone(page.calls.save[0]));
+  await flush();
+  assert.equal(page.ids["native-timezone-toggle"].disabled, true);
+  verification.resolve(clone(page.calls.save[0]));
+  await flush();
+  assert.equal(page.ids["native-timezone-toggle"].disabled, false);
+  assert.equal(page.ids["native-environment-fields"].disabled, false);
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
+});
+
+test("automatic native diagnostics default off and settings survive saving and reopening", async () => {
+  const page = createPage({ scoped: true });
+  await flush();
+  assert.equal(page.ids["auto-degradation-toggle"].getAttribute("aria-pressed"), "false");
+  assert.equal(page.ids["auto-degradation-interval"].value, "30");
+  assert.equal(page.ids["degradation-check-model"].value, "gpt-5.4");
+  page.toggleAutoDegradation();
+  assert.match(page.ids["auto-degradation-toggle"].textContent, /已开启.*待保存/);
+  assert.equal(page.calls.save.length, 0);
+  assert.equal(page.accountRow(1).checkbox.disabled, true);
+  page.ids["auto-degradation-interval"].userInput("45");
+  page.ids["degradation-check-model"].userInput("gpt-5.4-mini");
+  page.save();
+  await flush();
+  assert.equal(page.store.config.auto_degradation_enabled, true);
+  assert.equal(page.store.config.auto_degradation_interval_minutes, 45);
+  assert.equal(page.store.config.degradation_check_model, "gpt-5.4-mini");
+  assert.equal(page.calls.test, 0);
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
+  const reopened = createPage({ store: page.store });
+  await flush();
+  assert.equal(reopened.ids["auto-degradation-toggle"].getAttribute("aria-pressed"), "true");
+  assert.equal(reopened.ids["auto-degradation-interval"].value, "45");
+  assert.equal(reopened.ids["degradation-check-model"].value, "gpt-5.4-mini");
+});
+
+test("automatic diagnostic inputs reject invalid values without writes or requests", async t => {
+  for (const [field, value] of [
+    ["auto-degradation-interval", ""], ["auto-degradation-interval", "4"],
+    ["auto-degradation-interval", "1441"], ["auto-degradation-interval", "5.5"],
+    ["degradation-check-model", ""], ["degradation-check-model", "gpt 5.4"],
+    ["degradation-check-model", "gpt" + String.fromCharCode(0) + "5.4"],
+    ["degradation-check-model", "x".repeat(129)],
+  ]) {
+    await t.test(field + " / " + JSON.stringify(value), async () => {
+      const page = createPage({ scoped: true });
+      await flush();
+      page.ids[field].userInput(value);
+      page.save();
+      page.degradationCheck();
+      await flush();
+      assert.equal(page.calls.save.length, 0);
+      assert.equal((page.calls.scoped || []).length, 0);
+      assert.match(page.ids["form-hint"].textContent, /间隔|原生检测模型/);
+    });
+  }
+});
+
+test("automatic status drives displayed routes while saves preserve the routing baseline", async () => {
+  const baseline = { account_ids: [1, 2], excluded_account_ids: [3], auto_select_new_accounts: true };
+  const store = { config: { ...baseline, auto_degradation_enabled: true } };
+  const runtime = { enabled: true, running: false, interval_minutes: 30,
+    last_run_at: "2026-09-27T12:00:00Z", next_run_at: "2026-09-27T12:05:00Z", accounts: [
+      { account_id: 1, status: "ok", bps_enabled: false, managed: true },
+      { account_id: 2, status: "degraded", bps_enabled: true, managed: true },
+      { account_id: 3, status: "error", bps_enabled: false, managed: false },
+    ] };
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [1, 2, 3].map(id => ({ id, schedulable: true })), auto_degradation: runtime }) };
+  const page = createPage({ store, status, scoped: true });
+  await flush();
+  assert.deepEqual(page.selected(), [2]);
+  assert.match(page.accountRow(1).availability.textContent, /原生 Codex.*自动管理/);
+  assert.match(page.accountRow(2).availability.textContent, /BPS 已启用.*自动管理/);
+  assert.match(page.ids["auto-degradation-status"].textContent, /上次.*下次/);
+  page.check(1, true);
+  page.selectAll();
+  page.accountRow(1).checkbox.checked = true;
+  page.accountRow(1).checkbox.emit("change");
+  assert.deepEqual(page.selected(), [2]);
+  page.checkModel("gpt-6-sol", true);
+  page.save();
+  await flush();
+  for (const key of Object.keys(baseline)) assert.deepEqual(store.config[key], baseline[key]);
+  assert.deepEqual(page.selected(), [2]);
+  page.toggleAutoDegradation();
+  assert.equal(page.accountRow(1).checkbox.disabled, true, "Closing is pending until the save is confirmed");
+  runtime.enabled = false;
+  status.status_json = JSON.stringify({ accounts: [1, 2, 3].map(id => ({ id, schedulable: true })), auto_degradation: runtime });
+  page.save();
+  await flush();
+  assert.equal(store.config.auto_degradation_enabled, false);
+  for (const key of Object.keys(baseline)) assert.deepEqual(store.config[key], baseline[key]);
+  assert.deepEqual(page.selected(), [2]);
+  assert.equal(page.accountRow(1).checkbox.disabled, false);
+  page.check(1, true);
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 2], "Status must retain unsaved manual changes after closing automation");
+  page.save();
+  await flush();
+  assert.deepEqual(store.config.account_ids.slice().sort(), [1, 2]);
+  assert.deepEqual(store.config.excluded_account_ids, [3]);
+});
+
+test("automatic bulk checks only display results and BPS blocks still permit native checks", async () => {
+  const details = JSON.parse(bpsStatus([[2, bpsBlockA]]).status_json);
+  details.auto_degradation = { enabled: true, accounts: [
+    { account_id: 1, status: "ok", bps_enabled: false, managed: true },
+    { account_id: 2, status: "degraded", bps_enabled: false, managed: true },
+    { account_id: 3, status: "error", bps_enabled: true, managed: false },
+  ] };
+  const status = { healthy: true, status_json: JSON.stringify(details) };
+  const page = createPage({ scoped: true, status, store: { config: { account_ids: [1, 2, 3], auto_degradation_enabled: true } },
+    testScoped: config => Promise.resolve(scopedResult(config, { 1: { status: "degraded", answer: "苹果16" } })) });
+  await flush();
+  assert.deepEqual(page.selected(), [3]);
+  assert.equal(page.accountRow(2).button.disabled, false);
+  page.degradationCheck();
+  await flush();
+  assert.deepEqual(page.selected(), [3]);
+  assert.equal(page.calls.save.length, 0);
+  assert.equal(page.calls.scoped[0].degradation_check_model, "gpt-5.4");
+  assert.match(page.ids["form-hint"].textContent, /未按探针结果调整/);
+});
+
+test("automatic state shows confirmation and errors without overriding effective routes", async () => {
+  const status = { healthy: true, status_json: JSON.stringify({ accounts: [{ id: 1, schedulable: true }], auto_degradation: {
+    enabled: true, error: "native unavailable", accounts: [{ account_id: 1, status: "error", bps_enabled: true, managed: true, pending_status: "ok", consecutive: 1 }],
+  } }) };
+  const page = createPage({ status, store: { config: { auto_degradation_enabled: true, account_ids: [] } } });
+  await flush();
+  assert.deepEqual(page.selected(), [1]);
+  assert.ok(page.accountRow(1).result.textContent.includes("检测失败 · 待复测 1/2"));
+  assert.match(page.ids["auto-degradation-status"].textContent, /检测异常，保留路由.*native unavailable/);
+});
+
+test("unready automatic state cannot overwrite selections or allow stale account edits", async () => {
+  const details = { accounts: [{ id: 1, schedulable: true }, { id: 2, schedulable: true }], auto_degradation: {
+    enabled: false, ready: false, accounts: [{ account_id: 1, bps_enabled: false, managed: true }],
+  } };
+  const status = { healthy: true, status_json: JSON.stringify(details) };
+  const page = createPage({ status, store: { config: { account_ids: [1] } } });
+  await flush();
+  assert.deepEqual(page.selected(), [1]);
+  assert.equal(page.accountRow(1).checkbox.disabled, true);
+  assert.equal(page.accountRow(1).checkbox.indeterminate, true);
+  assert.match(page.ids["auto-degradation-status"].textContent, /正在加载/);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1]);
+  assert.equal(page.store.config.auto_select_new_accounts, undefined);
+  details.auto_degradation.ready = true;
+  status.status_json = JSON.stringify(details);
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), []);
+  assert.equal(page.accountRow(1).checkbox.disabled, false);
+  assert.equal(page.accountRow(1).checkbox.indeterminate, false);
+});
+
+test("canceling an unsaved automatic toggle preserves previous manual edits", async () => {
+  const page = createPage({ store: { config: { account_ids: [1] } } });
+  await flush();
+  page.check(2, true);
+  page.toggleAutoDegradation();
+  page.toggleAutoDegradation();
+  assert.deepEqual(page.selected(), [1, 2]);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1, 2]);
+  assert.equal(page.store.config.auto_degradation_enabled, false);
+});
+
+test("automatic settings must match save acknowledgement and confirmed read-back", async t => {
+  for (const phase of ["save", "load"]) {
+    await t.test(phase, async () => {
+      const page = createPage({
+        save: (config, store) => { store.config = clone(config); return Promise.resolve(phase === "save" ? { ...config, auto_degradation_enabled: false } : config); },
+        load: (count, store) => Promise.resolve(count > 1 && phase === "load" ? { ...store.config, auto_degradation_interval_minutes: 60 } : clone(store.config)),
+      });
+      await flush();
+      page.toggleAutoDegradation();
+      page.save();
+      await flush();
+      assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
+      assert.match(page.ids["form-hint"].textContent, /自动检测.*不一致/);
+      assert.equal(page.ids["auto-degradation-toggle"].getAttribute("aria-pressed"), "true");
+    });
+  }
+});
+
+test("manual revision invalidates automatic routes when an explicit edit returns to the original baseline", async () => {
+  const baseline = { account_ids: [1], excluded_account_ids: [7], auto_select_new_accounts: true };
+  const store = { config: { ...baseline, auto_degradation_enabled: true, auto_degradation_manual_revision: 11 } };
+  const page = createPage({ store, scoped: true, getStatus() {
+    const managed = store.config.auto_degradation_manual_revision === 11;
+    return Promise.resolve({ healthy: true, status_json: JSON.stringify({
+      accounts: [1, 7].map(id => ({ id, schedulable: true })),
+      auto_degradation: { ready: true, enabled: store.config.auto_degradation_enabled === true, accounts: [
+        { account_id: 1, status: "pending", bps_enabled: true, managed: false },
+        { account_id: 7, status: "degraded", bps_enabled: managed, managed },
+      ] },
+    }) });
+  } });
+  await flush();
+  assert.deepEqual(page.selected(), [1, 7]);
+  page.checkModel("gpt-6-sol", true);
+  page.save();
+  await flush();
+  assert.equal(store.config.auto_degradation_manual_revision, 11, "Ordinary automatic saves preserve revision");
+  page.toggleAutoDegradation();
+  page.save();
+  await flush();
+  assert.equal(store.config.auto_degradation_manual_revision, 11, "Closing automation preserves the last automatic route");
+  assert.deepEqual(page.selected(), [1, 7]);
+  page.check(7, false);
+  page.save();
+  await flush();
+  for (const key of Object.keys(baseline)) assert.deepEqual(store.config[key], baseline[key]);
+  assert.equal(store.config.auto_degradation_manual_revision, 12, "Explicit intent changes revision even when IDs equal the original baseline");
+  assert.deepEqual(page.selected(), [1]);
+  page.save();
+  await flush();
+  assert.equal(store.config.auto_degradation_manual_revision, 12, "A save without account edits cannot change revision");
+  page.check(7, true);
+  page.check(7, false);
+  page.checkAccount(1);
+  await flush();
+  assert.equal(page.calls.scoped.at(-1).auto_degradation_manual_revision, 12, "A manual probe does not persist route intent");
+  page.save();
+  await flush();
+  assert.equal(store.config.auto_degradation_manual_revision, 13, "Edit intent matters even when the net form selection is unchanged");
+});
+
+test("manual route revision reaches its safe integer limit and refuses further edits", async () => {
+  const page = createPage({ store: { config: { account_ids: [1], auto_degradation_manual_revision: Number.MAX_SAFE_INTEGER - 1 } } });
+  await flush();
+  page.check(2, true);
+  page.save();
+  await flush();
+  assert.equal(page.store.config.auto_degradation_manual_revision, Number.MAX_SAFE_INTEGER);
+  page.save();
+  await flush();
+  assert.equal(page.calls.save.length, 2, "Unedited saves remain possible at the limit");
+  page.check(2, false);
+  page.save();
+  await flush();
+  assert.equal(page.calls.save.length, 2);
+  assert.equal(page.store.config.auto_degradation_manual_revision, Number.MAX_SAFE_INTEGER);
+  assert.match(page.ids["form-hint"].textContent, /手动账号选择版本已达到上限/);
+  assert.deepEqual(page.selected(), [1], "The rejected edit remains visible for recovery");
+});
 
 test("configuration actions work without sandboxed form submission", () => {
   for (const id of ["save-button", "retry-button", "select-all-button", "bps-403-toggle"]) {
@@ -702,7 +1045,7 @@ test("selected accounts save on click, persist on read-back, and survive reopeni
   assert.equal(page.calls.load, 2, "Saving must confirm the persisted host configuration");
   const submitted = clone(page.calls.save[0]);
   submitted.account_ids.sort((a, b) => a - b);
-  assert.deepEqual(submitted, { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false, bps_auto_disable_on_403: true });
+  assert.deepEqual(submitted, { ...defaultAutoDegradation, auto_degradation_manual_revision: 1, account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false, bps_auto_disable_on_403: true });
   assert.deepEqual(page.selected(), [1, 2]);
   assert.match(page.ids["form-hint"].textContent, /已保存/);
   assert.equal(page.ids["account-fields"].disabled, false);
@@ -840,12 +1183,14 @@ test("a failed verification read never turns a save acknowledgement into success
 test("automatic images need no configuration controls", async () => {
   assert.match(htmlSource, /支持直接发送图片和截图，无需额外配置/);
   assert.doesNotMatch(htmlSource, /image-relay|图片中转|公网 HTTPS|反向代理|监听地址|存储目录/);
-  assert.doesNotMatch(htmlSource, /<input |<select |<details /);
+  const inputs = [...htmlSource.matchAll(/<input[^>]+id="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(inputs, ["auto-degradation-interval", "degradation-check-model"]);
+  assert.doesNotMatch(htmlSource, /<select |<details /);
   const page = createPage();
   await flush();
   page.save();
   await flush();
-  assert.deepEqual(page.calls.save[0], { account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels, bps_auto_disable_on_403: true });
+  assert.deepEqual(page.calls.save[0], { ...defaultAutoDegradation, account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels, bps_auto_disable_on_403: true });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
@@ -889,7 +1234,7 @@ test("a rejected save preserves account edits for retry", async () => {
   page.save();
   await flush();
   assert.equal(page.calls.save.length, 2);
-  assert.deepEqual(page.store.config, { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels, bps_auto_disable_on_403: true });
+  assert.deepEqual(page.store.config, { ...defaultAutoDegradation, auto_degradation_manual_revision: 1, account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels, bps_auto_disable_on_403: true });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
@@ -1495,11 +1840,11 @@ test("diagnostic controls explain probe scope, request cost, and both bulk selec
   const page = createPage({ scoped: true });
   await flush();
   const hint = page.ids["account-check-hint"].textContent;
-  assert.match(hint, /真实请求.*消耗额度/);
+  assert.match(hint, /原生 Codex.*消耗额度/);
   assert.match(hint, /本次探针/);
   assert.match(hint, /取消.*符合规则/);
-  assert.match(hint, /403.*已保存/);
-  assert.match(page.ids["degradation-check-button"].title, /取消.*符合规则/);
+  assert.match(hint, /原生错误不会触发 BPS 停用/);
+  assert.match(page.ids["degradation-check-button"].title, /原生 Codex.*自动模式仅展示结果/);
   assert.match(page.accountRow(1).button.title, /探针结果/);
   assert.match(htmlSource, /PDF.*Word/);
   assert.match(htmlSource, /客户端.*工具/);
@@ -1601,7 +1946,7 @@ test("scoped diagnostics do not acknowledge unsaved 403 restores", async () => {
     store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2] } } });
   await flush();
   page.check(2, true);
-  assert.equal(page.accountRow(2).button.disabled, true);
+  assert.equal(page.accountRow(2).button.disabled, false);
   page.checkAccount(1);
   await flush();
   assert.ok(!page.calls.scoped[0].bps_reenabled_accounts || !page.calls.scoped[0].bps_reenabled_accounts[2]);
@@ -1845,7 +2190,7 @@ test("lost or invalid prepare acknowledgements never auto-commit and retain a qu
         page.degradationCheck();
         await flush();
         assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
-        assert.equal(page.ids["degradation-check-button"].textContent, "一键检测降智账号");
+        assert.equal(page.ids["degradation-check-button"].textContent, "一键检测原生 Codex");
       }
     });
   }

@@ -34,6 +34,11 @@
     "excluded_account_ids",
     "bps_reenabled_accounts",
     "bps_auto_disable_on_403",
+    "auto_degradation_enabled",
+    "auto_degradation_interval_minutes",
+    "auto_degradation_manual_revision",
+    "native_timezone_by_ip",
+    "degradation_check_model",
     "max_response_bytes",
     "auth_mode",
     "tools_version_id",
@@ -52,6 +57,12 @@
   var excludedIDs = [];
   var autoSelectNewAccounts = false;
   var bpsAutoDisableOn403 = true;
+  var autoDegradationEnabled = false;
+  var nativeTimezoneByIP = false;
+  var autoDegradationStatus = null;
+  var autoDegradationAccounts = new Map();
+  var accountSelectionEdited = false;
+  var pendingManualAccountSelection = null;
   var accountDirectoryReady = false;
   var knownAccountIDs = [];
   var knownAccountIDSet = new Set();
@@ -119,7 +130,13 @@
     id("retry-button").hidden = configReady || loading;
     id("retry-button").disabled = loading || saving || checking;
     id("bps-403-toggle").disabled = locked;
+    id("auto-degradation-fields").disabled = locked;
+    id("auto-degradation-toggle").disabled = locked;
+    id("native-environment-fields").disabled = locked;
+    id("native-timezone-toggle").disabled = locked;
     renderBps403Toggle();
+    renderAutoDegradation();
+    renderNativeTimezoneToggle();
     var degradationButton = id("degradation-check-button");
     var supported = supportsAccountChecks();
     var pendingCheck = hasPendingAccountCheck();
@@ -128,23 +145,22 @@
     if (degradationButton) {
       degradationButton.disabled = locked || (!pendingCheck && (!supported || !accounts.some(canCheckAccount)));
       degradationButton.title = pendingCheck ? "仅查询上次检测任务，不重复提交检测请求" :
-        (supported ? "检测当前列表账号；发现疑似账号时勾选它们，并取消符合规则账号的勾选，保存后生效" : unavailableReason);
+        (supported ? "检测当前列表账号的原生 Codex；自动模式仅展示结果，手动模式改选后需保存" : unavailableReason);
       degradationButton.textContent = checking && !checkingAccountID ? "正在检测列表账号…" :
-        (pendingCheck ? "继续查询上次检测" : "一键检测降智账号");
+        (pendingCheck ? "继续查询上次检测" : "一键检测原生 Codex");
     }
     accountCheckButtons.forEach(function (entry) {
       var pendingTarget = pendingCheck && pendingAccountCheck.accountID === entry.account.id;
       entry.button.disabled = locked || (pendingCheck ? !pendingTarget : (!supported || !canCheckAccount(entry.account)));
       entry.button.title = pendingCheck ? "上次检测尚未确认，请先继续查询原任务" : !supported ? unavailableReason :
-        (bpsDisabledAccounts.has(entry.account.id) ? "BPS 已停用，请重新勾选并保存后检测" :
-          (!entry.account.schedulable ? "账号不可调度，请先恢复账号" : "仅检测此账号，不按探针结果改选；403 自动停用仍会生效"));
+        (!entry.account.schedulable ? "账号不可调度，请先恢复账号" : "仅检测此账号的原生 Codex，不按手动探针结果改选；BPS 403 保护不影响原生检测");
       entry.button.textContent = checking && checkingAccountID === entry.account.id ? "检测中…" : (pendingTarget ? "继续查询" : "降智检测");
     });
     var checkHint = id("account-check-hint");
     if (checkHint) checkHint.textContent = pendingCheck
       ? "上次检测结果未确认，可能已提交。请继续查询原任务；确认结束或过期前不会创建新检测。"
       : supported
-        ? "检测会发送真实请求并消耗额度，仅反映本次探针。单号不按探针结果改选；一键检测发现疑似账号时会勾选它们并取消符合规则账号的勾选，失败或跳过保持原选择，改选需保存。检测使用当前表单快照，不自动保存配置；403 自动停用仍按已保存开关执行，可立即取消相关账号勾选。" +
+        ? "手动检测请求 OpenAI 原生 Codex，会消耗额度，仅反映本次探针。单号不改选；自动模式下批量也不改选。手动模式批量发现疑似账号时勾选它们并取消符合规则账号的勾选，失败或跳过保持原选择，改选需保存。检测使用当前表单快照，不自动保存配置。BPS 403 保护不阻止原生检测，原生错误不会触发 BPS 停用。" +
           (supportsScopedChecks() ? "" : "兼容模式由当前插件运行实例串行执行，无需修改宿主；提交失败可能仅表示回执未确认。")
         : unavailableReason;
     updateAccountActions();
@@ -163,7 +179,7 @@
   }
 
   function canCheckAccount(account) {
-    return isSelectableAccount(account) && account.schedulable === true && !bpsDisabledAccounts.has(account.id);
+    return isSelectableAccount(account) && account.schedulable === true;
   }
 
   function statusLabel(account) {
@@ -181,6 +197,12 @@
   function bpsAvailabilityLabel(account) {
     if (hasPendingBpsRestore(account.id)) return "BPS 待恢复（保存生效）";
     if (bpsDisabledAccounts.has(account.id)) return "BPS 已禁用（HTTP 403）";
+    var auto = autoDegradationAccounts.get(account.id);
+    if (auto && autoDegradationStatus.ready !== false && (autoDegradationStatus.enabled || auto.managed)) {
+      return (isSelected(account.id) ? "BPS 已启用" : "原生 Codex（BPS 未启用）") +
+        (autoDegradationStatus.enabled ? " · 自动管理" : " · 保留最后路由");
+    }
+    if (automaticAccountSelectionLocked()) return "BPS 路由状态待同步";
     return account.schedulable ? "可用" : (account.status || "暂停");
   }
 
@@ -309,6 +331,136 @@
     bpsAutoDisableOn403 = !bpsAutoDisableOn403;
     renderBps403Toggle();
     scheduleResize();
+  }
+
+  function renderNativeTimezoneToggle() {
+    var pending = nativeTimezoneByIP !== (loaded.native_timezone_by_ip === true);
+    var button = id("native-timezone-toggle");
+    button.textContent = "请求时区跟随出口 IP：" + (nativeTimezoneByIP ? "已开启" : "已关闭") + (pending ? "（待保存）" : "");
+    button.setAttribute("aria-pressed", String(nativeTimezoneByIP));
+  }
+
+  function toggleNativeTimezone(event) {
+    event.preventDefault();
+    if (!configReady || saving || loading || checking) return;
+    nativeTimezoneByIP = !nativeTimezoneByIP;
+    renderNativeTimezoneToggle();
+    scheduleResize();
+  }
+
+  function verifyNativeTimezonePolicy(config, expected) {
+    if ((config.native_timezone_by_ip === true) !== (expected.native_timezone_by_ip === true)) {
+      throw new Error("宿主返回的请求时区开关与提交内容不一致，请重新保存");
+    }
+  }
+
+  function automaticAccountSelectionLocked() {
+    return autoDegradationEnabled || loaded.auto_degradation_enabled === true ||
+      !!(autoDegradationStatus && autoDegradationStatus.ready === false);
+  }
+
+  function renderAutoDegradation() {
+    var pending = autoDegradationEnabled !== (loaded.auto_degradation_enabled === true);
+    var button = id("auto-degradation-toggle");
+    button.textContent = "自动检测与切换：" + (autoDegradationEnabled ? "已开启" : "已关闭") + (pending ? "（待保存）" : "");
+    button.setAttribute("aria-pressed", String(autoDegradationEnabled));
+    var runtime = autoDegradationStatus;
+    var parts = [runtime && runtime.ready === false ? "正在加载自动检测路由状态" :
+      runtime && runtime.enabled ? (runtime.running ? "正在检测原生 Codex" : "自动检测运行中") : "自动检测已关闭"];
+    if (runtime && runtime.last_run_at) parts.push("上次：" + displayCheckTime(runtime.last_run_at));
+    if (runtime && runtime.enabled && runtime.next_run_at) parts.push("下次：" + displayCheckTime(runtime.next_run_at));
+    if (runtime && runtime.error) parts.push("检测异常，保留路由：" + String(runtime.error).slice(0, 160));
+    if (pending) parts.push("开关变更待保存");
+    id("auto-degradation-status").textContent = parts.join(" · ");
+  }
+
+  function displayCheckTime(value) {
+    var parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? String(value).slice(0, 80) : parsed.toLocaleString();
+  }
+
+  function toggleAutoDegradation(event) {
+    event.preventDefault();
+    if (!configReady || saving || loading || checking) return;
+    if (!autoDegradationEnabled && loaded.auto_degradation_enabled !== true) {
+      pendingManualAccountSelection = { selected: selectedIDs.slice(), excluded: excludedIDs.slice(), edited: accountSelectionEdited };
+      accountSelectionEdited = false;
+      applyAutoDegradationSelections();
+    } else if (autoDegradationEnabled && loaded.auto_degradation_enabled !== true && pendingManualAccountSelection) {
+      selectedIDs = pendingManualAccountSelection.selected;
+      selectedIDSet = new Set(selectedIDs);
+      excludedIDs = pendingManualAccountSelection.excluded;
+      accountSelectionEdited = pendingManualAccountSelection.edited;
+      pendingManualAccountSelection = null;
+    }
+    autoDegradationEnabled = !autoDegradationEnabled;
+    renderAccountList();
+    renderAccountHint();
+    updateControls();
+    scheduleResize();
+  }
+
+  function autoDegradationSettings(config) {
+    return { enabled: config.auto_degradation_enabled === true,
+      interval: config.auto_degradation_interval_minutes == null ? 30 : config.auto_degradation_interval_minutes,
+      revision: config.auto_degradation_manual_revision == null ? 0 : config.auto_degradation_manual_revision,
+      model: config.degradation_check_model == null ? "gpt-5.4" : config.degradation_check_model };
+  }
+
+  function verifyAutoDegradation(config, expected) {
+    if (JSON.stringify(autoDegradationSettings(config)) !== JSON.stringify(autoDegradationSettings(expected))) {
+      throw new Error("宿主返回的自动检测开关、周期、原生模型或手动选择版本与提交内容不一致，请重新保存");
+    }
+  }
+
+  function readAutoDegradationSettings(config) {
+    var interval = Number(id("auto-degradation-interval").value);
+    var model = id("degradation-check-model").value;
+    if (!Number.isInteger(interval) || interval < 5 || interval > 1440) {
+      throw new Error("常规检测间隔必须是 5–1440 分钟的整数");
+    }
+    var modelBytes = typeof model === "string" ? Array.from(model).reduce(function (total, character) {
+      var point = character.codePointAt(0);
+      return total + (point < 128 ? 1 : point < 2048 ? 2 : point < 65536 ? 3 : 4);
+    }, 0) : 0;
+    if (!modelBytes || modelBytes > 128 || Array.from(model).some(function (character) {
+      var code = character.codePointAt(0);
+      return !character.trim() || code < 32 || (code >= 127 && code <= 159);
+    })) {
+      throw new Error("原生检测模型不能为空，不得包含空格或控制字符，且最多 128 字节");
+    }
+    config.auto_degradation_enabled = autoDegradationEnabled;
+    config.auto_degradation_interval_minutes = interval;
+    config.degradation_check_model = model;
+  }
+
+  function applyAutoDegradationSelections() {
+    if (!autoDegradationStatus || autoDegradationStatus.ready === false || accountSelectionEdited) return;
+    var selected = new Set(selectedIDs);
+    var excluded = new Set(excludedIDs);
+    autoDegradationAccounts.forEach(function (entry, accountID) {
+      if (!autoDegradationStatus.enabled && entry.managed !== true) return;
+      if (entry.bps_enabled) { selected.add(accountID); excluded.delete(accountID); }
+      else { selected.delete(accountID); excluded.add(accountID); }
+    });
+    selectedIDs = Array.from(selected);
+    selectedIDSet = selected;
+    excludedIDs = Array.from(excluded);
+    applyBpsDisabledSelection();
+  }
+
+  function updateAutoDegradationStatus(details) {
+    var runtime = details.auto_degradation;
+    if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) return;
+    autoDegradationStatus = runtime;
+    if (runtime.ready === false) { renderAutoDegradation(); return; }
+    autoDegradationAccounts = new Map();
+    (Array.isArray(runtime.accounts) ? runtime.accounts : []).forEach(function (entry) {
+      if (!entry || !Number.isSafeInteger(entry.account_id) || entry.account_id <= 0 || typeof entry.bps_enabled !== "boolean") return;
+      autoDegradationAccounts.set(entry.account_id, entry);
+    });
+    applyAutoDegradationSelections();
+    renderAutoDegradation();
   }
 
   function verifyBpsPolicies(config, expected) {
@@ -441,6 +593,7 @@
         selectedIDSet.add(account.id);
       }
     });
+    applyAutoDegradationSelections();
   }
 
   function adoptSubmittedAccountPolicy(config) {
@@ -457,15 +610,16 @@
     });
     var allSelected = selectable.length > 0 && selectable.every(function (account) { return isSelected(account.id); });
     var button = id("select-all-button");
-    button.disabled = !configReady || saving || loading || checking || !selectable.length;
+    button.disabled = !configReady || saving || loading || checking || automaticAccountSelectionLocked() || !selectable.length;
     button.textContent = allSelected ? "已全选列表账号" : "全选列表账号";
     button.title = allSelected ? "当前列表账号已全部勾选；保存后生效" : "勾选当前列表账号，保存后生效";
   }
 
   function selectAllAccounts() {
-    if (!configReady || saving || loading || checking) {
+    if (!configReady || saving || loading || checking || automaticAccountSelectionLocked()) {
       return;
     }
+    accountSelectionEdited = true;
     // 只补选当前列表中的账号；保留已保存但暂未出现在状态列表里的账号。
     var visibleIDs = new Set();
     accounts.forEach(function (account) {
@@ -488,7 +642,8 @@
       var check = accountChecks[account.id];
       return [account.id, accountDisplayName(account), !!account.schedulable, account.status || "",
         isSelected(account.id), check ? check.status : "", check ? check.detail : "",
-        bpsDisabledAccounts.get(account.id), hasPendingBpsRestore(account.id)];
+        bpsDisabledAccounts.get(account.id), hasPendingBpsRestore(account.id), automaticAccountSelectionLocked(),
+        autoDegradationStatus && autoDegradationStatus.enabled, autoDegradationStatus && autoDegradationStatus.ready, autoDegradationAccounts.get(account.id)];
     }));
   }
 
@@ -522,12 +677,14 @@
       box.type = "checkbox";
       box.value = String(account.id);
       box.checked = isSelected(account.id);
-      box.disabled = bpsDisabledAccounts.has(account.id) && !bpsDisabledAccounts.get(account.id);
+      box.indeterminate = automaticAccountSelectionLocked() && (!autoDegradationStatus || autoDegradationStatus.ready === false || !autoDegradationAccounts.has(account.id));
+      box.disabled = automaticAccountSelectionLocked() || (bpsDisabledAccounts.has(account.id) && !bpsDisabledAccounts.get(account.id));
       box.addEventListener("change", function () {
-        if (!configReady || saving || loading || checking) {
+        if (!configReady || saving || loading || checking || automaticAccountSelectionLocked()) {
           box.checked = isSelected(account.id);
           return;
         }
+        accountSelectionEdited = true;
         var value = Number.parseInt(box.value, 10);
         setAccountSelected(value, box.checked);
         if (bpsDisabledAccounts.has(value)) renderAccountList();
@@ -551,8 +708,16 @@
       row.appendChild(label);
       var result = document.createElement("span");
       var check = accountChecks[account.id];
+      var autoCheck = autoDegradationAccounts.get(account.id);
+      if (autoCheck && autoDegradationStatus.ready !== false && (autoDegradationStatus.enabled || autoCheck.managed)) {
+        check = { status: autoCheck.status || "pending", detail: "原生 Codex 自动检测" };
+        if (autoCheck.checked_at) check.detail += "；上次：" + displayCheckTime(autoCheck.checked_at);
+        if (autoCheck.next_check_at && autoDegradationStatus.enabled) check.detail += "；下次：" + displayCheckTime(autoCheck.next_check_at);
+        if (autoCheck.pending_status) check.detail += "；等待复测确认：" + degradationStatusLabel(autoCheck.pending_status) + "（" + (autoCheck.consecutive || 0) + "/2）";
+      }
       result.className = "account-check-result" + (check ? " result-" + check.status : "");
-      result.textContent = check ? degradationStatusLabel(check.status) : "未检测";
+      result.textContent = check && check.status !== "pending" ? degradationStatusLabel(check.status) : "未检测";
+      if (autoCheck && autoCheck.pending_status) result.textContent += " · 待复测 " + (autoCheck.consecutive || 0) + "/2";
       result.title = check ? check.detail || "" : "";
       result.setAttribute("role", "status");
       row.appendChild(result);
@@ -576,6 +741,13 @@
     updateAccountActions();
     var hint = id("account-hint");
     var count = selectedIDs.length;
+    if (automaticAccountSelectionLocked()) {
+      hint.textContent = (!autoDegradationStatus || autoDegradationStatus.ready === false
+        ? "正在获取后台有效路由，勾选状态待同步；"
+        : "自动检测管理账号路由，当前 " + count + " 个账号使用 BPS；列表显示后台实际状态，") +
+        "手动勾选已锁定。关闭自动并保存后可手动编辑，最后有效路由会保留。BPS 403 停用保护仍有效，自动检测不会解除封禁；恢复封禁请先关闭自动并保存，再重新勾选账号保存。";
+      return;
+    }
     hint.textContent =
       "已勾选 " + count + " 个账号；取消勾选的账号原样透传。" +
       (loaded.auto_select_new_accounts === true
@@ -634,6 +806,19 @@
     });
     config.account_ids = selectedIDs.length ? selectedIDs.slice() : [];
     config.bps_auto_disable_on_403 = bpsAutoDisableOn403;
+    config.native_timezone_by_ip = nativeTimezoneByIP;
+    readAutoDegradationSettings(config);
+    var revision = autoDegradationSettings(loaded).revision;
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new Error("手动账号选择版本无效，请重新读取配置");
+    }
+    if (includePendingRestores === true && accountSelectionEdited && !automaticAccountSelectionLocked()) {
+      if (revision === Number.MAX_SAFE_INTEGER) {
+        throw new Error("手动账号选择版本已达到上限，无法保存账号修改；请先处理持久化版本后重试");
+      }
+      revision++;
+    }
+    config.auto_degradation_manual_revision = revision;
     // 旧非空白名单必须先拿到有效目录，才能保留已知未勾选账号的透传行为。
     if (autoSelectNewAccounts || accountDirectoryReady) {
       config.auto_select_new_accounts = true;
@@ -658,7 +843,16 @@
     delete config.degradation_check_account_id;
     delete config.degradation_check_account_ids;
     delete config.diagnostic_task;
-    return mergeBpsAccountPolicy(config, includePendingRestores === true);
+    config = mergeBpsAccountPolicy(config, includePendingRestores === true);
+    // Runtime decisions live in plugin storage. Do not replace their baseline
+    // with a stale form snapshot, including the save that disables automation.
+    if (automaticAccountSelectionLocked()) {
+      ["account_ids", "auto_select_new_accounts", "excluded_account_ids"].forEach(function (key) {
+        if (Object.prototype.hasOwnProperty.call(loaded, key)) config[key] = loaded[key];
+        else delete config[key];
+      });
+    }
+    return config;
   }
 
   function configAccountIDs(config, key) {
@@ -702,7 +896,7 @@
   }
 
   function sameAccountPolicy(config, expected) {
-    if (!sameAccountIDs(config, expected.account_ids)) return false;
+    if (!sameAccountIDs(config, configAccountIDs(expected))) return false;
     if ((config.auto_select_new_accounts === true) !== (expected.auto_select_new_accounts === true)) return false;
     var actual = configAccountIDs(config, "excluded_account_ids");
     var excluded = configAccountIDs(expected, "excluded_account_ids");
@@ -715,12 +909,27 @@
   }
 
   function applyConfig(config) {
+    var previousRevision = autoDegradationSettings(loaded).revision;
     loaded = config && typeof config === "object" && !Array.isArray(config) ? Object.assign({}, config) : {};
+    if (configReady && previousRevision !== autoDegradationSettings(loaded).revision) {
+      // These cached decisions belong to the previous manual baseline. The
+      // forced status refresh after saving will supply matching decisions.
+      autoDegradationAccounts = new Map();
+    }
     selectedIDs = configAccountIDs(loaded);
     selectedIDSet = new Set(selectedIDs);
     excludedIDs = configAccountIDs(loaded, "excluded_account_ids");
     autoSelectNewAccounts = loaded.auto_select_new_accounts === true || selectedIDs.length === 0;
     bpsAutoDisableOn403 = loaded.bps_auto_disable_on_403 !== false;
+    autoDegradationEnabled = loaded.auto_degradation_enabled === true;
+    nativeTimezoneByIP = loaded.native_timezone_by_ip === true;
+    renderNativeTimezoneToggle();
+    accountSelectionEdited = false;
+    pendingManualAccountSelection = null;
+    var autoSettings = autoDegradationSettings(loaded);
+    id("auto-degradation-interval").value = String(autoSettings.interval);
+    id("degradation-check-model").value = autoSettings.model;
+    renderAutoDegradation();
     renderBps403Toggle();
     // A diagnostic save preserves confirmed acknowledgements only. Keep a
     // user's still-unsaved restore choice local until an ordinary save.
@@ -735,6 +944,7 @@
     });
     excludedIDs = excludedIDs.filter(function (value) { return !pendingRestores.has(value); });
     syncAutomaticAccounts();
+    applyAutoDegradationSelections();
     selectedModels = configModels(loaded);
     renderModelList();
     renderAccountList();
@@ -774,6 +984,7 @@
     });
     updateBpsDisabledAccounts(details);
     syncAutomaticAccounts();
+    updateAutoDegradationStatus(details);
     if (details.degradation_check && !(lastDegradationCheck && lastDegradationCheck.request_id)) {
       rememberAccountChecks(details.degradation_check);
       renderDegradationResult(details.degradation_check);
@@ -793,7 +1004,9 @@
     if (Array.isArray(activeModels)) {
       line.push(activeModels.length ? "已启用模型 " + activeModels.join(", ") : "未启用模型（全部透传）");
     }
-    if (details.auto_select_new_accounts === true) {
+    if (details.auto_degradation && details.auto_degradation.enabled) {
+      line.push("原生 Codex 自动检测与切换");
+    } else if (details.auto_select_new_accounts === true) {
       line.push("新增账号自动使用 BPS");
     } else if (Array.isArray(details.account_ids) && details.account_ids.length) {
       line.push("固定 #" + details.account_ids.join(" #"));
@@ -877,8 +1090,9 @@
     if (saving || loading || checking || !configReady) {
       return;
     }
-    var submitted = readForm(true);
-    adoptSubmittedAccountPolicy(submitted);
+    var submitted;
+    try { submitted = readForm(true); } catch (error) { setHint(error.message, "error"); return; }
+    if (!automaticAccountSelectionLocked()) adoptSubmittedAccountPolicy(submitted);
     saving = true;
     updateControls();
     var writeAcknowledged = false;
@@ -887,6 +1101,8 @@
       .saveConfig(submitted)
       .then(function (normalized) {
         verifyBpsPolicies(normalized, submitted);
+        verifyAutoDegradation(normalized, submitted);
+        verifyNativeTimezonePolicy(normalized, submitted);
         if (!sameAccountPolicy(normalized, submitted)) {
           throw new Error("宿主返回的账号选择、自动接入模式或排除名单与提交内容不一致");
         }
@@ -902,6 +1118,8 @@
       })
       .then(function (persisted) {
         verifyBpsPolicies(persisted, submitted);
+        verifyAutoDegradation(persisted, submitted);
+        verifyNativeTimezonePolicy(persisted, submitted);
         if (!sameAccountPolicy(persisted, submitted)) {
           throw new Error("重新读取的账号选择、自动接入模式或排除名单与提交内容不一致，请重试或检查宿主日志");
         }
@@ -942,7 +1160,9 @@
     if (!resuming && (single ? !canCheckAccount(target) : !accounts.some(canCheckAccount))) return;
     var targets = resuming ? pendingAccountCheck.targets.slice() :
       (single ? [accountID] : accounts.filter(isSelectableAccount).map(function (account) { return account.id; }));
-    var snapshot = resuming ? pendingAccountCheck.snapshot : readForm(false);
+    var snapshot;
+    try { snapshot = resuming ? pendingAccountCheck.snapshot : readForm(false); }
+    catch (error) { setHint(error.message, "error"); return; }
     if (!resuming) {
       snapshot.degradation_check = true;
       if (single) snapshot.degradation_check_account_id = accountID;
@@ -989,7 +1209,8 @@
       renderDiagnosticTask({ task_id: check.request_id, state: check.completed === true ? "completed" : "unknown" });
       renderDegradationResult(check);
       var degraded = confirmedDegradedIDs(check);
-      if (!single && check.completed === true && degraded.length) {
+      if (!automaticAccountSelectionLocked() && !single && check.completed === true && degraded.length) {
+        accountSelectionEdited = true;
         var selected = new Set(degraded);
         results.forEach(function (row) {
           if ((row.status === "ok" || row.status === "degraded") &&
@@ -1032,6 +1253,8 @@
     id("save-button").addEventListener("click", handleSave);
     id("select-all-button").addEventListener("click", selectAllAccounts);
     id("bps-403-toggle").addEventListener("click", toggleBps403);
+    id("auto-degradation-toggle").addEventListener("click", toggleAutoDegradation);
+    id("native-timezone-toggle").addEventListener("click", toggleNativeTimezone);
     var degradationButton = id("degradation-check-button");
     if (degradationButton) {
       degradationButton.addEventListener("click", handleDegradationCheck);

@@ -30,17 +30,19 @@ type Transport struct {
 	mu sync.RWMutex
 	// cfg and its slices are immutable after publication. New/ApplyConfig
 	// own the storage; readers take a value snapshot under mu.
-	cfg            protocol.Config
-	client         *http.Client
-	closed         bool
-	broker         *hcplugin.GRPCBroker
-	host           pluginv1.HostServiceClient
-	hostConn       *grpc.ClientConn
-	accounts       accountCache
-	bpsAccounts    bpsAccountState
-	diagnosticJobs *diagnosticJobStore
-	attachments    *attachments.Uploader
-	imageAdmission imageRequestAdmission
+	cfg             protocol.Config
+	client          *http.Client
+	closed          bool
+	broker          *hcplugin.GRPCBroker
+	host            pluginv1.HostServiceClient
+	hostConn        *grpc.ClientConn
+	accounts        accountCache
+	bpsAccounts     bpsAccountState
+	diagnosticJobs  *diagnosticJobStore
+	autoDegradation autoDegradationState
+	nativeTimezone  *nativeTimezoneResolver
+	attachments     *attachments.Uploader
+	imageAdmission  imageRequestAdmission
 	// proxyClients 按账号代理 URL 复用独立的 Transport。此前每个请求都会
 	// Clone 一个 Transport 并立即关闭连接池，带代理的并发请求无法复用连接。
 	// 同时获取两把锁时始终先 mu 后 proxyMu；生命周期切换与缓存摘除
@@ -107,9 +109,11 @@ func (t *Transport) Shutdown() {
 	t.hostConn = nil
 	t.host = nil
 	t.bindBPSAccountStore(nil)
+	t.bindAutoDegradation(nil)
 	t.accounts.invalidate()
 	proxyClients := t.detachProxyClients()
 	t.mu.Unlock()
+	t.autoDegradation.workers.Wait()
 	t.diagnosticJobs.stop()
 	closeCachedProxyClients(proxyClients)
 	if client != nil {
@@ -268,6 +272,7 @@ func (t *Transport) InitHostServices(ctx context.Context, r *pluginv1.InitHostSe
 	t.hostConn = conn
 	t.host = pluginv1.NewHostServiceClient(conn)
 	t.bindBPSAccountStore(t.host)
+	t.bindAutoDegradation(t.host)
 	t.accounts.invalidate()
 	t.mu.Unlock()
 	if old != nil {
@@ -288,6 +293,7 @@ func (t *Transport) Health(ctx context.Context, _ *pluginv1.HealthRequest) (*plu
 	accounts := t.accountDirectory(ctx)
 	healthy, message := !closed, healthMessage(closed)
 	status := t.bpsAccountStatusJSON(healthStatusJSON(cfg, accounts), cfg)
+	status = t.autoDegradationStatusJSON(status, cfg, accounts)
 	return &pluginv1.HealthResponse{Healthy: healthy, Message: message, StatusJson: t.diagnosticStatusJSON(status)}, nil
 }
 
@@ -479,6 +485,7 @@ func (t *Transport) ApplyConfig(ctx context.Context, r *pluginv1.ApplyConfigRequ
 		t.client = newClient(c)
 		proxyClients = t.detachProxyClients()
 	}
+	t.configureAutoDegradation(t.cfg, c)
 	t.cfg = c
 	t.mu.Unlock()
 	// 代理客户端绑定旧配置的超时/TLS 参数，应用新配置后必须丢弃旧缓存。
@@ -599,8 +606,12 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 
 	// 自动模式下新增账号直接走 BPS，明确取消的账号原样透传。旧配置继续使用
 	// 白名单，直到配置页保存完成迁移；无需账号轮询或打开页面才能接入新 ID。
-	if !cfg.HandlesAccount(start.GetAccountId()) {
-		return t.passthrough(stream, start, body, client, cfg.MaxResponseBytes)
+	useBPS, selectionErr := t.automaticBPSSelection(cfg, start.GetAccountId())
+	if selectionErr != nil && protocol.HandlesModel(protocol.RequestedModel(body), cfg) {
+		return sendError(stream, "automatic_routing_state_unavailable", safeError(selectionErr), true)
+	}
+	if !useBPS {
+		return t.passthrough(stream, start, body, client, cfg)
 	}
 
 	// 只有本插件对外提供的模型才走 Basis Points。宿主会用普通 Codex 模型
@@ -608,10 +619,10 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	// Basis Points 会被上游以 403 basispoints_model_access_changed 拒绝，宿主
 	// 随即把账号判成异常/限流。未知模型一律原样透传。
 	if !protocol.HandlesModel(protocol.RequestedModel(body), cfg) {
-		return t.passthrough(stream, start, body, client, cfg.MaxResponseBytes)
+		return t.passthrough(stream, start, body, client, cfg)
 	}
 	if t.isBPSAccountDisabled(start.GetAccountId(), cfg) {
-		return t.passthrough(stream, start, body, client, cfg.MaxResponseBytes)
+		return t.passthrough(stream, start, body, client, cfg)
 	}
 	if start.GetAccountId() > 0 {
 		if err := t.bpsAccountStoreError(); err != nil {
@@ -640,6 +651,9 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		return sendError(stream, "invalid_proxy", "proxy client is unavailable", false)
 	}
 	requestClient = withoutBPSRedirects(requestClient)
+	if start.GetMethod() == http.MethodPost && requestHeaders.Get("Content-Encoding") == "" {
+		body = t.applyAccountTimezoneBody(stream.Context(), cfg, start.GetAccountId(), proxyURL, requestClient, body, false)
+	}
 	requestBody := body
 	var source map[string]any
 	imagesRewritten := false
@@ -838,13 +852,14 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	return sendHTTPResponse(stream, resp, responseBody, responseContentType)
 }
 
-// passthrough 把宿主的请求原样送到宿主原本指定的上游，不做任何改写。
+// passthrough forwards to the host-selected upstream. The opt-in timezone
+// feature only updates the environment context of native Codex requests.
 //
-// 用途：账号白名单模式下宿主调度的账号不在勾选列表里 —— 这个账号不应该被插件
-// 改写。宿主已经把请求交给了插件，而插件无法拒绝接管，所以这里做一次与"没有
-// 启用插件"等价的转发：URL、方法、请求头、请求体原样发出，响应原样流回，
-// 既不注入 Basis Points 头，也不改写工具目录，更不做响应转换。
-func (t *Transport) passthrough(stream pluginv1.TransportPlugin_ForwardServer, start *pluginv1.ForwardRequestStart, body []byte, client *http.Client, max int) error {
+// Unselected accounts, unsupported BPS models and restricted BPS accounts
+// retain the host URL, method, identity headers and response stream. The body
+// is unchanged unless the independent native timezone option is enabled;
+// BPS headers, tool rewriting and response conversion never enter this path.
+func (t *Transport) passthrough(stream pluginv1.TransportPlugin_ForwardServer, start *pluginv1.ForwardRequestStart, body []byte, client *http.Client, cfg protocol.Config) error {
 	target := strings.TrimSpace(start.GetUrl())
 	if target == "" {
 		return sendError(stream, "invalid_request", "host did not provide an upstream URL for this account", false)
@@ -882,12 +897,13 @@ func (t *Transport) passthrough(stream pluginv1.TransportPlugin_ForwardServer, s
 	if requestClient == nil {
 		return sendError(stream, "invalid_proxy", "proxy client is unavailable", false)
 	}
+	t.applyNativeTimezone(cfg, start.GetAccountId(), start.GetProxyUrl(), requestClient, req)
 	resp, err := requestClient.Do(req)
 	if err != nil {
 		return sendError(stream, "upstream_transport", safeTransportError(err), true)
 	}
 	defer resp.Body.Close()
-	return sendHTTPResponseStream(stream, resp, max)
+	return sendHTTPResponseStream(stream, resp, cfg.MaxResponseBytes)
 }
 
 // passthroughRequestHeader 过滤 hop-by-hop 头以及由 Go 传输层自行决定的头。

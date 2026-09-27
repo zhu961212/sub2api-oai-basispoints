@@ -32,6 +32,10 @@ func (t *Transport) testScopedDegradation(ctx context.Context, c protocol.Config
 	if !c.DegradationCheck || (c.DegradationCheckAccountID <= 0 && len(c.DegradationCheckAccountIDs) == 0) {
 		return &pluginv1.TestConfigResponse{Success: false, Message: "degradation check requires an explicit account or non-empty account snapshot"}
 	}
+	if !t.beginScopedDiagnostic() {
+		return &pluginv1.TestConfigResponse{Success: false, Message: "automatic detection is busy; wait for the current batch to finish"}
+	}
+	defer t.endScopedDiagnostic()
 	// A diagnostic cannot acknowledge an unsaved recovery click. Only the
 	// active, previously applied configuration can clear a persisted 403 block.
 	t.mu.RLock()

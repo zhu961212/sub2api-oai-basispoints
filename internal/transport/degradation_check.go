@@ -149,12 +149,6 @@ func (t *Transport) runDegradationCheckWithBudget(ctx context.Context, c protoco
 			result.Results[index].Error = "account is not available for degradation check"
 			continue
 		}
-		if t.isBPSAccountDisabled(account.id, c) {
-			accounts[index].schedulable = false
-			result.Results[index].Status = "skipped"
-			result.Results[index].Error = "Basis Points is disabled after HTTP 403; re-enable this account before checking"
-			continue
-		}
 		if !account.schedulable {
 			result.Results[index].Status = "skipped"
 			result.Results[index].Error = "account is not schedulable"
@@ -225,27 +219,17 @@ type degradationAccount struct {
 }
 
 func degradationModel(c protocol.Config) string {
-	for _, model := range c.EnabledModels {
-		if c.HandlesModel(model) {
-			return strings.TrimSpace(model)
-		}
+	if model := strings.TrimSpace(c.DegradationCheckModel); model != "" {
+		return model
 	}
-	return protocol.DefaultModelID
+	return "gpt-5.4"
 }
 
 func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Config, host pluginv1.HostServiceClient, base *http.Client, accountID int64, model string) (string, string, error) {
 	if err := ctx.Err(); err != nil {
 		return "error", "", err
 	}
-	if t.isBPSAccountDisabled(accountID, c) {
-		return "skipped", "", fmt.Errorf("Basis Points is disabled after HTTP 403")
-	}
-	if err := t.bpsAccountStoreError(); err != nil {
-		return "error", "", err
-	}
-	observeBPSStatus := newBasisPointsStatusObserver(func() { t.disableBPSAccount(ctx, accountID) })
-	start := &pluginv1.ForwardRequestStart{AccountId: accountID}
-	headers, proxyURL, err := prepareHeaders(ctx, start, host, c.AuthMode)
+	req, proxyURL, err := prepareNativeDegradationRequest(ctx, host, accountID, model)
 	if err != nil {
 		return "error", "", err
 	}
@@ -253,44 +237,22 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	if err != nil {
 		return "error", "", err
 	}
-	requestClient = withoutBPSRedirects(requestClient)
+	// Do not replay native credentials or account headers through a redirect.
+	isolated := *requestClient
+	isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	requestClient = &isolated
 	// This request owns the client copy. A production save can replace the
 	// shared client between prepare and commit, but must not replace the
 	// diagnostic snapshot's timeout. The account/scan contexts still cap it.
 	requestClient.Timeout = time.Duration(c.TimeoutSeconds) * time.Second
-	// Match real forwarding: Basis Points expects normalized input, explicit
-	// model selection and streamed Responses output.
-	upstreamBody, err := protocol.PrepareResponsesBody(map[string]any{
-		"model":            model,
-		"input":            degradationCheckPrompt,
-		"reasoning_effort": "low",
-	}, c)
-	if err != nil {
-		return "error", "", fmt.Errorf("cannot prepare check request")
-	}
-	body := protocol.JSONBytes(upstreamBody)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ResponsesURL, bytes.NewReader(body))
-	if err != nil {
-		return "error", "", fmt.Errorf("cannot create check request")
-	}
-	for key, values := range headers {
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Content-Type", "application/json")
+	t.applyNativeTimezone(c, accountID, proxyURL, requestClient, req)
 	resp, err := requestClient.Do(req)
 	if err != nil {
 		return "error", "", degradationReadError(ctx, err)
 	}
 	defer resp.Body.Close()
-	observeBPSStatus(resp.StatusCode)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "error", "", fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
-	}
-	if err := prepareBasisPointsResponse(resp, c.MaxResponseBytes, observeBPSStatus); err != nil {
-		return "error", "", err
 	}
 	responseBody, contentType, err := readDegradationResponse(ctx, resp.Body, resp.Header.Get("Content-Type"), c.MaxResponseBytes)
 	if err != nil {

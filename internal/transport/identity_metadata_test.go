@@ -112,6 +112,7 @@ func TestDegradationProbePreservesIdentityWithoutMetadataLookups(t *testing.T) {
 			applyConfig(t, tr, map[string]any{"responses_url": upstream.URL})
 			cfg := tr.cfg.Clone()
 			cfg.ResponsesURL = upstream.URL
+			tr.client = nativeDegradationTestClient(t, upstream)
 			status, answer, err := tr.checkDegradationAccount(context.Background(), cfg, host, tr.client, 7, "gpt-6-astra")
 			if err != nil || status != "ok" || answer != "iPhone 17" {
 				t.Fatalf("probe failed: %s %q %v", status, answer, err)
@@ -126,8 +127,9 @@ func TestDegradationProbePreservesIdentityWithoutMetadataLookups(t *testing.T) {
 					t.Errorf("probe added or replaced %s: %q", key, got.header.Get(key))
 				}
 			}
+			metadata, _ := got.body["metadata"].(map[string]any)
 			for _, key := range []string{"device_id", "installation_id", "x-codex-turn-metadata"} {
-				if _, exists := got.body["metadata"].(map[string]any)[key]; exists {
+				if _, exists := metadata[key]; exists {
 					t.Errorf("probe injected body device carrier %s", key)
 				}
 			}

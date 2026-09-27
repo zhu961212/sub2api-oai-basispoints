@@ -274,6 +274,7 @@ func TestDiagnosticJobKeepsPreparedRequestParametersAfterProductionSave(t *testi
 			cfg.TimeoutSeconds = tc.snapshotSeconds
 			cfg.ResponsesURL = "https://prepared.example.invalid/responses"
 			cfg.EnabledModels = []string{"gpt-6-luna"}
+			cfg.DegradationCheckModel = "gpt-5.4-mini"
 			payload["config"] = cfg
 			diagnosticSave(t, tr, command)
 			applyConfig(t, tr, map[string]any{
@@ -310,8 +311,8 @@ func TestDiagnosticJobKeepsPreparedRequestParametersAfterProductionSave(t *testi
 				if actual.remaining < tc.wantDeadline-2*time.Second || actual.remaining > tc.wantDeadline {
 					t.Fatalf("request deadline changed with production config: got %v, want near %v", actual.remaining, tc.wantDeadline)
 				}
-				if actual.model != "gpt-6-luna" || actual.url != cfg.ResponsesURL {
-					t.Fatalf("request did not preserve prepared model/endpoint: %+v", actual)
+				if actual.model != "gpt-5.4-mini" || actual.url != nativeDegradationResponsesURL {
+					t.Fatalf("request did not preserve native model/endpoint: %+v", actual)
 				}
 			default:
 				t.Fatal("diagnostic did not reach the injected transport")
@@ -426,8 +427,8 @@ func TestDiagnosticJobCannotAcknowledgeUnsaved403Recovery(t *testing.T) {
 	diagnosticSave(t, tr, diagnosticCommit(tr, "blocked"))
 	job := waitDiagnosticJob(t, tr, "blocked")
 	check := degradationScopedResult(t, job.Result)
-	if calls.Load() != 0 || check.Results[0].Status != "skipped" {
-		t.Fatalf("unsaved recovery authorized probe: %+v", check)
+	if calls.Load() != 1 || check.Results[0].Status != "ok" || !tr.isBPSAccountDisabled(7, tr.cfg) {
+		t.Fatalf("native probe should run without acknowledging BPS recovery: %+v", check)
 	}
 }
 

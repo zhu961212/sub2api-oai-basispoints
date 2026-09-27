@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -13,13 +14,34 @@ import (
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
 
-func TestDegradationModelFollowsEnabledModel(t *testing.T) {
-	if got := degradationModel(protocol.Config{EnabledModels: []string{"gpt-5.6-sol"}}); got != "gpt-5.6-sol" {
+func TestDegradationModelIsIndependentOfBPSModels(t *testing.T) {
+	if got := degradationModel(protocol.Config{DegradationCheckModel: " gpt-5.4-mini ", EnabledModels: []string{"gpt-5.6-sol"}}); got != "gpt-5.4-mini" {
 		t.Fatalf("degradationModel = %q, want configured model", got)
 	}
-	if got := degradationModel(protocol.Config{EnabledModels: []string{}}); got != protocol.DefaultModelID {
-		t.Fatalf("degradationModel with empty selection = %q, want %q", got, protocol.DefaultModelID)
+	if got := degradationModel(protocol.Config{EnabledModels: []string{"gpt-5.6-sol"}}); got != "gpt-5.4" {
+		t.Fatalf("degradationModel without native model = %q, want gpt-5.4", got)
 	}
+}
+
+// Keep production URL immutable while routing test traffic exclusively to a
+// local server. An unexpected non-native request is rejected before any I/O.
+func nativeDegradationTestClient(t *testing.T, server *httptest.Server) *http.Client {
+	t.Helper()
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{Transport: degradationRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != nativeDegradationResponsesURL {
+			t.Fatalf("native probe used unexpected URL %q", req.URL.String())
+		}
+		local := req.Clone(req.Context())
+		local.URL = new(url.URL)
+		*local.URL = *req.URL
+		local.URL.Scheme, local.URL.Host = target.Scheme, target.Host
+		local.Host = req.URL.Host
+		return server.Client().Transport.RoundTrip(local)
+	})}
 }
 
 func TestDegradationAnswerUsesConfiguredHeuristic(t *testing.T) {
@@ -79,7 +101,7 @@ func TestDegradationCheckReturnsResultsAndOnlySelectsWrongAnswers(t *testing.T) 
 		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Errorf("invalid check body: %v", err)
 		} else {
-			if !strings.Contains(string(protocol.JSONBytes(payload["input"])), degradationCheckPrompt) || payload["stream"] != true || payload["reasoning_effort"] != "low" || payload["model_selection"] != "explicit" {
+			if !strings.Contains(string(protocol.JSONBytes(payload["input"])), degradationCheckPrompt) || payload["stream"] != true || payload["store"] != false || payload["instructions"] == "" || payload["reasoning_effort"] != nil || payload["model_selection"] != nil {
 				t.Errorf("unexpected check payload: %#v", payload)
 			}
 		}
@@ -108,6 +130,7 @@ func TestDegradationCheckReturnsResultsAndOnlySelectsWrongAnswers(t *testing.T) 
 	}
 	transport.mu.Lock()
 	transport.host = &degradationTestHost{fakeHost: host}
+	transport.client = nativeDegradationTestClient(t, upstream)
 	transport.mu.Unlock()
 	cfg := protocol.DefaultConfig()
 	cfg.ResponsesURL = upstream.URL

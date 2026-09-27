@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -20,19 +22,47 @@ import (
 func TestDegradationCheckTargetsOneAccountUsingItsCredentialAndProxy(t *testing.T) {
 	accountToken := token(t, "acct-9")
 	var calls atomic.Int32
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		if r.URL.Host != "upstream.example.test" || r.Header.Get("Authorization") != "Bearer "+accountToken || r.Header.Get("ChatGPT-Account-ID") != "acct-9" {
+		if r.Host != "chatgpt.com" || r.URL.Path != "/backend-api/codex/responses" || r.Header.Get("Authorization") != "Bearer "+accountToken || r.Header.Get("ChatGPT-Account-ID") != "acct-9" {
 			t.Error("check did not use the target account credential and proxy")
 		}
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("invalid request body: %v", err)
-		} else if body["model"] != "gpt-5.6-sol" {
+		} else if body["model"] != "gpt-5.4-mini" {
 			t.Errorf("check model = %v, want configured model", body["model"])
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(protocol.JSONBytes(map[string]any{"output_text": "iPhone 17"}))
+	}))
+	defer upstream.Close()
+	localURL, _ := url.Parse(upstream.URL)
+	var tunnels atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.Host != "chatgpt.com:443" {
+			t.Error("native probe did not connect through the selected account proxy")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		tunnels.Add(1)
+		remote, err := net.Dial("tcp", localURL.Host)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer remote.Close()
+		client, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer client.Close()
+		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buffered.Flush()
+		go func() { _, _ = io.Copy(remote, buffered); _ = remote.Close() }()
+		_, _ = io.Copy(client, remote)
 	}))
 	defer proxy.Close()
 	host := &degradationTestHost{fakeHost: &fakeHost{
@@ -46,11 +76,16 @@ func TestDegradationCheckTargetsOneAccountUsingItsCredentialAndProxy(t *testing.
 	tr := New()
 	defer tr.Shutdown()
 	tr.host = host
+	localTransport := upstream.Client().Transport.(*http.Transport).Clone()
+	localTransport.TLSClientConfig = localTransport.TLSClientConfig.Clone()
+	localTransport.TLSClientConfig.ServerName = localURL.Hostname()
+	tr.client = &http.Client{Transport: localTransport}
 	for _, automatic := range []bool{false, true} {
 		t.Run(fmt.Sprintf("automatic=%t", automatic), func(t *testing.T) {
 			cfg := protocol.DefaultConfig()
 			cfg.ResponsesURL = "http://upstream.example.test/basispoints/api/responses"
 			cfg.EnabledModels = []string{"gpt-5.6-sol"}
+			cfg.DegradationCheckModel = "gpt-5.4-mini"
 			cfg.AccountIDs = []int64{7}
 			cfg.AutoSelectNewAccounts = automatic
 			cfg.ExcludedAccountIDs = []int64{9}
@@ -68,7 +103,7 @@ func TestDegradationCheckTargetsOneAccountUsingItsCredentialAndProxy(t *testing.
 			}
 		})
 	}
-	if calls.Load() != 2 || !reflect.DeepEqual(host.resolvedAccountIDs, []int64{9, 9}) {
+	if calls.Load() != 2 || tunnels.Load() < 1 || !reflect.DeepEqual(host.resolvedAccountIDs, []int64{9, 9}) {
 		t.Fatalf("targeted check probed other accounts: calls=%d resolved=%v", calls.Load(), host.resolvedAccountIDs)
 	}
 }

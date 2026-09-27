@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -14,6 +15,11 @@ import (
 // The fixed prompt may consume account quota.
 // Credentials come only from liveCredentials and are never included in logs.
 func TestLiveDegradationRunner(t *testing.T) {
+	// Existing BPS live credentials do not implicitly authorize a request to
+	// the separate native Codex endpoint. Opt in to this probe explicitly.
+	if os.Getenv("BASISPOINTS_LIVE_NATIVE_DEGRADATION") != "1" {
+		t.Skip("native Codex probe requires BASISPOINTS_LIVE_NATIVE_DEGRADATION=1")
+	}
 	accessToken, accountID, proxyURL := liveCredentials(t)
 	transport := New()
 	defer transport.Shutdown()

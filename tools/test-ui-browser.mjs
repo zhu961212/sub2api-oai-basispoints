@@ -79,7 +79,7 @@ const driver = String.raw`
     const width = document.documentElement.clientWidth;
     if (document.documentElement.scrollWidth > width + 1 || document.body.scrollWidth > width + 1)
       throw new Error('Page overflows horizontally at ' + width + 'px');
-    for (const element of document.querySelectorAll('.account-name, .account-availability, #degradation-result > span, #bps-403-toggle')) {
+    for (const element of document.querySelectorAll('.account-name, .account-availability, #degradation-result > span, #bps-403-toggle, #auto-degradation-toggle, #auto-degradation-fields input, #native-timezone-toggle')) {
       const bounds = element.getBoundingClientRect();
       if (bounds.left < -1 || bounds.right > width + 1 || element.scrollWidth > element.clientWidth + 1)
         throw new Error('Account name, diagnostic result or policy control overflows at ' + width + 'px');
@@ -111,10 +111,40 @@ const driver = String.raw`
       }
       const initial403Policy = stage === 'select' || stage === 'clear';
       if (assert403Policy(initial403Policy).disabled) throw new Error('403 policy control did not become ready');
+      const autoToggle = document.getElementById('auto-degradation-toggle');
+      const autoInterval = document.getElementById('auto-degradation-interval');
+      const nativeModel = document.getElementById('degradation-check-model');
+      const timezoneToggle = document.getElementById('native-timezone-toggle');
+      if (!timezoneToggle || timezoneToggle.disabled || timezoneToggle.type !== 'button' || timezoneToggle.getAttribute('aria-pressed') !== 'false')
+        throw new Error('Request timezone toggle is missing, locked, or not default-off');
+      const timezoneHelp = document.getElementById('native-timezone-hint').textContent;
+      if (timezoneToggle.textContent !== '请求时区跟随出口 IP：已关闭' ||
+          document.querySelector('#native-environment-fields legend').textContent !== '请求环境' ||
+          !timezoneHelp.includes('此开关只控制原生 Codex 和 BPS 业务请求的时区，独立于“自动检测与切换”') ||
+          !timezoneHelp.includes('降智检测始终只请求原生 Codex，不检测 BPS') ||
+          !timezoneHelp.includes('检测请求也遵循此时区设置'))
+        throw new Error('Request timezone copy does not describe both native and BPS scope');
+      if (!autoToggle || autoToggle.disabled || autoToggle.type !== 'button' || autoToggle.getAttribute('aria-pressed') !== 'false' ||
+          !autoInterval || autoInterval.value !== '30' || autoInterval.min !== '5' || autoInterval.max !== '1440' ||
+          !nativeModel || nativeModel.value !== 'gpt-5.4')
+        throw new Error('Native automatic diagnostic defaults or controls are incorrect');
+      if (stage === 'select') {
+        timezoneToggle.click();
+        if (timezoneToggle.getAttribute('aria-pressed') !== 'true' || !timezoneToggle.textContent.includes('待保存') || autoToggle.getAttribute('aria-pressed') !== 'false')
+          throw new Error('Request timezone toggle did not remain independent or show its pending state');
+        timezoneToggle.click();
+        autoToggle.click();
+        if (autoToggle.getAttribute('aria-pressed') !== 'true' || !autoToggle.textContent.includes('待保存') ||
+            !document.getElementById('select-all-button').disabled || Array.from(document.querySelectorAll('#account-list input')).some(box => !box.disabled))
+          throw new Error('Enabling automatic diagnostics did not lock account selection until saved');
+        autoToggle.click();
+        if (autoToggle.getAttribute('aria-pressed') !== 'false' || document.getElementById('select-all-button').disabled)
+          throw new Error('Canceling the unsaved automatic setting did not restore manual controls');
+      }
       if (document.getElementById('bps-device-toggle') || document.getElementById('bps-device-hint'))
         throw new Error('Retired device convergence controls are still visible');
       assertResponsiveLayout();
-      if (document.querySelector('[id^="image-relay"]') || document.querySelector('input:not(#account-list input):not(#model-list input), select, details'))
+      if (document.querySelector('[id^="image-relay"]') || document.querySelector('input:not(#account-list input):not(#model-list input):not(#auto-degradation-fields input), select, details'))
         throw new Error('Images still require additional configuration controls');
       if (!document.body.textContent.includes('支持直接发送图片和截图，无需额外配置'))
         throw new Error('Automatic image support is not described');
@@ -148,7 +178,7 @@ const driver = String.raw`
       }
       function assertBusy(before) {
         for (const controlID of ['save-button', 'retry-button', 'select-all-button', 'degradation-check-button',
-          'bps-403-toggle', 'account-fields', 'model-fields']) {
+          'bps-403-toggle', 'account-fields', 'model-fields', 'native-timezone-toggle', 'native-environment-fields']) {
           if (!document.getElementById(controlID).disabled) throw new Error('Diagnostic did not lock ' + controlID);
         }
         if (Array.from(document.querySelectorAll('.account-check-button')).some((button) => !button.disabled))
@@ -179,8 +209,8 @@ const driver = String.raw`
       }
       assertReady();
       const checkHelp = document.getElementById('account-check-hint').textContent;
-      if (!checkHelp.includes('真实请求并消耗额度') || !checkHelp.includes('本次探针') ||
-          !checkHelp.includes('取消符合规则账号的勾选') || !checkHelp.includes('403 自动停用仍按已保存开关执行'))
+      if (!checkHelp.includes('请求 OpenAI 原生 Codex，会消耗额度') || !checkHelp.includes('本次探针') ||
+          !checkHelp.includes('取消符合规则账号的勾选') || !checkHelp.includes('原生错误不会触发 BPS 停用'))
         throw new Error('Diagnostic controls do not explain probe scope, cost, and actual selection behavior');
       if (stage === 'scoped-reopen') {
         send('done', { selected: selected(), models: selectedModels(), scopedSelectionSurvivedReopen: true });

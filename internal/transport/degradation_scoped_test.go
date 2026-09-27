@@ -206,8 +206,8 @@ func TestScopedDegradationIgnoresUnsavedRecoveryAcknowledgement(t *testing.T) {
 		t.Fatalf("blocked diagnostic failed: %v, %v", response, err)
 	}
 	check := degradationScopedResult(t, response)
-	if len(check.Results) != 1 || check.Results[0].Status != "skipped" || calls.Load() != 0 || len(host.resolvedAccountIDs) != 0 || !tr.isBPSAccountDisabled(7, tr.cfg) {
-		t.Fatalf("unsaved acknowledgement bypassed block: %+v calls=%d IDs=%v", check, calls.Load(), host.resolvedAccountIDs)
+	if len(check.Results) != 1 || check.Results[0].Status != "ok" || calls.Load() != 1 || len(host.resolvedAccountIDs) != 1 || !tr.isBPSAccountDisabled(7, tr.cfg) {
+		t.Fatalf("native probe failed or cleared BPS protection: %+v calls=%d IDs=%v", check, calls.Load(), host.resolvedAccountIDs)
 	}
 	var status map[string]json.RawMessage
 	_ = json.Unmarshal([]byte(response.GetStatusJson()), &status)
@@ -219,12 +219,12 @@ func TestScopedDegradationIgnoresUnsavedRecoveryAcknowledgement(t *testing.T) {
 	applyConfig(t, tr, map[string]any{"bps_reenabled_accounts": map[string]string{"7": block}})
 	cfg.BPSReenabledAccounts = nil
 	response, err = tr.TestConfig(degradationScopedContext("saved-recovery"), &pluginv1.TestConfigRequest{ConfigJson: protocol.JSONBytes(cfg)})
-	if err != nil || !response.GetSuccess() || degradationScopedResult(t, response).Results[0].Status != "ok" || calls.Load() != 1 {
+	if err != nil || !response.GetSuccess() || degradationScopedResult(t, response).Results[0].Status != "ok" || calls.Load() != 2 {
 		t.Fatalf("persisted acknowledgement not honored: %v, %v calls=%d", response, err, calls.Load())
 	}
 }
 
-func TestScopedDegradation403OnlyDisablesRequestedAccount(t *testing.T) {
+func TestScopedNativeDegradation403DoesNotDisableBPS(t *testing.T) {
 	for _, wire := range []string{"http", "json", "sse"} {
 		t.Run(wire, func(t *testing.T) {
 			tr := New()
@@ -248,15 +248,15 @@ func TestScopedDegradation403OnlyDisablesRequestedAccount(t *testing.T) {
 			})}
 			cfg := protocol.DefaultConfig()
 			cfg.DegradationCheck, cfg.DegradationCheckAccountID = true, 9
-			// Unsaved diagnostic settings cannot disable the active 403 policy.
+			// A native error must never be fed to the production BPS 403 policy.
 			cfg.BPSAutoDisableOn403 = false
 			response, err := tr.TestConfig(degradationScopedContext("forbidden-"+wire), &pluginv1.TestConfigRequest{ConfigJson: protocol.JSONBytes(cfg)})
 			if err != nil || !response.GetSuccess() {
 				t.Fatalf("403 diagnostic failed: %v, %v", response, err)
 			}
 			check := degradationScopedResult(t, response)
-			if len(check.Results) != 1 || check.Results[0].Status != "error" || len(check.DegradedAccountIDs) != 0 || calls.Load() != 1 || !reflect.DeepEqual(host.resolvedAccountIDs, []int64{9}) || !tr.isBPSAccountDisabled(9, tr.cfg) || tr.isBPSAccountDisabled(7, tr.cfg) {
-				t.Fatalf("403 restriction escaped the requested account: %+v calls=%d IDs=%v", check, calls.Load(), host.resolvedAccountIDs)
+			if len(check.Results) != 1 || check.Results[0].Status != "error" || len(check.DegradedAccountIDs) != 0 || calls.Load() != 1 || !reflect.DeepEqual(host.resolvedAccountIDs, []int64{9}) || tr.isBPSAccountDisabled(9, tr.cfg) || tr.isBPSAccountDisabled(7, tr.cfg) {
+				t.Fatalf("native 403 changed BPS protection: %+v calls=%d IDs=%v", check, calls.Load(), host.resolvedAccountIDs)
 			}
 		})
 	}

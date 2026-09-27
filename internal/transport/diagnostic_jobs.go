@@ -63,6 +63,7 @@ type diagnosticJobStore struct {
 	cancel       context.CancelFunc
 	closed       bool
 	active       string
+	scopedActive int
 	jobs         map[string]*diagnosticJob
 	workers      sync.WaitGroup
 	storageError string
@@ -219,7 +220,7 @@ func (t *Transport) normalizeDiagnosticCommand(raw []byte) ([]byte, bool, error)
 	}
 	if s.jobs[command.TaskID] == nil && s.active != "" && s.active != command.TaskID {
 		active := s.jobs[s.active]
-		if active != nil && !(active.State == "prepared" && time.Now().After(active.ExpiresAt)) {
+		if s.active == autoDegradationDiagnosticID || (active != nil && !(active.State == "prepared" && time.Now().After(active.ExpiresAt))) {
 			s.mu.Unlock()
 			return nil, true, fmt.Errorf("another diagnostic task is busy; wait for it to finish")
 		}

@@ -35,6 +35,7 @@ func TestDegradationProbeDoesNotFollowRedirectOrRetry(t *testing.T) {
 			host := &degradationTestHost{fakeHost: &fakeHost{token: token(t, "probe-redirect-account")}}
 			cfg := protocol.DefaultConfig()
 			cfg.ResponsesURL = upstream.URL
+			tr.client = nativeDegradationTestClient(t, upstream)
 			status, answer, err := tr.checkDegradationAccount(context.Background(), cfg, host, tr.client, 7, protocol.DefaultModelID)
 			if status != "error" || answer != "" || err == nil || !strings.Contains(err.Error(), fmt.Sprint(code)) {
 				t.Fatalf("redirect produced a classification: status=%s answer=%q err=%v", status, answer, err)

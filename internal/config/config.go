@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -40,7 +41,9 @@ const (
 	// DefaultAuthMode 是 Basis Points 的鉴权模式。
 	DefaultAuthMode = "chatgpt"
 	// MaxDegradationCheckAccountIDs bounds one explicit diagnostic snapshot.
-	MaxDegradationCheckAccountIDs = 10000
+	MaxDegradationCheckAccountIDs         = 10000
+	DefaultDegradationCheckModel          = "gpt-5.4"
+	DefaultAutoDegradationIntervalMinutes = 30
 )
 
 // defaultModels 是未指定 enabled_models 时启用的模型。
@@ -75,6 +78,15 @@ type Config struct {
 	BPSAutoDisableOn403 bool `json:"bps_auto_disable_on_403"`
 	// Acknowledging one block never clears a newer persisted BPS 403.
 	BPSReenabledAccounts map[string]string `json:"bps_reenabled_accounts,omitempty"`
+	// Periodic native Codex diagnostics are opt-in and independent of BPS models.
+	AutoDegradationEnabled         bool `json:"auto_degradation_enabled"`
+	AutoDegradationIntervalMinutes int  `json:"auto_degradation_interval_minutes"`
+	// Manual revision invalidates automatic route overrides even when IDs return to an old baseline.
+	AutoDegradationManualRevision int64  `json:"auto_degradation_manual_revision"`
+	DegradationCheckModel         string `json:"degradation_check_model"`
+	// NativeTimezoneByIP adjusts native Codex and BPS request environment context using the forwarding account's exit timezone.
+	// The field and JSON key retain their original names for configuration compatibility.
+	NativeTimezoneByIP bool `json:"native_timezone_by_ip"`
 	// Diagnostic commands are temporary fields. Legacy saved configurations
 	// remain parseable, but only the request-scoped TestConfig bridge executes
 	// commands bound to an explicit account or caller-supplied bulk snapshot.
@@ -95,14 +107,16 @@ type Config struct {
 // 能规范化为完整配置，而不是解析失败。
 func Default() Config {
 	return Config{
-		ResponsesURL:        DefaultResponsesURL,
-		EnabledModels:       cloneStrings(defaultModels),
-		TimeoutSeconds:      DefaultTimeoutSeconds,
-		MaxResponseBytes:    DefaultMaxResponseBytes,
-		AuthMode:            DefaultAuthMode,
-		RewriteTools:        true,
-		TransformResponses:  true,
-		BPSAutoDisableOn403: true,
+		ResponsesURL:                   DefaultResponsesURL,
+		EnabledModels:                  cloneStrings(defaultModels),
+		TimeoutSeconds:                 DefaultTimeoutSeconds,
+		MaxResponseBytes:               DefaultMaxResponseBytes,
+		AuthMode:                       DefaultAuthMode,
+		RewriteTools:                   true,
+		TransformResponses:             true,
+		BPSAutoDisableOn403:            true,
+		AutoDegradationIntervalMinutes: DefaultAutoDegradationIntervalMinutes,
+		DegradationCheckModel:          DefaultDegradationCheckModel,
 	}
 }
 
@@ -190,6 +204,12 @@ func Parse(raw []byte) (Config, error) {
 		if err := decoder.Decode(&extra); err != io.EOF {
 			return Config{}, fmt.Errorf("configuration JSON must contain one object")
 		}
+		if c.AutoDegradationIntervalMinutes == 0 {
+			return Config{}, fmt.Errorf("auto_degradation_interval_minutes must be between 5 and 1440")
+		}
+		if c.DegradationCheckModel == "" {
+			return Config{}, fmt.Errorf("degradation_check_model must not be empty")
+		}
 	}
 	if err := c.Normalize(); err != nil {
 		return Config{}, err
@@ -226,6 +246,26 @@ func (c *Config) Normalize() error {
 	}
 	if c.MaxResponseBytes < 64<<10 || c.MaxResponseBytes > 128<<20 {
 		return fmt.Errorf("max_response_bytes must be between 64 KiB and 128 MiB")
+	}
+	if c.AutoDegradationIntervalMinutes == 0 {
+		c.AutoDegradationIntervalMinutes = DefaultAutoDegradationIntervalMinutes
+	}
+	if c.AutoDegradationIntervalMinutes < 5 || c.AutoDegradationIntervalMinutes > 1440 {
+		return fmt.Errorf("auto_degradation_interval_minutes must be between 5 and 1440")
+	}
+	if c.AutoDegradationManualRevision < 0 || c.AutoDegradationManualRevision > 9007199254740991 {
+		return fmt.Errorf("auto_degradation_manual_revision must be between 0 and 9007199254740991")
+	}
+	if c.DegradationCheckModel == "" {
+		c.DegradationCheckModel = DefaultDegradationCheckModel
+	}
+	if len(c.DegradationCheckModel) > 128 {
+		return fmt.Errorf("degradation_check_model must be a non-empty model ID of at most 128 bytes")
+	}
+	for _, r := range c.DegradationCheckModel {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("degradation_check_model must not contain whitespace or control characters")
+		}
 	}
 	if c.DegradationCheckAccountID < 0 {
 		return fmt.Errorf("degradation_check_account_id must be a positive account ID or zero")
