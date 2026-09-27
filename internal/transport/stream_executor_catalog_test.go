@@ -39,7 +39,7 @@ func TestStreamExecutorOnlyCatalogPreservesCustomRelayAndReplay(t *testing.T) {
 	defer transport.Shutdown()
 	applyConfig(t, transport, map[string]any{"responses_url": upstream.URL})
 	source := executorOnlyCatalogSource(t.Name())
-	result := runForward(t, transport, requestFrames(t, "https://ignored.example.test/v1/responses", token(t, "acct"), nil, protocol.JSONBytes(source)))
+	result := runForward(t, transport, requestFrames(t, "https://ignored.example.test/v1/responses", token(t, "acct"), map[string]string{"conversation_id": t.Name()}, protocol.JSONBytes(source)))
 	events := parsedStreamEvents(t, result)
 	if len(events) == 0 || events[len(events)-1]["type"] != "response.completed" || streamFailureCode(result) != "" {
 		t.Fatalf("custom executor relay did not complete: %s", result.body)
@@ -90,6 +90,7 @@ func TestStreamExecutorOnlyCatalogPreservesCustomRelayAndReplay(t *testing.T) {
 	}
 
 	followup := executorOnlyCatalogSource(t.Name())
+	followup["__bps_session_scope"] = "account:7/session:" + t.Name()
 	followup["input"] = []any{call, map[string]any{"type": "custom_tool_call_output", "call_id": call["call_id"], "output": "workspace path"}}
 	replay, err := protocol.PrepareResponsesBody(followup, protocol.DefaultConfig())
 	if err != nil {

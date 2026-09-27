@@ -55,6 +55,11 @@ func TestToolRepairUnderescapedCodeAllowsCanonicalTargetAliases(t *testing.T) {
 				original := map[string]any{"status": "completed", "output": []any{codeIdentityMalformedNative(catalogName)}}
 				corrected := relayCompatNative(map[string]any{"tool": repairedName, "args": `text("x");`})
 				corrected["id"], corrected["call_id"] = "fc_alias_corrected", "call_alias_corrected"
+				namespace := nativeCallNamespace(source)
+				t.Cleanup(func() {
+					nativeCallCache.forget(nativeCacheKey(namespace, "call_alias_corrected"))
+					toolCatalogCache.forget(namespace)
+				})
 				repaired := map[string]any{"status": "completed", "output": []any{corrected}}
 				merged, err := MergeToolRepairResponse(source, original, repaired)
 				if err != nil || merged == nil {
@@ -85,6 +90,11 @@ func TestToolRepairUnknownHelperStillAllowsKnownExecutor(t *testing.T) {
 	}
 	corrected := relayCompatNative(map[string]any{"tool": "functions.exec", "args": "text(1)"})
 	corrected["id"], corrected["call_id"] = "fc_helper_corrected", "call_helper_corrected"
+	namespace := nativeCallNamespace(source)
+	t.Cleanup(func() {
+		nativeCallCache.forget(nativeCacheKey(namespace, "call_helper_corrected"))
+		toolCatalogCache.forget(namespace)
+	})
 	repaired := map[string]any{"status": "completed", "output": []any{corrected}}
 	merged, err := MergeToolRepairResponse(source, original, repaired)
 	if err != nil || merged == nil {

@@ -16,18 +16,7 @@ func relayScope(start *pluginv1.ForwardRequestStart) string {
 	// The host isolates conversation_id by API key. Its optional account
 	// fingerprint can overwrite session_id afterwards with an account-wide
 	// UUID, so session_id (and client aliases) cannot identify an image tenant.
-	scope := ""
-	for key, values := range start.GetHeaders() {
-		if strings.EqualFold(key, "conversation_id") {
-			for _, value := range values.GetValues() {
-				if value = strings.TrimSpace(value); value != "" {
-					scope = value
-					break
-				}
-			}
-			break
-		}
-	}
+	scope := hostSessionScope(start.GetHeaders())
 	if scope == "" {
 		// Empty scope explicitly disables persistent cache entries; per-request
 		// duplicates are still coalesced by the uploader. Random scopes would

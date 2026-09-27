@@ -30,10 +30,13 @@ type toolSpec struct {
 	Ambiguous bool
 }
 
-// RememberResponseContext links a Responses response ID to the session scope
-// that produced it. Follow-up requests often carry only previous_response_id
-// and omit both the full history and the tool catalog.
+// RememberResponseContext links a completed response ID to its cache scope.
+// This is local catalog bookkeeping only: BPS still requires expanded history
+// and does not accept previous_response_id in forwarded requests.
 func RememberResponseContext(source, response map[string]any) {
+	if source["__bps_context_cache_disabled"] == true {
+		return
+	}
 	if ClassifyResponseTerminal("", response).Failed() {
 		return
 	}
@@ -45,16 +48,19 @@ func RememberResponseContext(source, response map[string]any) {
 		return
 	}
 	namespace := cacheNamespaceForSource(source)
-	if namespace == "" {
+	anonymous := namespace == ""
+	if anonymous {
 		namespace = "response:" + shortHash(responseID)
 		source["__bps_response_scope"] = namespace
 	}
-	tools := sourceTools(source)
 	// Prepared requests already published their catalog before going upstream.
-	// A delayed response must not restore that snapshot over a newer request.
-	// Still register anonymous response scopes, or restore an evicted entry.
+	// A missing entry may mean a newer update/revocation has since expired or
+	// been evicted. Never republish a prepared snapshot on late completion.
+	// Anonymous requests only acquire their scope when a response ID exists.
 	_, frozen := source["__bps_effective_tools"]
-	storeToolCatalog(source, tools, !frozen)
+	if !frozen || anonymous {
+		storeToolCatalog(source, sourceTools(source), !frozen)
+	}
 	responseContextCache.put(responseID, namespace, len(namespace)+16, true)
 }
 
@@ -630,6 +636,11 @@ func conversationIdentity(source map[string]any) string {
 }
 
 func cacheNamespaceForSource(source map[string]any) string {
+	// Only the transport knows whether the host supplied an isolated session.
+	// An untrusted body ID or response reference cannot override that decision.
+	if source["__bps_context_cache_disabled"] == true {
+		return ""
+	}
 	if identity := conversationIdentity(source); identity != "" {
 		return "session:" + shortHash(identity)
 	}
@@ -751,12 +762,7 @@ func prepareResponsesBodyWithImages(source map[string]any, cfg Config, allowInli
 	if err != nil {
 		return nil, err
 	}
-	if _, frozen := source["__bps_effective_tools"]; !frozen {
-		source["__bps_effective_tools"] = cloneJSONValue(sourceTools(source))
-	}
-	// Build eagerly before the source is shared with response processing.
-	// Keeping tool_choice outside the index preserves explicit none overrides.
-	source["__bps_client_tool_specs"] = indexClientToolSpecs(source["__bps_effective_tools"])
+	freezeToolCatalog(source)
 	cacheNamespace := nativeCallNamespace(source)
 	inputItems := translateInputItemsInNamespace(source["input"], clientToolSpecs(source), cacheNamespace)
 	historyRoot := conversationFingerprint(inputItems)

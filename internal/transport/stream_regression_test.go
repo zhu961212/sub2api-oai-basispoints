@@ -45,16 +45,30 @@ func runSSE(t *testing.T, body string, request []*pluginv1.ForwardRequest) forwa
 	return runForward(t, transport, request)
 }
 
-func TestHostSessionScopePrefersSessionAndAcceptsAliases(t *testing.T) {
+func TestHostSessionScopeUsesOnlyIsolatedConversation(t *testing.T) {
 	headers := map[string]*pluginv1.HeaderValues{
 		"conversation_id": {Values: []string{"conversation"}},
 		"session_id":      {Values: []string{"session"}},
 	}
-	if got := hostSessionScope(headers); got != "session" {
-		t.Fatalf("scope = %q, want session_id value", got)
+	if got := hostSessionScope(headers); got != "conversation" {
+		t.Fatalf("scope = %q, want isolated conversation_id value", got)
 	}
-	if got := hostSessionScope(map[string]*pluginv1.HeaderValues{"X-Conversation-ID": {Values: []string{"conv-alias"}}}); got != "conv-alias" {
-		t.Fatalf("alias scope = %q", got)
+	for _, alias := range []string{"session_id", "session-id", "conversation-id", "sessionId", "conversationId", "thread_id", "X-Conversation-ID", "X-Codex-Session-Id"} {
+		if got := hostSessionScope(map[string]*pluginv1.HeaderValues{alias: {Values: []string{"untrusted-alias"}}}); got != "" {
+			t.Errorf("untrusted %s supplied a persistent scope %q", alias, got)
+		}
+	}
+	if got := hostSessionScope(map[string]*pluginv1.HeaderValues{"Conversation_ID": {Values: []string{" ", " conversation ", "conversation"}}}); got != "conversation" {
+		t.Fatalf("case-insensitive header scope = %q", got)
+	}
+	if got := hostSessionScope(map[string]*pluginv1.HeaderValues{"conversation_id": {Values: []string{"first", "second"}}}); got != "" {
+		t.Fatalf("ambiguous multi-value scope = %q", got)
+	}
+	if got := hostSessionScope(map[string]*pluginv1.HeaderValues{"conversation_id": {Values: []string{"first"}}, "Conversation_ID": {Values: []string{"second"}}}); got != "" {
+		t.Fatalf("ambiguous header casing selected scope = %q", got)
+	}
+	if got := relayScope(&pluginv1.ForwardRequestStart{AccountId: 7, Headers: map[string]*pluginv1.HeaderValues{"conversation_id": {Values: []string{"first", "second"}}}}); got != "" {
+		t.Fatalf("ambiguous image cache scope = %q", got)
 	}
 }
 

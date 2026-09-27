@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -101,6 +102,45 @@ func TestProtocolCacheSnapshotRejectsEncodedAndRetainedOversize(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, _, ok := protocolCacheSnapshot(value); ok {
 				t.Fatal("oversized snapshot admitted")
+			}
+		})
+	}
+}
+
+func TestProtocolCacheOwnsKeyAndScalarStringStorage(t *testing.T) {
+	backing := strings.Repeat("0123456789", 1<<17)
+	key, value := backing[10:20], backing[30:45]
+	cache := newProtocolCache(2, 1024, 512, time.Hour)
+	if !cache.put(key, value, protocolCacheWeight(value), true) {
+		t.Fatal("valid cache entry rejected")
+	}
+	entry := cache.items[key].Value.(*protocolCacheEntry)
+	if unsafe.StringData(entry.key) == unsafe.StringData(key) {
+		t.Fatal("cache entry key retains oversized caller backing storage")
+	}
+	for retainedKey := range cache.items {
+		if unsafe.StringData(retainedKey) == unsafe.StringData(key) {
+			t.Fatal("cache map key retains oversized caller backing storage")
+		}
+	}
+	if unsafe.StringData(entry.value.(string)) == unsafe.StringData(value) {
+		t.Fatal("cache scalar value retains oversized caller backing storage")
+	}
+	if got, ok := cache.get(key); !ok || got != value {
+		t.Fatalf("owned entry changed: got %#v, found %t", got, ok)
+	}
+}
+
+func TestProtocolCacheSnapshotRejectsTypedRetainedOversize(t *testing.T) {
+	// Typed containers use JSON normalization. Their compact wire format must
+	// not bypass the retained-size limit enforced on canonical JSON trees.
+	for name, value := range map[string]any{
+		"typed slice":      make([]bool, protocolCacheEntryBytes/32+1),
+		"custom marshaler": json.RawMessage("[" + strings.Repeat("null,", protocolCacheEntryBytes/32) + "null]"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, ok := protocolCacheSnapshot(value); ok {
+				t.Fatal("typed oversized retained snapshot admitted")
 			}
 		})
 	}

@@ -121,6 +121,12 @@ func (c *protocolCache) put(key string, value any, weight int, replace bool) boo
 	for len(c.items) >= c.maxEntries || c.bytes+weight > c.maxBytes {
 		c.removeLocked(c.recent.Back())
 	}
+	// Keys and scalar response scopes may be short substrings of much larger
+	// request strings. Retain only the storage covered by the byte accounting.
+	key = strings.Clone(key)
+	if text, ok := value.(string); ok {
+		value = strings.Clone(text)
+	}
 	entry := &protocolCacheEntry{key: key, value: value, weight: weight, used: now}
 	c.items[key] = c.recent.PushFront(entry)
 	c.bytes += weight
@@ -150,7 +156,11 @@ func protocolCacheSnapshot(value any) (any, int, bool) {
 	if decoder.Decode(&owned) != nil {
 		return nil, 0, false
 	}
-	return owned, protocolCacheWeight(owned), true
+	weight := protocolCacheWeight(owned)
+	if weight > protocolCacheEntryBytes {
+		return nil, 0, false
+	}
+	return owned, weight, true
 }
 
 type protocolCacheSnapshotBuilder struct {

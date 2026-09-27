@@ -4,9 +4,9 @@
 
 [GitHub 仓库](https://github.com/zhu961212/sub2api-oai-basispoints) · [发布下载](https://github.com/zhu961212/sub2api-oai-basispoints/releases)
 
-当前版本：**0.6.4** · 插件 ID：**local.oai-basispoints**
+当前版本：**0.6.5** · 插件 ID：**local.oai-basispoints**
 
-**0.6.4 发行内容**：补齐 #40874 的 HTTP 错误路径。上游以 HTTP 502 返回确定的工具协议失败时，保留请求级失败终态与具体原因，停止重复请求；普通服务端错误继续原有策略。保留空模型 Host 透传和 C 源码受限纠正。卸载后全新安装，不迁移旧配置；详见 [发行记录](docs/release-0.6.4-2026-09-27.md)。0.6.1 保持撤回。
+**0.6.5 发行内容**：修复跨会话缓存串用、迟到响应恢复旧目录，以及仅响应转换时的并发目录覆盖；补齐缓存内存所有权和快照预算检查。保留完整历史、工具结果和原签名身份；详见 [发行记录](docs/release-0.6.5-2026-09-27.md)。0.6.1 保持撤回。
 
 **0.6.2 插件兼容方案**：恢复原界面的逐账号“降智检测”和“一键检测降智账号”。通过现有 UI Bridge v1 提交并确认插件后台任务，固定本次账号、模型和参数，页面按任务编号查询结果。只更新插件即可使用，不要求修改或重建 Sub2API。详见 [检测任务协议](docs/PLUGIN-DIAGNOSTIC-TASKS.md)。
 
@@ -19,6 +19,14 @@
 0.5.26 纳入的修复：[宿主适配、工具封装错误与性能优化记录](docs/HOST-OPTIMIZATION-2026-09-26.md)。覆盖工具调用截断纠正、BPS 账号状态隔离、响应处理和账号界面性能；本地验证与生产部署状态分别列明。
 
 0.5.26 新增：[一次 BPS 403 自动取消勾选并停用该账号的 BPS](docs/BPS-403-ACCOUNT-DISABLE.md)。配置页可开启或关闭，默认开启；不要求错误码或连续次数。宿主账号保留，可明确重新勾选并保存恢复。
+
+## 0.6.5 更新
+
+- 工具目录、原生调用和响应映射按宿主可信 conversation_id 与调度账号隔离；缺失或冲突身份不跨请求缓存，完整历史仍保留。
+- 迟到响应不能恢复已淘汰、替换或撤销的工具目录；仅响应转换模式同样提前冻结本轮工具声明。
+- 缓存键与字符串值独立持有存储，JSON 回退快照执行一致的内存预算检查。
+- 工具纠正沿用原请求截止时间，并响应回调取消；原请求取消或超时后不再追加纠正请求。
+- 完整检查、签名验证和安装步骤见 [0.6.5 发行记录](docs/release-0.6.5-2026-09-27.md)。
 
 ## 0.6.4 更新
 
@@ -197,7 +205,7 @@ TestLive 系列属于可选真实上游测试，设置 BASISPOINTS_LIVE_TOKEN �
 
 ## GitHub 源码准备
 
-运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.0-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
+运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.5-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
 
 ## 构建、签名与验包
 
@@ -219,12 +227,12 @@ Linux：
 bash ./build.sh -signing-key ../basispoints-private/publisher.private -key-id my-publisher-v1
 ~~~
 
-构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.4.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
+构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.5.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
 
 显式传入配套公钥进行独立验包：
 
 ~~~powershell
-python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.4.s2plugin --public-key ../basispoints-private/publisher.public
+python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.5.s2plugin --public-key ../basispoints-private/publisher.public
 ~~~
 
 校验器检查包内容、文件哈希及 manifest 原始字节的 Ed25519 签名。签名构建必须具备 Python 和与私钥同名的 .public 配套公钥；两种构建脚本均对实际输出执行强制验签，并核对 key_id。也可用上面的显式验签命令单独复查。
@@ -238,7 +246,7 @@ plugins:
     my-publisher-v1: BASE64_ED25519_PUBLIC_KEY
 ~~~
 
-在 Sub2API 插件管理页安装 0.6.4，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
+在 Sub2API 插件管理页安装 0.6.5，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
 
 ## 配置页与全选
 
@@ -279,7 +287,7 @@ Basis Points returned an unknown client tool absent from the active catalog
 
 该错误表示返回的调用无法匹配本轮客户端声明的工具目录。部分客户端的提示仍用 exec_command 固定示例，但本轮可能只声明 functions.exec 执行器。0.5.15 按实际目录生成调用格式指引，区分执行器与其内部 helper、自定义工具的原始 input 与中转信封中的 args。
 
-更新后需在宿主重新加载插件，确认运行版本为 0.6.0，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
+更新后需在宿主重新加载插件，确认运行版本为 0.6.5，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
 
 0.5.26 中，上游返回目录外或可识别但截断的单一末尾中转调用，并且本轮尚未向客户端发出工具时，最多追加一次带当前目录与拒绝原因的纠正请求。它沿用原账号、模型、历史和图片引用；错误工具不会执行。纠正后的结果仍须通过原有目录和参数校验，两次请求的用量合并记录。
 

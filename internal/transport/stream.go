@@ -15,19 +15,26 @@ import (
 )
 
 func hostSessionScope(headers map[string]*pluginv1.HeaderValues) string {
-	for _, name := range []string{"session_id", "conversation_id", "session-id", "conversation-id", "sessionId", "conversationId", "thread_id", "thread-id", "X-Session-Id", "X-Conversation-Id", "X-Codex-Session-Id", "X-Codex-Conversation-Id", "X-OpenCode-Session", "X-OpenCode-Session-Id", "X-Thread-Id"} {
-		for key, values := range headers {
-			if !strings.EqualFold(key, name) {
+	// Only conversation_id is guaranteed to retain the host's API-key
+	// isolation. Account fingerprinting can replace session_id with one
+	// account-wide UUID, and client aliases have no isolation guarantee.
+	scope := ""
+	for key, values := range headers {
+		if !strings.EqualFold(key, "conversation_id") {
+			continue
+		}
+		for _, value := range values.GetValues() {
+			value = strings.TrimSpace(value)
+			if value == "" {
 				continue
 			}
-			for _, value := range values.GetValues() {
-				if value = strings.TrimSpace(value); value != "" {
-					return value
-				}
+			if scope != "" && scope != value {
+				return "" // Conflicting values must not choose a tenant randomly.
 			}
+			scope = value
 		}
 	}
-	return ""
+	return scope
 }
 
 type sseRelayEvent struct {

@@ -654,10 +654,13 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 				delete(source, key)
 			}
 		}
-		// The host has already isolated these identifiers by API key/account.
-		// Keep the scope local: PrepareResponsesBody rebuilds an allowlisted body.
+		// The host isolates conversation_id by API key. Its session fingerprint
+		// and body/client aliases may be shared across users, so they cannot
+		// authorize cross-request context reuse. Keep these markers local.
 		if scope := hostSessionScope(start.GetHeaders()); scope != "" {
-			source["__bps_session_scope"] = scope
+			source["__bps_session_scope"] = fmt.Sprintf("account:%d/session:%s", start.GetAccountId(), scope)
+		} else {
+			source["__bps_context_cache_disabled"] = true
 		}
 		inlineImages := hasInlineImages(source)
 		validate := cfg.RewriteTools || cfg.TransformResponses || inlineImages
@@ -700,6 +703,9 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 			if err := protocol.ValidateRequestCapabilities(prepared); err != nil {
 				return sendRequestValidationError(stream, err)
 			}
+		}
+		if cfg.TransformResponses && !cfg.RewriteTools {
+			protocol.FreezeRequestTools(source)
 		}
 		if cfg.RewriteTools {
 			requestBody = protocol.JSONBytes(prepared)

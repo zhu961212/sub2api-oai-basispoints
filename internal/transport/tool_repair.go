@@ -19,6 +19,23 @@ type relayToolRepair func(context.Context, map[string]any) (map[string]any, erro
 func newRelayToolRepair(req *http.Request, client *http.Client, prepared []byte, source map[string]any, max int, observers ...func(int)) relayToolRepair {
 	attempted := false
 	return func(ctx context.Context, original map[string]any) (map[string]any, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Corrections share the original Forward deadline. The callback context
+		// additionally cancels work when a downstream send fails during repair.
+		caller := ctx
+		var cancel context.CancelFunc
+		if deadline, ok := caller.Deadline(); ok {
+			ctx, cancel = context.WithDeadline(req.Context(), deadline)
+		} else {
+			ctx, cancel = context.WithCancel(req.Context())
+		}
+		stopCaller := context.AfterFunc(caller, cancel)
+		defer func() { stopCaller(); cancel() }()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if attempted || !protocol.ToolRepairEligible(source, original) {
 			return nil, relayProtocolError("Basis Points tool correction is not permitted for this response")
 		}
