@@ -34,6 +34,8 @@ def source_path_allowed(name):
         return False
     if len(path.parts) == 1:
         return path.name in ROOT_FILES
+    if path.suffix.lower() == ".patch":
+        return path.parts[:2] == ("docs", "host-patches")
     return path.parts[0] in SOURCE_DIRS and (
         path.suffix.lower() in SOURCE_SUFFIXES or path.name == "LICENSE"
     )

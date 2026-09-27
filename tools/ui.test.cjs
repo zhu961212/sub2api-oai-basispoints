@@ -125,6 +125,7 @@ function createPage(options = {}) {
     "bps-403-toggle": "button",
     "bps-device-toggle": "button",
     "degradation-result": "div",
+    "account-check-hint": "span",
     "retry-button": "button",
   };
   for (const [id, tagName] of Object.entries(tags)) {
@@ -159,6 +160,12 @@ function createPage(options = {}) {
   };
   const bridge = {
     hasToken: true,
+    supportsScopedTest() { return options.scoped === true; },
+    testScoped(config) {
+      calls.scoped = calls.scoped || [];
+      calls.scoped.push(clone(config));
+      return options.testScoped ? options.testScoped(clone(config)) : Promise.resolve(scopedResult(config));
+    },
     ready() { calls.ready++; },
     resize(height) { calls.resize.push(height); },
     dispose() { calls.disposed++; },
@@ -406,7 +413,8 @@ test("select all preserves hidden saved IDs and adds every displayed account onl
   assert.equal(page.ids["select-all-button"].disabled, false);
   page.selectAll();
   assert.deepEqual(page.selected(), [1, 2, 3], "Each account must have exactly one checkbox");
-  assert.equal(page.ids["select-all-button"].disabled, true);
+  assert.equal(page.ids["select-all-button"].disabled, false);
+  assert.equal(page.ids["select-all-button"].textContent, "已全选列表账号");
   assert.equal(page.calls.save.length, 0, "Selecting accounts must still require Save");
   assert.match(page.ids["account-hint"].textContent, /已勾选 4 个账号/);
   page.check(2, false);
@@ -803,11 +811,11 @@ test("status refresh automatically selects new accounts without losing existing 
   const page = createPage({ status });
   await flush();
   page.selectAll();
-  assert.equal(page.ids["select-all-button"].disabled, true);
+  assert.equal(page.ids["select-all-button"].disabled, false);
   status.status_json = JSON.stringify({ accounts: [{ id: 2 }] });
   page.pollStatus();
   await flush();
-  assert.equal(page.ids["select-all-button"].disabled, true);
+  assert.equal(page.ids["select-all-button"].disabled, false);
   assert.deepEqual(page.selected(), [2]);
   page.save();
   await flush();
@@ -1545,7 +1553,7 @@ test("select all records explicit versioned restores only when the user saves", 
 
 test("ordinary saves never confirm retained diagnostic command markers", async (t) => {
   for (const phase of ["acknowledgement", "read-back"]) {
-    for (const marker of [{ degradation_check: true }, { degradation_check_account_id: 2 }]) {
+    for (const marker of [{ degradation_check: true }, { degradation_check_account_id: 2 }, { degradation_check_account_ids: [2] }, { degradation_check_account_ids: [] }]) {
       await t.test(phase + " / " + Object.keys(marker)[0], async () => {
         const page = createPage({
           save: (config, store) => {
@@ -1566,6 +1574,119 @@ test("ordinary saves never confirm retained diagnostic command markers", async (
   }
 });
 
+
+function scopedResult(config, verdicts = {}) {
+  const ids = config.degradation_check_account_id ? [config.degradation_check_account_id] : config.degradation_check_account_ids;
+  const results = ids.map(account_id => ({ account_id, status: "ok", answer: "苹果17", ...verdicts[account_id] }));
+  return { success: true, status_json: JSON.stringify({ degradation_check: {
+    request_id: "mock-request", target_account_ids: ids, completed: true, results,
+    degraded_account_ids: results.filter(row => row.status === "degraded").map(row => row.account_id),
+  } }) };
+}
+
+test("scoped single-account checks use page snapshots without saving shared configuration", async () => {
+  const store = { config: { account_ids: [1], enabled_models: ["gpt-6-astra"] } };
+  const first = createPage({ store, scoped: true });
+  const second = createPage({ store, scoped: true });
+  await flush();
+  first.checkModel("gpt-6-sol", true);
+  first.checkAccount(1);
+  second.checkAccount(2);
+  await flush();
+  assert.equal(first.calls.scoped[0].degradation_check_account_id, 1);
+  assert.equal(second.calls.scoped[0].degradation_check_account_id, 2);
+  assert.ok(first.calls.scoped[0].enabled_models.includes("gpt-6-sol"));
+  assert.ok(!second.calls.scoped[0].enabled_models.includes("gpt-6-sol"));
+  assert.deepEqual(store.config, { account_ids: [1], enabled_models: ["gpt-6-astra"] });
+  for (const page of [first, second]) {
+    assert.equal(page.calls.save.length, 0);
+    assert.equal(page.calls.test, 0);
+    assert.deepEqual(page.selected(), [1]);
+  }
+  assert.match(first.accountRow(1).result.textContent, /符合检测规则/);
+  assert.equal(first.accountRow(2).result.textContent, "未检测");
+  assert.match(second.accountRow(2).result.textContent, /符合检测规则/);
+});
+
+test("bulk snapshot selects confirmed degraded accounts locally and preserves failed or hidden selections", async () => {
+  const page = createPage({ scoped: true, store: { config: { account_ids: [1, 3, 99] } },
+    testScoped: config => Promise.resolve(scopedResult(config, {
+      2: { status: "degraded", answer: "苹果16" },
+      3: { status: "error", answer: "", error: "HTTP 429" },
+    })) });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.deepEqual(page.calls.scoped[0].degradation_check_account_ids, [1, 2, 3]);
+  assert.deepEqual(page.selected(), [2, 3]);
+  assert.equal(page.calls.save.length, 0);
+  assert.match(page.ids["form-hint"].textContent, /保存后生效/);
+  page.save();
+  await flush();
+  assert.deepEqual([...page.store.config.account_ids].sort((a,b) => a-b), [2, 3, 99]);
+  assert.ok(!page.store.config.degradation_check);
+  assert.ok(!page.store.config.degradation_check_account_id);
+  assert.ok(!page.store.config.degradation_check_account_ids);
+});
+
+test("diagnostic errors and mismatched targets preserve choices and unlock controls", async t => {
+  for (const mode of ["network", "wrong-target", "duplicate", "empty", "no-degraded", "incomplete"]) {
+    await t.test(mode, async () => {
+      const page = createPage({ scoped: true, store: { config: { account_ids: [2] } }, testScoped: config => {
+        if (mode === "network") return Promise.reject(new Error("timeout"));
+        const result = scopedResult(config);
+        const details = JSON.parse(result.status_json);
+        if (mode === "wrong-target") details.degradation_check.target_account_ids = [99];
+        if (mode === "duplicate") details.degradation_check.results[1] = details.degradation_check.results[0];
+        if (mode === "empty") details.degradation_check.results = [];
+        if (mode === "incomplete") details.degradation_check.completed = false;
+        result.status_json = JSON.stringify(details);
+        return Promise.resolve(result);
+      } });
+      await flush();
+      page.degradationCheck();
+      await flush();
+      assert.deepEqual(page.selected(), [2]);
+      assert.equal(page.calls.save.length, 0);
+      assert.equal(page.ids["save-button"].disabled, false);
+      assert.equal(page.ids["degradation-check-button"].disabled, false);
+      if (!["no-degraded", "incomplete"].includes(mode)) assert.match(page.ids["form-hint"].textContent, /检测失败/);
+    });
+  }
+});
+
+test("active diagnostics lock edits and dispatch once even when events are forced", async () => {
+  const pending = deferred();
+  const page = createPage({ scoped: true, testScoped: () => pending.promise });
+  await flush();
+  page.checkAccount(1);
+  assert.equal(page.ids["save-button"].disabled, true);
+  assert.equal(page.ids["select-all-button"].disabled, true);
+  assert.equal(page.accountRow(1).button.textContent, "检测中…");
+  page.accountRow(2).button.emit("click");
+  page.ids["degradation-check-button"].emit("click");
+  page.ids["save-button"].emit("click");
+  page.ids["select-all-button"].emit("click");
+  assert.equal(page.calls.scoped.length, 1);
+  assert.equal(page.calls.save.length, 0);
+  pending.resolve(scopedResult(page.calls.scoped[0]));
+  await flush();
+  assert.equal(page.ids["save-button"].disabled, false);
+});
+
+test("scoped diagnostics do not acknowledge unsaved 403 restores", async () => {
+  const page = createPage({ scoped: true, status: bpsStatus([[2, bpsBlockA]]),
+    store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2] } } });
+  await flush();
+  page.check(2, true);
+  assert.equal(page.accountRow(2).button.disabled, true);
+  page.checkAccount(1);
+  await flush();
+  assert.ok(!page.calls.scoped[0].bps_reenabled_accounts || !page.calls.scoped[0].bps_reenabled_accounts[2]);
+  assert.ok(page.selected().includes(2));
+  assert.match(page.accountRow(2).availability.textContent, /待恢复/);
+  assert.equal(page.calls.save.length, 0);
+});
 
 function createBridgeHarness(options = {}) {
   const listeners = new Set();
@@ -1698,10 +1819,40 @@ test("passive diagnostic verdicts stay tied to numeric account IDs after reorder
   }
 });
 
+test("scoped bridge requires advertised support and correlates the diagnostic request ID", async () => {
+  const host = createBridgeHarness();
+  await assert.rejects(host.bridge.testScoped({ degradation_check: true }), /升级宿主/);
+  assert.equal(host.sent.length, 0);
+  const load = host.bridge.loadConfig();
+  host.reply({ config: {}, capabilities: ["config.testScoped"] });
+  await load;
+  assert.equal(host.bridge.supportsScopedTest(), true);
+  const config = { degradation_check: true, degradation_check_account_id: 2 };
+  const pending = host.bridge.testScoped(config);
+  const request = host.sent.at(-1).data;
+  assert.equal(request.type, "config.testScoped");
+  assert.deepEqual(request.config, config);
+  assert.equal([...host.timers.values()][0].delay, 150000);
+  const result = scopedResult(config);
+  const details = JSON.parse(result.status_json);
+  details.degradation_check.request_id = request.request_id;
+  result.status_json = JSON.stringify(details);
+  host.reply({ result });
+  assert.deepEqual(clone(await pending), result);
+  const wrong = host.bridge.testScoped(config);
+  host.reply({ result });
+  await assert.rejects(wrong, /标识不匹配/);
+  const reload = host.bridge.loadConfig();
+  host.reply({ config: {} });
+  await reload;
+  assert.equal(host.bridge.supportsScopedTest(), false);
+});
+
 test("Bridge v1 documents its account test limitation while retaining ordinary testing", async () => {
   const host = createBridgeHarness();
   assert.match(host.bridge.accountCheckUnavailableReason, /原子绑定检测账号/);
-  assert.match(htmlSource, /单账号和批量检测已暂停/);
+  assert.equal(host.bridge.supportsScopedTest(), false);
+  assert.match(htmlSource, /id="account-check-hint"/);
   const pending = host.bridge.testConfig();
   assert.equal(host.sent.length, 1);
   assert.equal(host.sent[0].data.type, "config.test");

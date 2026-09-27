@@ -7,6 +7,9 @@
 # 签名私钥是 base64 编码的密钥材料，禁止任何行尾/编码转换。
 *.private -text
 
+# Keep companion host patch context byte-for-byte across platforms.
+docs/host-patches/*.patch -text -whitespace
+
 # 插件包与二进制产物不入库。
 dist/*.s2plugin binary
 build/ binary

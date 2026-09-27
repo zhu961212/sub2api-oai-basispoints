@@ -146,7 +146,7 @@ func TestDegradationCheckBoundsAllBatchesAndConcurrency(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("queued batches exceeded total budget: %s", elapsed)
 	}
-	if err != nil || !check.Completed || len(check.Results) != 40 || len(check.DegradedAccountIDs) != 0 {
+	if err != context.DeadlineExceeded || check.Completed || len(check.Results) != 40 || len(check.DegradedAccountIDs) != 0 {
 		t.Fatalf("budget results incomplete: completed=%t results=%d degraded=%v err=%v", check.Completed, len(check.Results), check.DegradedAccountIDs, err)
 	}
 	for _, result := range check.Results {
@@ -162,5 +162,65 @@ func TestDegradationCheckBoundsAllBatchesAndConcurrency(t *testing.T) {
 	check, err = transport.runDegradationCheckWithBudget(ctx, protocol.DefaultConfig(), time.Second)
 	if err == nil || check.Completed || len(check.DegradedAccountIDs) != 0 {
 		t.Fatal("parent cancellation was reported as completed")
+	}
+}
+
+func TestDegradationCheckCompletionTracksScanBudgetAndPreservesResults(t *testing.T) {
+	for _, expires := range []bool{false, true} {
+		t.Run(fmt.Sprintf("scanExpires=%t", expires), func(t *testing.T) {
+			host := &degradationTestHost{fakeHost: &fakeHost{
+				accounts: []*pluginv1.AccountInfo{
+					{Id: 7, Schedulable: true}, {Id: 9, Schedulable: true}, {Id: 11, Schedulable: true},
+				},
+				tokenFor: map[int64]string{7: token(t, "acct-7"), 9: token(t, "acct-9"), 11: token(t, "acct-11")},
+			}}
+			tr := New()
+			defer tr.Shutdown()
+			tr.host = host
+			tr.client = &http.Client{Transport: degradationRoundTripper(func(request *http.Request) (*http.Response, error) {
+				status, answer := http.StatusOK, "iPhone 17"
+				switch request.Header.Get("ChatGPT-Account-ID") {
+				case "acct-7":
+					answer = "iPhone 16"
+				case "acct-9":
+					status = http.StatusInternalServerError
+				case "acct-11":
+					if expires {
+						<-request.Context().Done()
+						return nil, request.Context().Err()
+					}
+				default:
+					t.Error("diagnostic probed an account outside the snapshot")
+				}
+				return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(protocol.JSONBytes(map[string]any{"output_text": answer}))))}, nil
+			})}
+			cfg := protocol.DefaultConfig()
+			cfg.DegradationCheck = true
+			cfg.DegradationCheckAccountIDs = []int64{7, 9, 11, 99}
+			budget := time.Second
+			if expires {
+				budget = 100 * time.Millisecond
+			}
+			check, err := tr.runDegradationCheckWithBudget(context.Background(), cfg, budget)
+			if expires {
+				if err != context.DeadlineExceeded || check.Completed {
+					t.Fatalf("internal deadline was reported as complete: %+v err=%v", check, err)
+				}
+			} else if err != nil || !check.Completed {
+				t.Fatalf("individual HTTP failure made the whole scan incomplete: %+v err=%v", check, err)
+			}
+			if len(check.Results) != 4 || len(check.DegradedAccountIDs) != 1 || check.DegradedAccountIDs[0] != 7 {
+				t.Fatalf("scan lost completed account results: %+v", check)
+			}
+			wantStatuses := []string{"degraded", "error", "ok", "skipped"}
+			if expires {
+				wantStatuses[2] = "error"
+			}
+			for i, id := range cfg.DegradationCheckAccountIDs {
+				if check.Results[i].AccountID != id || check.Results[i].Status != wantStatuses[i] {
+					t.Errorf("account result %d changed: %+v", id, check.Results[i])
+				}
+			}
+		})
 	}
 }

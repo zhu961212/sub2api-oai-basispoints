@@ -36,6 +36,8 @@ type degradationAccountResult struct {
 }
 
 type degradationCheckResult struct {
+	RequestID          string                     `json:"request_id"`
+	TargetAccountIDs   []int64                    `json:"target_account_ids"`
 	Completed          bool                       `json:"completed"`
 	Expected           string                     `json:"expected"`
 	Prompt             string                     `json:"prompt"`
@@ -58,10 +60,17 @@ func (t *Transport) runDegradationCheckWithBudget(ctx context.Context, c protoco
 	scanCtx, cancelScan := context.WithTimeout(ctx, budget)
 	defer cancelScan()
 	result := degradationCheckResult{
+		TargetAccountIDs:   append([]int64{}, c.DegradationCheckAccountIDs...),
 		Expected:           degradationExpectedReply,
 		Prompt:             degradationCheckPrompt,
 		Results:            []degradationAccountResult{},
 		DegradedAccountIDs: []int64{},
+	}
+	if c.DegradationCheckAccountID > 0 {
+		result.TargetAccountIDs = []int64{c.DegradationCheckAccountID}
+	}
+	for _, id := range result.TargetAccountIDs {
+		result.Results = append(result.Results, degradationAccountResult{AccountID: id, Status: "error", Error: "degradation check could not run"})
 	}
 
 	t.mu.RLock()
@@ -111,24 +120,22 @@ func (t *Transport) runDegradationCheckWithBudget(ctx context.Context, c protoco
 			}
 		}
 	}
-	if c.DegradationCheckAccountID > 0 {
-		var selected []degradationAccount
-		for _, account := range accounts {
-			if account.id == c.DegradationCheckAccountID {
-				selected = []degradationAccount{account}
-				break
+	if len(result.TargetAccountIDs) > 0 {
+		selected := make([]degradationAccount, 0, len(result.TargetAccountIDs))
+		for _, id := range result.TargetAccountIDs {
+			if index, exists := seen[id]; exists {
+				selected = append(selected, accounts[index])
+			} else {
+				selected = append(selected, degradationAccount{id: id, unavailable: true})
 			}
 		}
-		if len(selected) == 0 {
-			result.Results = []degradationAccountResult{{
-				AccountID: c.DegradationCheckAccountID,
-				Status:    "skipped",
-				Error:     "account is not available for degradation check",
-			}}
-			result.Completed = ctx.Err() == nil
-			return result, ctx.Err()
-		}
 		accounts = selected
+	} else {
+		// Unscoped enumeration remains private; public diagnostics always have
+		// an explicit target snapshot validated before reaching this runner.
+		for _, account := range accounts {
+			result.TargetAccountIDs = append(result.TargetAccountIDs, account.id)
+		}
 	}
 	if len(accounts) == 0 {
 		return result, fmt.Errorf("no OpenAI OAuth accounts available for degradation check")
@@ -137,6 +144,11 @@ func (t *Transport) runDegradationCheckWithBudget(ctx context.Context, c protoco
 	workerCount := 0
 	for index, account := range accounts {
 		result.Results[index] = degradationAccountResult{AccountID: account.id, Name: account.name}
+		if account.unavailable {
+			result.Results[index].Status = "skipped"
+			result.Results[index].Error = "account is not available for degradation check"
+			continue
+		}
 		if t.isBPSAccountDisabled(account.id, c) {
 			accounts[index].schedulable = false
 			result.Results[index].Status = "skipped"
@@ -198,9 +210,9 @@ dispatch:
 			result.DegradedAccountIDs = append(result.DegradedAccountIDs, account.AccountID)
 		}
 	}
-	result.Completed = ctx.Err() == nil
-	if ctx.Err() != nil {
-		return result, ctx.Err()
+	result.Completed = scanCtx.Err() == nil
+	if scanCtx.Err() != nil {
+		return result, scanCtx.Err()
 	}
 	return result, nil
 }
@@ -209,6 +221,7 @@ type degradationAccount struct {
 	id          int64
 	name        string
 	schedulable bool
+	unavailable bool
 }
 
 func degradationModel(c protocol.Config) string {

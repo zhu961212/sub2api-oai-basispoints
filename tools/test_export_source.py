@@ -12,7 +12,8 @@ class SourceExportBoundaryTests(unittest.TestCase):
                      ".github/workflows/ci.yml", "internal/attachments/cache_regression_test.go",
                      "third_party/sub2api/LICENSE", "third_party/sub2api/go.mod",
                      "third_party/sub2api/pkg/pluginapi/v1/plugin.pb.go",
-                     "docs/使用说明.md", "tools/test_export_source.py", "ui/index.html"):
+                     "docs/使用说明.md", "docs/host-patches/sub2api-0.2.8-config-test-scoped.patch",
+                     "tools/test_export_source.py", "ui/index.html"):
             with self.subTest(name=name):
                 self.assertTrue(exporter.source_path_allowed(name))
 
@@ -20,7 +21,7 @@ class SourceExportBoundaryTests(unittest.TestCase):
         for name in ("dist/plugin.s2plugin", "build/key.private", ".git/config",
                      "tools/publisher.private", "docs/key.pem", ".env", "ui/.env.local",
                      "internal/auth.json", "ui/credentials.json", "tools/accounts-export.json",
-                     "docs/settings.local.json", "tools/__pycache__/script.py",
+                     "docs/settings.local.json", "tools/__pycache__/script.py", "tools/private.patch",
                      "tools/node_modules/index.js", "/outside.go", "../README.md"):
             with self.subTest(name=name):
                 self.assertFalse(exporter.source_path_allowed(name))

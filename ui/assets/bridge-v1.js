@@ -46,6 +46,7 @@
     var defaultTimeout = typeof settings.timeoutMs === "number" ? settings.timeoutMs : DEFAULT_TIMEOUT_MS;
     var pending = new Map();
     var disposed = false;
+    var scopedTestsAvailable = false;
 
     function onMessage(event) {
       if (disposed) {
@@ -105,7 +106,7 @@
           reject(new Error("缺少 bridge_token，请从插件管理页重新打开配置"));
           return;
         }
-        var requestID = newRequestID();
+        var requestID = payload && payload.request_id || newRequestID();
         var limit = typeof timeoutMs === "number" ? timeoutMs : defaultTimeout;
         var timer = global.setTimeout(function () {
           pending.delete(requestID);
@@ -136,12 +137,29 @@
       hasToken: token !== "",
       // UI Bridge v1 tests shared saved config, not a request-local target.
       // Never implement account diagnostics as saveConfig followed by testConfig.
-      accountCheckUnavailableReason: "当前宿主 UI Bridge v1 无法原子绑定检测账号；为避免多页面检测错账号，单账号和批量检测已暂停。需宿主提供按请求绑定目标的检测接口。账号状态查询、路由保存和宿主连通性测试仍可使用。",
+      accountCheckUnavailableReason: "当前宿主未提供原子绑定检测账号的接口，单账号和批量检测已暂停。请同步升级配套宿主和插件后重新打开配置页。账号状态查询、路由保存和宿主连通性测试仍可使用。",
       ready: function () {
         post("sub2api.plugin.ready");
       },
       loadConfig: function () {
-        return request("config.load").then(readConfigResponse);
+        return request("config.load").then(function (response) {
+          var config = readConfigResponse(response);
+          scopedTestsAvailable = Array.isArray(response.capabilities) && response.capabilities.indexOf("config.testScoped") >= 0;
+          return config;
+        });
+      },
+      supportsScopedTest: function () { return scopedTestsAvailable; },
+      testScoped: function (config) {
+        if (!scopedTestsAvailable) return Promise.reject(new Error("宿主不支持按请求绑定账号的检测接口，请升级宿主后重新打开配置页"));
+        var requestID = newRequestID();
+        return request("config.testScoped", { config: config, request_id: requestID }, 150000).then(function (response) {
+          var result = response.result;
+          var details = result && typeof result.status_json === "string" ? JSON.parse(result.status_json) : null;
+          if (!details || !details.degradation_check || details.degradation_check.request_id !== requestID) {
+            throw new Error(result && result.message || "宿主返回的检测请求标识不匹配，请重新打开配置页");
+          }
+          return result;
+        });
       },
       saveConfig: function (config) {
         return request("config.save", { config: config }, STEP_UP_TIMEOUT_MS).then(readConfigResponse);

@@ -53,6 +53,7 @@ const driver = String.raw`
   const token = new URLSearchParams(location.hash.slice(1)).get('bridge_token');
   const params = new URLSearchParams(location.search);
   const stage = params.get('stage');
+  const scoped = stage === 'scoped' || stage === 'scoped-reopen';
   const blocked = params.get('blocked') === '1';
   const send = (type, data = {}) => parent.postMessage({ source: 'bps-ui-browser-test', bridge_token: token, stage, type, ...data }, '*');
   const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -124,7 +125,7 @@ const driver = String.raw`
         throw new Error('Automatic image support is not described');
       if (!same(Array.from(document.querySelectorAll('#model-list input')).map((box) => box.value), modelIDs))
         throw new Error('The model picker does not group GPT-6 before GPT-5.6');
-      const initialModels = stage === 'select' ? defaultModels : stage === 'all' ? subset : stage === 'clear' ? modelIDs : [];
+      const initialModels = stage === 'select' ? defaultModels : stage === 'all' || scoped ? subset : stage === 'clear' ? modelIDs : [];
       if (!same(selectedModels(), initialModels))
         throw new Error('Reopened models were ' + JSON.stringify(selectedModels()) + ', expected ' + JSON.stringify(initialModels));
       if (stage === 'reopen-empty' && !document.getElementById('model-hint').textContent.includes('所有模型原样透传'))
@@ -132,11 +133,96 @@ const driver = String.raw`
       if (/图片中转|公网 HTTPS|反向代理|监听地址|存储目录/.test(document.body.textContent))
         throw new Error('Obsolete image hosting instructions are still visible');
     }
-    const initial = stage === 'reopen-empty' || (stage === 'select' && blocked) ? [] : accountIDs;
+    const initial = scoped ? (stage === 'scoped' ? [accountIDs[0], accountIDs[1], accountIDs[3]] : [accountIDs[1], accountIDs[2], accountIDs[3]]) :
+      stage === 'reopen-empty' || (stage === 'select' && blocked) ? [] : accountIDs;
     if (!same(selected(), initial)) throw new Error('Reopened selection was ' + JSON.stringify(selected()) + ', expected ' + JSON.stringify(initial));
     send('opened', { selected: selected(), models: selectedModels(), viewportWidth: document.documentElement.clientWidth,
       autoDisableOn403: document.getElementById('bps-403-toggle')?.getAttribute('aria-pressed'),
       deviceConvergence: document.getElementById('bps-device-toggle')?.getAttribute('aria-pressed') });
+    if (scoped) {
+      const bulk = document.getElementById('degradation-check-button');
+      const save = document.getElementById('save-button');
+      const accountButton = (accountID) => document.querySelector('.account-check-button[value="' + accountID + '"]');
+      const hint = () => document.getElementById('form-hint').textContent;
+      function assertReady() {
+        if (bulk.disabled || save.disabled || document.getElementById('select-all-button').disabled ||
+            Array.from(document.querySelectorAll('.account-check-button')).some((button) => button.disabled))
+          throw new Error('New host capability did not enable individual, bulk and select-all actions');
+      }
+      function assertBusy(before) {
+        for (const controlID of ['save-button', 'retry-button', 'select-all-button', 'degradation-check-button',
+          'bps-403-toggle', 'bps-device-toggle', 'account-fields', 'model-fields']) {
+          if (!document.getElementById(controlID).disabled) throw new Error('Diagnostic did not lock ' + controlID);
+        }
+        if (Array.from(document.querySelectorAll('.account-check-button')).some((button) => !button.disabled))
+          throw new Error('Diagnostic did not lock every individual check');
+        // Even synthetic events must not bypass the busy guard or dispatch writes.
+        for (const button of [save, bulk, accountButton(accountIDs[0]), document.getElementById('select-all-button'),
+          document.getElementById('bps-403-toggle'), document.getElementById('bps-device-toggle')]) {
+          button.click();
+          button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        }
+        const box = document.querySelector('#account-list input');
+        box.checked = !box.checked;
+        box.dispatchEvent(new Event('change', { bubbles: true }));
+        if (!same(selected(), before) || !same(selectedModels(), subset))
+          throw new Error('Busy diagnostic allowed account or model selection changes');
+        assert403Policy(false);
+        assertDeviceConvergence(false);
+      }
+      async function diagnose(button, expectedSelection, expectedHint) {
+        const before = selected();
+        assertReady();
+        button.click();
+        assertBusy(before);
+        await until(() => !save.disabled && hint().includes(expectedHint), 'Scoped diagnostic did not settle: ' + expectedHint);
+        if (!same(selected(), expectedSelection) || !same(selectedModels(), subset))
+          throw new Error('Scoped diagnostic changed the wrong account or model selection');
+        assertReady();
+        assertResponsiveLayout();
+      }
+      assertReady();
+      if (stage === 'scoped-reopen') {
+        send('done', { selected: selected(), models: selectedModels(), scopedSelectionSurvivedReopen: true });
+        return;
+      }
+      await diagnose(accountButton(accountIDs[1]), initial, '账号选择未改变');
+      const checkedRow = accountButton(accountIDs[1]).closest('.account-row');
+      const sameNameRow = accountButton(accountIDs[0]).closest('.account-row');
+      if (!checkedRow.querySelector('.account-check-result.result-degraded') || sameNameRow.querySelector('.account-check-result.result-degraded'))
+        throw new Error('Single-account result leaked to another account with the same name');
+      const singleResult = document.getElementById('degradation-result').textContent;
+      if (!singleResult.includes('（#' + accountIDs[1] + '）') || singleResult.includes('foreign-result-name'))
+        throw new Error('Scoped result lost the selected account ID or trusted an unrelated result name');
+
+      await diagnose(accountButton(accountIDs[0]), initial, '检测失败');
+      if (sameNameRow.querySelector('.account-check-result.result-degraded'))
+        throw new Error('Mismatched request ID was displayed as another account result');
+
+      const filtered = [accountIDs[1], accountIDs[2], accountIDs[3]];
+      await diagnose(bulk, filtered, '失败或跳过的账号保留原选择');
+      if (!hint().includes('点击保存后生效')) throw new Error('Bulk selection did not explain the manual save requirement');
+      const expectedStatuses = ['ok', 'error', 'degraded', 'skipped', 'ok'];
+      for (let index = 0; index < accountIDs.length; index++) {
+        const row = accountButton(accountIDs[index]).closest('.account-row');
+        if (!row.querySelector('.account-check-result.result-' + expectedStatuses[index]))
+          throw new Error('Bulk result was assigned to the wrong account ID');
+      }
+      await diagnose(bulk, filtered, '检测失败');
+      await diagnose(bulk, filtered, '检测未全部完成');
+      send('before-scoped-save', { selected: selected(), models: selectedModels() });
+      save.click();
+      await until(() => !save.disabled && hint().includes('已保存'), 'Scoped local selection did not save on explicit click');
+      if (!same(selected(), filtered) || !same(selectedModels(), subset))
+        throw new Error('Explicit save changed the diagnostic account/model selection');
+      assertReady();
+      assertResponsiveLayout();
+      send('done', { selected: selected(), models: selectedModels(), scopedDiagnostics: 5,
+        individualResultIsolated: true, requestAndTargetMismatchRejected: true,
+        busyActionsLocked: true, partialFailureSelectionPreserved: true, incompleteSelectionPreserved: true,
+        scopedSelectionSavedOnlyOnClick: true });
+      return;
+    }
     if (stage === 'reopen-empty') {
       const statuses = ['error', 'error', 'degraded', 'ok', 'skipped'];
       const bulk = document.getElementById('degradation-check-button');
@@ -176,12 +262,16 @@ const driver = String.raw`
     }
     if (stage === 'select' && !blocked) {
       const selectAll = document.getElementById('select-all-button');
-      if (!selectAll || !selectAll.disabled) throw new Error('Legacy unrestricted accounts were not already selected');
+      if (!selectAll || selectAll.disabled || selectAll.textContent !== '已全选列表账号')
+        throw new Error('Already selected accounts must keep the select-all control clickable');
+      selectAll.click();
+      if (!same(selected(), accountIDs) || selectAll.disabled) throw new Error('Repeated select-all changed selected accounts or disabled the control');
       for (const box of document.querySelectorAll('#account-list input:checked')) box.click();
       if (!same(selected(), [])) throw new Error('Account checkboxes did not clear the migrated selection');
       if (!selectAll || selectAll.disabled) throw new Error('Select-all button did not become ready');
       selectAll.click();
-      if (!selectAll.disabled) throw new Error('Select-all button stayed enabled after every account was selected');
+      if (selectAll.disabled || selectAll.textContent !== '已全选列表账号')
+        throw new Error('Select-all must stay clickable and report every account selected');
     } else if (stage !== 'all') {
       for (const box of document.querySelectorAll('#account-list input')) box.click();
     }
@@ -249,6 +339,7 @@ const host = `
   const expectBlocked = ${JSON.stringify(expectBlocked)};
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  const sameIDs = (left, right) => Array.isArray(left) && same(left.slice().sort((a, b) => a - b), right.slice().sort((a, b) => a - b));
   // Saved configuration uses catalog order; the UI groups model generations separately.
   const models = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra', 'gpt-5.6-luna'];
   const defaultModels = ['gpt-6-astra', 'gpt-5.6-sol'];
@@ -262,6 +353,11 @@ const host = `
   let loadCount = 0;
   let saveCount = 0;
   let testCount = 0;
+  let scopedTestCount = 0;
+  let scopedInFlight = false;
+  let allowScopedSave = false;
+  let legacyChecks = {};
+  let scopedChecks = {};
   let lastCheck = null;
   const events = [];
   const accounts = ${JSON.stringify(browserAccounts)};
@@ -269,7 +365,7 @@ const host = `
   async function finish(ok, details) {
     if (finished) return;
     finished = true;
-    const result = { ok, ...details, saveCount, loadCount, testCount, persisted: config, events };
+    const result = { ok, ...details, saveCount, loadCount, testCount, scopedTestCount, persisted: config, events };
     document.getElementById('result').textContent = JSON.stringify(result, null, 2);
     await fetch('/__test/result/' + secret, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result) });
   }
@@ -309,7 +405,30 @@ const host = `
         return void finish(reproduced, { reproducedSubmitBlocked: reproduced, evidence: details,
           error: reproduced ? undefined : 'Expected a blocked native form submission with no config.save' });
       }
+      if (data.type === 'before-scoped-save') {
+        if (stage !== 'scoped' || scopedTestCount !== 5 || scopedInFlight || saveCount !== 3 ||
+            !same(config.account_ids, [accountIDs[0], accountIDs[1], accountIDs[3]]))
+          return void finish(false, { error: 'Diagnostics saved or altered persisted selection before an explicit save' });
+        allowScopedSave = true;
+        return;
+      }
       if (data.type !== 'done') return;
+      if (stage === 'scoped') {
+        if (!allowScopedSave || saveCount !== 4 || testCount !== 0 || scopedTestCount !== 5 || data.scopedDiagnostics !== 5 ||
+            !sameIDs(config.account_ids, [accountIDs[1], accountIDs[2], accountIDs[3]]) || !same(config.enabled_models, subset))
+          return void finish(false, { error: 'Scoped diagnostic results or explicit persisted selection did not match the requested snapshot' });
+        scopedChecks = { singleAndBulkDiagnosticsEnabled: true, requestLocalSnapshotsUsed: true,
+          individualResultIsolated: data.individualResultIsolated, requestAndTargetMismatchRejected: data.requestAndTargetMismatchRejected,
+          busyActionsLocked: data.busyActionsLocked, partialFailureSelectionPreserved: data.partialFailureSelectionPreserved,
+          incompleteSelectionPreserved: data.incompleteSelectionPreserved, scopedSelectionSavedOnlyOnClick: data.scopedSelectionSavedOnlyOnClick };
+        return reopen('scoped-reopen');
+      }
+      if (stage === 'scoped-reopen') {
+        if (saveCount !== 4 || scopedTestCount !== 5 || !data.scopedSelectionSurvivedReopen ||
+            !same(data.selected, [accountIDs[1], accountIDs[2], accountIDs[3]]))
+          return void finish(false, { error: 'Explicit scoped selection did not survive reopening the new host UI' });
+        return void finish(true, { ...legacyChecks, ...scopedChecks, scopedSelectionSurvivedReopen: true });
+      }
       if (stage === 'select') {
         if (saveCount !== 1 || !same(config.account_ids, accountIDs)) return void finish(false, { error: 'Selected accounts were not persisted by the host' });
         if (config.bps_auto_disable_on_403 !== false) return void finish(false, { error: 'Disabled 403 policy was not persisted by the host' });
@@ -337,7 +456,7 @@ const host = `
       }
       if (testCount !== 0 || saveCount !== 3 || data.pausedAccountDiagnostics !== accountIDs.length || data.passiveAccountResults !== accountIDs.length)
         return void finish(false, { error: 'Paused diagnostics dispatched a request, saved config, or lost passive results' });
-      return void finish(true, { checkedSelectionSurvivedReopen: true, emptySelectionSurvivedReopen: true,
+      legacyChecks = { checkedSelectionSurvivedReopen: true, emptySelectionSurvivedReopen: true,
         fullAccountNamesDisplayed: true, duplicateNamesDisambiguatedByIDs: true, namesRenderedAsText: true,
         accountDiagnosticsPausedWithoutSideEffects: true, passiveAccountResultsIsolated: true, default403PolicyEnabled: true, disabled403PolicySurvivedReopen: true,
         enabled403PolicySurvivedReopen: true, wideAndNarrowLayoutsWithoutOverflow: true,
@@ -346,28 +465,83 @@ const host = `
         deviceConvergenceLockedDuringSave: true,
         automaticImagesWithoutSettings: true,
         defaultModelsSelected: true, modelSubsetSurvivedReopen: true, allSixModelsSurvivedReopen: true,
-        emptyModelSelectionSurvivedReopen: true, otherConfigurationPreserved: true });
+        emptyModelSelectionSurvivedReopen: true, otherConfigurationPreserved: true };
+      config = { ...config, account_ids: [accountIDs[0], accountIDs[1], accountIDs[3]],
+        excluded_account_ids: [accountIDs[2], accountIDs[4]], enabled_models: subset };
+      lastCheck = null;
+      return reopen('scoped');
     }
     if (data.source !== 'sub2api-plugin-ui') return;
     if (data.type === 'ui.resize' || data.type === 'sub2api.plugin.ready') return;
     if (typeof data.request_id !== 'string' || !data.request_id) return void finish(false, { error: 'Bridge request has no request_id' });
     events.push({ stage, type: data.type, origin: event.origin });
-    const respond = (payload) => event.source.postMessage({ source: 'sub2api-plugin-host', bridge_token: token,
+    const responseWindow = event.source;
+    const responseToken = token;
+    const respond = (payload) => responseWindow.postMessage({ source: 'sub2api-plugin-host', bridge_token: responseToken,
       type: data.type + '.result', request_id: data.request_id, ...payload }, '*');
-    if (data.type === 'config.load') { loadCount++; return respond({ ok: true, config: clone(config) }); }
+    if (data.type === 'config.load') {
+      loadCount++;
+      const payload = { ok: true, config: clone(config) };
+      if (stage === 'scoped' || stage === 'scoped-reopen') payload.capabilities = ['config.testScoped'];
+      return respond(payload);
+    }
     if (data.type === 'plugin.status') return respond({ ok: true, result: { healthy: true, message: 'ready',
       status_json: JSON.stringify({ plugin_version: 'browser-test', accounts, account_ids: config.account_ids,
         available_models: models, enabled_models: config.enabled_models, degradation_check: lastCheck }) } });
     if (data.type === 'config.test') {
       testCount++;
-      return void finish(false, { error: 'Paused account diagnostics must never dispatch config.test' });
+      return void finish(false, { error: 'Account diagnostics must never dispatch legacy config.test' });
+    }
+    if (data.type === 'config.testScoped') {
+      if (stage !== 'scoped' || scopedInFlight || allowScopedSave || saveCount !== 3)
+        return void finish(false, { error: 'Scoped request escaped its supported stage or busy lock' });
+      scopedTestCount++;
+      if (scopedTestCount > 5) return void finish(false, { error: 'An extra scoped request bypassed the busy lock' });
+      const snapshot = data.config;
+      const single = scopedTestCount <= 2;
+      const targets = single ? [accountIDs[scopedTestCount === 1 ? 1 : 0]] : accountIDs;
+      const expectedSelection = scopedTestCount <= 3 ? [accountIDs[0], accountIDs[1], accountIDs[3]] : [accountIDs[1], accountIDs[2], accountIDs[3]];
+      if (!snapshot || snapshot.degradation_check !== true || !sameIDs(snapshot.account_ids, expectedSelection) ||
+          !same(snapshot.enabled_models, subset) || snapshot.timeout_seconds !== 123 || snapshot.auth_mode !== 'chatgpt' || snapshot.rewrite_tools !== false ||
+          (single ? snapshot.degradation_check_account_id !== targets[0] || 'degradation_check_account_ids' in snapshot :
+            !same(snapshot.degradation_check_account_ids, targets) || 'degradation_check_account_id' in snapshot))
+        return void finish(false, { error: 'Scoped request did not preserve its selected account/model snapshot and explicit targets' });
+      if (!same(config.account_ids, [accountIDs[0], accountIDs[1], accountIDs[3]]) || config.degradation_check === true ||
+          'degradation_check_account_id' in config || 'degradation_check_account_ids' in config)
+        return void finish(false, { error: 'Scoped diagnostic command leaked into saved configuration' });
+      const call = scopedTestCount;
+      const statuses = single ? ['degraded'] : call === 5 ? ['degraded', 'ok', 'ok', 'error', 'skipped'] : ['ok', 'error', 'degraded', 'skipped', 'ok'];
+      const check = { request_id: data.request_id, target_account_ids: targets.slice(), completed: call !== 5,
+        degraded_account_ids: targets.filter((_id, index) => statuses[index] === 'degraded'),
+        results: targets.map((id, index) => {
+          const row = { account_id: id, name: 'foreign-result-name', status: statuses[index] };
+          if (row.status === 'degraded' || row.status === 'ok') row.answer = row.status === 'degraded' ? '苹果16' : '苹果17';
+          else row.error = row.status === 'error' ? 'fixed diagnostic failure' : 'fixed skipped account';
+          return row;
+        }) };
+      if (call === 2) check.request_id = 'unrelated-request';
+      if (call === 4) check.target_account_ids[0] = 999;
+      if (call !== 2 && call !== 4) lastCheck = clone(check);
+      scopedInFlight = true;
+      // Fixed local fixtures only: no account, token, model or upstream network request.
+      setTimeout(() => {
+        scopedInFlight = false;
+        respond({ ok: true, result: { success: call < 3, message: 'fixed scoped diagnostic', latency_ms: 100,
+          status_json: JSON.stringify({ degradation_check: check }) } });
+      }, 100);
+      return;
     }
     if (data.type === 'config.save') {
       saveCount++;
+      if (scopedInFlight || (stage === 'scoped' && !allowScopedSave))
+        return void finish(false, { error: 'Scoped diagnostics must not save configuration automatically or while busy' });
       if (stage === 'reopen-empty')
         return void finish(false, { error: 'Paused account diagnostics must never save configuration' });
       if (data.config.timeout_seconds !== 123 || data.config.auth_mode !== 'chatgpt' || data.config.rewrite_tools !== false)
         return void finish(false, { error: 'Saving account selection overwrote unrelated configuration' });
+      if (stage === 'scoped' && (data.config.degradation_check === true ||
+          'degradation_check_account_id' in data.config || 'degradation_check_account_ids' in data.config))
+        return void finish(false, { error: 'Explicit save retained a diagnostic command' });
       config = clone(data.config);
       return respond({ ok: true, config: clone(config) });
     }
@@ -450,7 +624,7 @@ try {
   const result = await resultPromise;
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) throw new Error(result.error || 'Browser regression failed');
-  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: complete safe account names fit wide/narrow layouts; paused diagnostics send no requests and passive results stay tied to IDs; 403/device policies and account/model choices persist after reopening.');
+  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: old-host diagnostics stay disabled; scoped single/bulk diagnostics preserve request/account ownership, busy locks and failed selections; only explicit save persists choices; select-all remains clickable and policies/models survive reopening.');
 } catch (error) {
   console.error(error.stack || error.message);
   process.exitCode = 1;

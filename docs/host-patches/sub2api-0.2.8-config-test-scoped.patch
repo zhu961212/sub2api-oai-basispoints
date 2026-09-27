@@ -1,0 +1,1601 @@
+diff --git a/backend/internal/handler/admin/plugin_handler.go b/backend/internal/handler/admin/plugin_handler.go
+index efb8e4b75c2d56c36aeaf0dd98212ed8ed10c0c6..94fedcf000231ff0f7d597f1196f4e1bc3a4ffb4 100644
+--- a/backend/internal/handler/admin/plugin_handler.go
++++ b/backend/internal/handler/admin/plugin_handler.go
+@@ -183,6 +183,35 @@ func (h *PluginHandler) Test(c *gin.Context) {
+ 	response.Success(c, result)
+ }
+ 
++// TestScoped accepts a request-local snapshot through the step-up protected
++// endpoint. Neither the request nor its diagnostics flags are persisted.
++func (h *PluginHandler) TestScoped(c *gin.Context) {
++	id, ok := pluginIDParam(c)
++	if !ok {
++		return
++	}
++	var request struct {
++		RequestID string          `json:"request_id"`
++		Config    json.RawMessage `json:"config"`
++	}
++	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4*1024*1024+4096))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&request); err != nil {
++		response.BadRequest(c, "检测参数必须包含 request_id 和 config 对象")
++		return
++	}
++	if err := decoder.Decode(&struct{}{}); err != io.EOF {
++		response.BadRequest(c, "检测参数只能包含一个 JSON 对象")
++		return
++	}
++	result, err := h.manager.TestScoped(c.Request.Context(), id, request.RequestID, request.Config)
++	if err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	response.Success(c, result)
++}
++
+ // Status returns the plugin's passive runtime status for the config UI. It is
+ // read-only (no config apply, no upstream call) and therefore not step-up gated,
+ // so a status UI can poll it without a 2FA prompt or a "test" side effect.
+@@ -218,6 +247,7 @@ func (h *PluginHandler) CreateUISession(c *gin.Context) {
+ 		"url":               fmt.Sprintf("/api/v1/plugin-ui/%s/index.html#bridge_token=%s", assetToken, bridgeToken),
+ 		"bridge_token":      bridgeToken,
+ 		"ui_bridge_version": 1,
++		"capabilities":      []string{"config.testScoped"},
+ 		"expires_at":        expires,
+ 	})
+ }
+diff --git a/backend/internal/handler/admin/plugin_scoped_diagnostics_test.go b/backend/internal/handler/admin/plugin_scoped_diagnostics_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..38c0d4821535306132631ece2d8bc38167fb123a
+--- /dev/null
++++ b/backend/internal/handler/admin/plugin_scoped_diagnostics_test.go
+@@ -0,0 +1,71 @@
++package admin
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++)
++
++type scopedHandlerRepository struct{ service.PluginRepository }
++
++func (*scopedHandlerRepository) GetByID(context.Context, int64) (*service.PluginInstallation, error) {
++	return &service.PluginInstallation{ID: 9}, nil
++}
++
++type scopedHandlerEncryptor struct{}
++
++func (scopedHandlerEncryptor) Encrypt(value string) (string, error) { return value, nil }
++func (scopedHandlerEncryptor) Decrypt(value string) (string, error) { return value, nil }
++
++func TestPluginScopedHandlerRejectsMalformedRequests(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	manager := service.NewPluginManager(&scopedHandlerRepository{}, scopedHandlerEncryptor{}, nil, service.PluginHostInfo{}, nil)
++	h := NewPluginHandler(manager)
++	router := gin.New()
++	router.POST("/plugins/:id/test-scoped", h.TestScoped)
++	for _, payload := range []string{
++		`null`, `{}`, `{"request_id":"valid-id","config":[]}`,
++		`{"request_id":"valid-id","config":null}`,
++		`{"request_id":"valid-id","config":{},"unknown":true}`,
++		`{"request_id":"bad id","config":{}}`,
++		`{"request_id":"valid-id","config":{}} {}`,
++	} {
++		t.Run(payload, func(t *testing.T) {
++			recorder := httptest.NewRecorder()
++			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/plugins/9/test-scoped", strings.NewReader(payload)))
++			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
++		})
++	}
++	recorder := httptest.NewRecorder()
++	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/plugins/9/test-scoped", strings.NewReader(`{"request_id":"valid-id","config":{}}`)))
++	require.Equal(t, http.StatusBadRequest, recorder.Code)
++	require.Contains(t, recorder.Body.String(), "插件未运行")
++}
++
++func TestPluginUISessionAdvertisesScopedTestingCapability(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	manager := service.NewPluginManager(&scopedHandlerRepository{}, scopedHandlerEncryptor{}, nil, service.PluginHostInfo{}, nil)
++	router := gin.New()
++	router.POST("/plugins/:id/ui-session", NewPluginHandler(manager).CreateUISession)
++	recorder := httptest.NewRecorder()
++	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/plugins/9/ui-session", nil))
++	require.Equal(t, http.StatusOK, recorder.Code)
++	var response struct {
++		Data struct {
++			Capabilities  []string `json:"capabilities"`
++			BridgeVersion int      `json:"ui_bridge_version"`
++			BridgeToken   string   `json:"bridge_token"`
++		} `json:"data"`
++	}
++	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
++	require.Equal(t, 1, response.Data.BridgeVersion)
++	require.Equal(t, []string{"config.testScoped"}, response.Data.Capabilities)
++	require.NotEmpty(t, response.Data.BridgeToken)
++}
+diff --git a/backend/internal/server/routes/admin.go b/backend/internal/server/routes/admin.go
+index d0737f039797b56dc2bdc485dd32d55346c6d4e0..e45ca6dc96f9c311a7e724b17d3f82def406f741 100644
+--- a/backend/internal/server/routes/admin.go
++++ b/backend/internal/server/routes/admin.go
+@@ -769,6 +769,7 @@ func registerPluginRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAut
+ 		plugins.GET("/:id/status", h.Admin.Plugin.Status)
+ 		plugins.PUT("/:id/config", gin.HandlerFunc(stepUpAuth), h.Admin.Plugin.SaveConfig)
+ 		plugins.POST("/:id/test", gin.HandlerFunc(stepUpAuth), h.Admin.Plugin.Test)
++		plugins.POST("/:id/test-scoped", gin.HandlerFunc(stepUpAuth), h.Admin.Plugin.TestScoped)
+ 		plugins.POST("/:id/ui-session", h.Admin.Plugin.CreateUISession)
+ 	}
+ }
+diff --git a/backend/internal/server/routes/plugin_scoped_diagnostics_test.go b/backend/internal/server/routes/plugin_scoped_diagnostics_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a94651e842ad8f0d5958167b3d2d1e9383e64390
+--- /dev/null
++++ b/backend/internal/server/routes/plugin_scoped_diagnostics_test.go
+@@ -0,0 +1,51 @@
++package routes
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/handler"
++	adminhandler "github.com/Wei-Shaw/sub2api/internal/handler/admin"
++	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++)
++
++func TestPluginScopedRouteRequiresAdminAndStepUp(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	for _, denyAdmin := range []bool{true, false} {
++		t.Run(map[bool]string{true: "admin", false: "step-up"}[denyAdmin], func(t *testing.T) {
++			router := gin.New()
++			admin := router.Group("/api/v1/admin")
++			admin.Use(func(c *gin.Context) {
++				if denyAdmin {
++					c.AbortWithStatus(http.StatusUnauthorized)
++					return
++				}
++				c.Next()
++			})
++			stepUpCalls := 0
++			stepUp := middleware.StepUpAuthMiddleware(func(c *gin.Context) {
++				stepUpCalls++
++				c.AbortWithStatus(http.StatusForbidden)
++			})
++			handlers := &handler.Handlers{Admin: &handler.AdminHandlers{Plugin: adminhandler.NewPluginHandler(nil)}}
++			registerPluginRoutes(admin, handlers, stepUp)
++			for _, path := range []string{"/api/v1/admin/plugins/9/test-scoped", "/api/v1/admin/plugins/9/test"} {
++				recorder := httptest.NewRecorder()
++				router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
++				if denyAdmin {
++					require.Equal(t, http.StatusUnauthorized, recorder.Code)
++				} else {
++					require.Equal(t, http.StatusForbidden, recorder.Code)
++				}
++			}
++			if denyAdmin {
++				require.Zero(t, stepUpCalls)
++			} else {
++				require.Equal(t, 2, stepUpCalls)
++			}
++		})
++	}
++}
+diff --git a/backend/internal/service/plugin_manager.go b/backend/internal/service/plugin_manager.go
+index 23ae5ae8242d002b7293ff3ee2ce7e1d5fe514a3..ee2e4f32dd892363ccf38e54d6bd8dc97809908c 100644
+--- a/backend/internal/service/plugin_manager.go
++++ b/backend/internal/service/plugin_manager.go
+@@ -53,6 +53,8 @@ type PluginManager struct {
+ 	accountDirectory PluginAccountDirectory
+ 
+ 	operationMu        sync.Mutex
++	scopedTestMu       sync.Mutex
++	scopedTests        map[pluginScopedTestKey]*pluginScopedTestEntry
+ 	mu                 sync.Mutex
+ 	runtimes           map[int64]*pluginRuntime
+ 	localInstallations map[int64]*PluginInstallation
+diff --git a/backend/internal/service/plugin_scoped_diagnostics.go b/backend/internal/service/plugin_scoped_diagnostics.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b5cd1ddda9ddd2ba992f0f7878afed95fe30542e
+--- /dev/null
++++ b/backend/internal/service/plugin_scoped_diagnostics.go
+@@ -0,0 +1,168 @@
++package service
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"time"
++
++	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
++	"google.golang.org/grpc/metadata"
++	"google.golang.org/protobuf/proto"
++)
++
++const (
++	pluginScopedTestTTL          = 10 * time.Minute
++	pluginScopedTestMaxEntries   = 256
++	pluginScopedTestScopeKey     = "x-sub2api-test-scope"
++	pluginScopedTestRequestIDKey = "x-sub2api-test-request-id"
++)
++
++type pluginScopedTestKey struct {
++	pluginID  int64
++	requestID string
++}
++
++type pluginScopedTestEntry struct {
++	digest  [sha256.Size]byte
++	done    chan struct{}
++	expires time.Time
++	result  *pluginv1.TestConfigResponse
++	err     error
++}
++
++// TestScoped binds a test to one caller-supplied configuration snapshot. It does
++// not load saved configuration, apply configuration, or write any configuration.
++// Request IDs provide bounded, process-local replay protection, including RPC
++// failures where the host cannot know whether an upstream request was sent.
++func (m *PluginManager) TestScoped(ctx context.Context, id int64, requestID string, raw json.RawMessage) (*pluginv1.TestConfigResponse, error) {
++	// Include validation, repository reads and duplicate waits in one budget.
++	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
++	defer cancel()
++	if id <= 0 || !validPluginScopedRequestID(requestID) {
++		return nil, errors.New("检测 request_id 无效：须为 1–128 位字母、数字、短横线、下划线、点或冒号")
++	}
++	canonical, err := canonicalPluginScopedConfig(raw)
++	if err != nil {
++		return nil, err
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	key := pluginScopedTestKey{pluginID: id, requestID: requestID}
++	digest := sha256.Sum256(canonical)
++	now := time.Now()
++	m.scopedTestMu.Lock()
++	if m.scopedTests == nil {
++		m.scopedTests = make(map[pluginScopedTestKey]*pluginScopedTestEntry)
++	}
++	for existingKey, entry := range m.scopedTests {
++		// Never evict in-flight operations or unexpired completed results.
++		if !entry.expires.IsZero() && !now.Before(entry.expires) {
++			delete(m.scopedTests, existingKey)
++		}
++	}
++	if entry, exists := m.scopedTests[key]; exists {
++		m.scopedTestMu.Unlock()
++		if entry.digest != digest {
++			return nil, errors.New("检测 request_id 已用于不同配置，请为新的检测使用新的 request_id")
++		}
++		select {
++		case <-entry.done:
++			return clonePluginTestResponse(entry.result), entry.err
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}
++	if len(m.scopedTests) >= pluginScopedTestMaxEntries {
++		m.scopedTestMu.Unlock()
++		return nil, errors.New("检测请求过多，请等待现有检测缓存过期后重试")
++	}
++	entry := &pluginScopedTestEntry{digest: digest, done: make(chan struct{})}
++	m.scopedTests[key] = entry
++	m.scopedTestMu.Unlock()
++
++	result, err := m.testScopedSnapshot(ctx, id, requestID, canonical)
++	m.scopedTestMu.Lock()
++	entry.result, entry.err = clonePluginTestResponse(result), err
++	entry.expires = time.Now().Add(pluginScopedTestTTL)
++	close(entry.done)
++	m.scopedTestMu.Unlock()
++	return result, err
++}
++
++func (m *PluginManager) testScopedSnapshot(ctx context.Context, id int64, requestID string, snapshot []byte) (*pluginv1.TestConfigResponse, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if _, err := m.repo.GetByID(ctx, id); err != nil {
++		return nil, err
++	}
++	m.mu.Lock()
++	runtime := m.runtimes[id]
++	var api pluginv1.TransportPluginClient
++	if runtime != nil && !runtime.draining.Load() {
++		api = runtime.api
++	}
++	m.mu.Unlock()
++	if api == nil {
++		return nil, errors.New("插件未运行，请先启用插件再进行账号检测")
++	}
++	// Keep the published client for this request without holding operationMu.
++	// Saves, other tests and disable must stay responsive. If this runtime is
++	// stopped, its RPC fails and the failure is cached; never retry a new runtime.
++	validation, err := api.ValidateConfig(ctx, &pluginv1.ValidateConfigRequest{ConfigJson: snapshot})
++	if err != nil {
++		return nil, fmt.Errorf("校验检测配置: %w", err)
++	}
++	if !validation.GetValid() {
++		return nil, fmt.Errorf("检测配置无效: %s", validation.GetMessage())
++	}
++	// Reserved metadata is generated here, never copied from HTTP headers.
++	md, _ := metadata.FromOutgoingContext(ctx)
++	md = md.Copy()
++	md.Set(pluginScopedTestScopeKey, "request-v1")
++	md.Set(pluginScopedTestRequestIDKey, requestID)
++	ctx = metadata.NewOutgoingContext(ctx, md)
++	return api.TestConfig(ctx, &pluginv1.TestConfigRequest{ConfigJson: snapshot})
++}
++
++func validPluginScopedRequestID(id string) bool {
++	if len(id) == 0 || len(id) > 128 {
++		return false
++	}
++	for _, char := range id {
++		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '-' || char == '_' || char == '.' || char == ':' {
++			continue
++		}
++		return false
++	}
++	return true
++}
++
++func canonicalPluginScopedConfig(raw []byte) ([]byte, error) {
++	if len(raw) == 0 || len(raw) > pluginConfigMaxBytes {
++		return nil, errors.New("检测配置必须是有效且大小受限的 JSON 对象")
++	}
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	decoder.UseNumber()
++	var value map[string]any
++	if err := decoder.Decode(&value); err != nil || value == nil {
++		return nil, errors.New("检测配置 JSON 根节点必须是对象")
++	}
++	if err := decoder.Decode(&struct{}{}); err != io.EOF {
++		return nil, errors.New("检测配置只能包含一个 JSON 对象")
++	}
++	return json.Marshal(value)
++}
++
++func clonePluginTestResponse(result *pluginv1.TestConfigResponse) *pluginv1.TestConfigResponse {
++	if result == nil {
++		return nil
++	}
++	return proto.Clone(result).(*pluginv1.TestConfigResponse)
++}
+diff --git a/backend/internal/service/plugin_scoped_diagnostics_test.go b/backend/internal/service/plugin_scoped_diagnostics_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ead79cf324c097ed3c2307c7e9dd32e3de01556f
+--- /dev/null
++++ b/backend/internal/service/plugin_scoped_diagnostics_test.go
+@@ -0,0 +1,430 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/metadata"
++)
++
++type scopedDiagnosticClient struct {
++	pluginv1.TransportPluginClient
++	valid       bool
++	normalized  []byte
++	validations atomic.Int32
++	applies     atomic.Int32
++	tests       atomic.Int32
++	validateFn  func(context.Context) (*pluginv1.ValidateConfigResponse, error)
++	testFn      func(context.Context, []byte) (*pluginv1.TestConfigResponse, error)
++}
++
++func (c *scopedDiagnosticClient) ValidateConfig(ctx context.Context, _ *pluginv1.ValidateConfigRequest, _ ...grpc.CallOption) (*pluginv1.ValidateConfigResponse, error) {
++	c.validations.Add(1)
++	if c.validateFn != nil {
++		return c.validateFn(ctx)
++	}
++	return &pluginv1.ValidateConfigResponse{Valid: c.valid, Message: "fixture validation", NormalizedConfigJson: c.normalized}, nil
++}
++
++type scopedDiagnosticRepository struct {
++	PluginRepository
++	getFn func(context.Context, int64) (*PluginInstallation, error)
++}
++
++func (r *scopedDiagnosticRepository) GetByID(ctx context.Context, id int64) (*PluginInstallation, error) {
++	return r.getFn(ctx, id)
++}
++
++func (c *scopedDiagnosticClient) ApplyConfig(context.Context, *pluginv1.ApplyConfigRequest, ...grpc.CallOption) (*pluginv1.ApplyConfigResponse, error) {
++	c.applies.Add(1)
++	return &pluginv1.ApplyConfigResponse{Applied: true}, nil
++}
++
++func (c *scopedDiagnosticClient) TestConfig(ctx context.Context, req *pluginv1.TestConfigRequest, _ ...grpc.CallOption) (*pluginv1.TestConfigResponse, error) {
++	c.tests.Add(1)
++	if c.testFn != nil {
++		return c.testFn(ctx, req.ConfigJson)
++	}
++	return &pluginv1.TestConfigResponse{Success: true, Message: "fixture result"}, nil
++}
++
++func scopedDiagnosticManager(client *scopedDiagnosticClient) (*PluginManager, *pluginConfigRepository) {
++	installation := &PluginInstallation{ID: 9, ConfigEncrypted: `ENC:{"target":99}`}
++	repo := &pluginConfigRepository{installation: installation}
++	return &PluginManager{repo: repo, encryptor: pluginTokenEncryptor{}, runtimes: map[int64]*pluginRuntime{9: {installation: installation, api: client}}}, repo
++}
++
++func TestPluginManagerTestScopedBindsSnapshotWithoutApplyOrSave(t *testing.T) {
++	client := &scopedDiagnosticClient{valid: true, normalized: []byte(`{"target":88}`)}
++	manager, repo := scopedDiagnosticManager(client)
++	repo.installation.ConfigEncrypted = "deliberately cannot be decrypted"
++	client.testFn = func(ctx context.Context, snapshot []byte) (*pluginv1.TestConfigResponse, error) {
++		require.JSONEq(t, `{"target":9007199254740993,"degradation_check":true}`, string(snapshot))
++		md, ok := metadata.FromOutgoingContext(ctx)
++		require.True(t, ok)
++		require.Equal(t, []string{"request-v1"}, md.Get(pluginScopedTestScopeKey))
++		require.Equal(t, []string{"request-1"}, md.Get(pluginScopedTestRequestIDKey))
++		require.Equal(t, []string{"trace-1"}, md.Get("trace-id"))
++		return &pluginv1.TestConfigResponse{Success: true, Message: "snapshot result"}, nil
++	}
++	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(pluginScopedTestScopeKey, "untrusted", pluginScopedTestRequestIDKey, "wrong", "trace-id", "trace-1"))
++	result, err := manager.TestScoped(ctx, 9, "request-1", []byte(`{"target":9007199254740993,"degradation_check":true}`))
++	require.NoError(t, err)
++	require.True(t, result.Success)
++	require.Equal(t, int32(1), client.validations.Load())
++	require.Zero(t, client.applies.Load())
++	require.Empty(t, repo.encrypted)
++	require.Equal(t, "deliberately cannot be decrypted", repo.installation.ConfigEncrypted)
++	result.Message = "caller changed its result"
++	replay, err := manager.TestScoped(ctx, 9, "request-1", []byte(`{ "degradation_check":true, "target":9007199254740993 }`))
++	require.NoError(t, err)
++	require.Equal(t, "snapshot result", replay.Message)
++	require.Equal(t, int32(1), client.tests.Load())
++}
++
++func TestPluginManagerTestScopedDeduplicatesConcurrentRequestsAndRejectsConflicts(t *testing.T) {
++	started, release := make(chan struct{}), make(chan struct{})
++	client := &scopedDiagnosticClient{valid: true}
++	client.testFn = func(context.Context, []byte) (*pluginv1.TestConfigResponse, error) {
++		close(started)
++		<-release
++		return &pluginv1.TestConfigResponse{Success: true}, nil
++	}
++	manager, _ := scopedDiagnosticManager(client)
++	var wg sync.WaitGroup
++	errs := make(chan error, 9)
++	for i := 0; i < 8; i++ {
++		wg.Go(func() {
++			_, err := manager.TestScoped(context.Background(), 9, "same-request", []byte(`{"target":1}`))
++			errs <- err
++		})
++	}
++	<-started
++	_, err := manager.TestScoped(context.Background(), 9, "same-request", []byte(`{"target":2}`))
++	require.ErrorContains(t, err, "不同配置")
++	canceledCtx, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, err = manager.TestScoped(canceledCtx, 9, "same-request", []byte(`{"target":1}`))
++	require.ErrorIs(t, err, context.Canceled)
++	close(release)
++	wg.Wait()
++	close(errs)
++	for err := range errs {
++		require.NoError(t, err)
++	}
++	require.Equal(t, int32(1), client.tests.Load())
++	require.Equal(t, int32(1), client.validations.Load())
++}
++
++func TestPluginManagerTestScopedKeepsDifferentTargetsIndependent(t *testing.T) {
++	client := &scopedDiagnosticClient{valid: true}
++	client.testFn = func(ctx context.Context, snapshot []byte) (*pluginv1.TestConfigResponse, error) {
++		md, _ := metadata.FromOutgoingContext(ctx)
++		return &pluginv1.TestConfigResponse{Success: true, Message: md.Get(pluginScopedTestRequestIDKey)[0], StatusJson: string(snapshot)}, nil
++	}
++	manager, repo := scopedDiagnosticManager(client)
++	var wg sync.WaitGroup
++	for id := 1; id <= 2; id++ {
++		wg.Go(func() {
++			requestID := fmt.Sprintf("page-%d", id)
++			snapshot := fmt.Sprintf(`{"target":%d}`, id)
++			result, err := manager.TestScoped(context.Background(), 9, requestID, []byte(snapshot))
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			if result.Message != requestID || result.StatusJson != snapshot {
++				t.Errorf("request %s received unrelated snapshot: %v", requestID, result)
++			}
++		})
++	}
++	wg.Wait()
++	require.Equal(t, int32(2), client.tests.Load())
++	require.Zero(t, client.applies.Load())
++	require.Empty(t, repo.encrypted)
++}
++
++func TestPluginManagerTestScopedCachesAmbiguousFailureAndCancellation(t *testing.T) {
++	for _, canceled := range []bool{false, true} {
++		t.Run(fmt.Sprint(canceled), func(t *testing.T) {
++			started := make(chan struct{})
++			client := &scopedDiagnosticClient{valid: true}
++			client.testFn = func(ctx context.Context, _ []byte) (*pluginv1.TestConfigResponse, error) {
++				close(started)
++				if canceled {
++					<-ctx.Done()
++					return nil, ctx.Err()
++				}
++				return nil, errors.New("connection lost after dispatch")
++			}
++			manager, _ := scopedDiagnosticManager(client)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			done := make(chan error, 1)
++			go func() {
++				_, err := manager.TestScoped(ctx, 9, "uncertain-request", []byte(`{}`))
++				done <- err
++			}()
++			<-started
++			if canceled {
++				cancel()
++			}
++			firstErr := <-done
++			require.Error(t, firstErr)
++			_, replayErr := manager.TestScoped(context.Background(), 9, "uncertain-request", []byte(`{}`))
++			require.EqualError(t, replayErr, firstErr.Error())
++			require.Equal(t, int32(1), client.tests.Load())
++		})
++	}
++}
++
++func TestPluginManagerTestScopedRejectsInvalidInputsBeforeAccessingRuntime(t *testing.T) {
++	manager := &PluginManager{}
++	for _, id := range []string{"", "bad id", "nonascii-检测", strings.Repeat("a", 129)} {
++		_, err := manager.TestScoped(context.Background(), 9, id, []byte(`{}`))
++		require.Error(t, err)
++	}
++	for _, snapshot := range []string{"", "null", "[]", "42", "{}{}", "{broken", strings.Repeat(" ", pluginConfigMaxBytes+1)} {
++		_, err := manager.TestScoped(context.Background(), 9, "valid-id", []byte(snapshot))
++		require.Error(t, err)
++	}
++	client := &scopedDiagnosticClient{valid: false}
++	manager, _ = scopedDiagnosticManager(client)
++	_, err := manager.TestScoped(context.Background(), 9, "invalid-config", []byte(`{}`))
++	require.ErrorContains(t, err, "检测配置无效")
++	require.Zero(t, client.tests.Load())
++	require.Zero(t, client.applies.Load())
++	manager.runtimes = nil
++	_, err = manager.TestScoped(context.Background(), 9, "not-running", []byte(`{}`))
++	require.ErrorContains(t, err, "插件未运行")
++}
++
++func TestPluginManagerTestScopedCacheBoundAndExpiry(t *testing.T) {
++	client := &scopedDiagnosticClient{valid: true}
++	manager, _ := scopedDiagnosticManager(client)
++	manager.scopedTests = make(map[pluginScopedTestKey]*pluginScopedTestEntry)
++	for i := 0; i < pluginScopedTestMaxEntries; i++ {
++		manager.scopedTests[pluginScopedTestKey{pluginID: 9, requestID: fmt.Sprint(i)}] = &pluginScopedTestEntry{expires: time.Now().Add(time.Minute)}
++	}
++	_, err := manager.TestScoped(context.Background(), 9, "full-cache", []byte(`{}`))
++	require.ErrorContains(t, err, "检测请求过多")
++	require.Zero(t, client.tests.Load())
++	manager.scopedTests[pluginScopedTestKey{pluginID: 9, requestID: "0"}].expires = time.Now().Add(-time.Second)
++	_, err = manager.TestScoped(context.Background(), 9, "after-expiry", []byte(`{}`))
++	require.NoError(t, err)
++	require.Len(t, manager.scopedTests, pluginScopedTestMaxEntries)
++}
++
++func TestPluginManagerLegacyTestStillLoadsAndAppliesSavedConfig(t *testing.T) {
++	client := &scopedDiagnosticClient{valid: true}
++	client.testFn = func(ctx context.Context, snapshot []byte) (*pluginv1.TestConfigResponse, error) {
++		require.JSONEq(t, `{"target":99}`, string(snapshot))
++		md, _ := metadata.FromOutgoingContext(ctx)
++		require.Empty(t, md.Get(pluginScopedTestScopeKey))
++		return &pluginv1.TestConfigResponse{Success: true}, nil
++	}
++	manager, _ := scopedDiagnosticManager(client)
++	_, err := manager.Test(context.Background(), 9)
++	require.NoError(t, err)
++	require.Equal(t, int32(1), client.applies.Load())
++	require.Equal(t, int32(1), client.tests.Load())
++}
++
++func TestPluginManagerTestScopedRunsConcurrentlyWithoutOperationLock(t *testing.T) {
++	entered := make(chan string, 2)
++	releases := map[string]chan struct{}{"first": make(chan struct{}), "second": make(chan struct{})}
++	done := make(chan string, 2)
++	errCh := make(chan error, 2)
++	client := &scopedDiagnosticClient{valid: true}
++	client.testFn = func(ctx context.Context, _ []byte) (*pluginv1.TestConfigResponse, error) {
++		md, _ := metadata.FromOutgoingContext(ctx)
++		id := md.Get(pluginScopedTestRequestIDKey)[0]
++		entered <- id
++		select {
++		case <-releases[id]:
++			return &pluginv1.TestConfigResponse{Success: true}, nil
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}
++	manager, _ := scopedDiagnosticManager(client)
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	manager.operationMu.Lock()
++	locked := true
++	defer func() {
++		if locked {
++			manager.operationMu.Unlock()
++		}
++	}()
++	for _, id := range []string{"first", "second"} {
++		go func() {
++			_, err := manager.TestScoped(ctx, 9, id, []byte(`{}`))
++			errCh <- err
++			done <- id
++		}()
++	}
++	for range 2 {
++		select {
++		case <-entered:
++		case <-ctx.Done():
++			t.Fatal("independent scoped tests did not enter RPC concurrently while lifecycle lock was held")
++		}
++	}
++	manager.operationMu.Unlock()
++	locked = false
++	require.True(t, manager.operationMu.TryLock(), "scoped RPC must not occupy the save/disable lock")
++	manager.operationMu.Unlock()
++	close(releases["first"])
++	select {
++	case id := <-done:
++		require.Equal(t, "first", id)
++	case <-ctx.Done():
++		t.Fatal("first test did not complete independently")
++	}
++	require.NoError(t, <-errCh)
++	select {
++	case <-done:
++		t.Fatal("second test completed before its own release")
++	default:
++	}
++	close(releases["second"])
++	select {
++	case id := <-done:
++		require.Equal(t, "second", id)
++	case <-ctx.Done():
++		t.Fatal("second test did not complete")
++	}
++	require.NoError(t, <-errCh)
++	require.Equal(t, int32(2), client.tests.Load())
++}
++
++func TestPluginManagerTestScopedBudgetStartsBeforeRepositoryRead(t *testing.T) {
++	client := &scopedDiagnosticClient{valid: true}
++	manager, _ := scopedDiagnosticManager(client)
++	started := time.Now()
++	var entryDeadline time.Time
++	manager.repo = &scopedDiagnosticRepository{getFn: func(ctx context.Context, id int64) (*PluginInstallation, error) {
++		deadline, ok := ctx.Deadline()
++		require.True(t, ok, "repository read must already have the scoped request budget")
++		require.WithinDuration(t, started.Add(30*time.Second), deadline, time.Second)
++		entryDeadline = deadline
++		return &PluginInstallation{ID: id}, nil
++	}}
++	client.validateFn = func(ctx context.Context) (*pluginv1.ValidateConfigResponse, error) {
++		deadline, ok := ctx.Deadline()
++		require.True(t, ok)
++		require.Equal(t, entryDeadline, deadline)
++		return &pluginv1.ValidateConfigResponse{Valid: true}, nil
++	}
++	client.testFn = func(ctx context.Context, _ []byte) (*pluginv1.TestConfigResponse, error) {
++		deadline, ok := ctx.Deadline()
++		require.True(t, ok)
++		require.Equal(t, entryDeadline, deadline, "testing must not restart the budget after validation")
++		return &pluginv1.TestConfigResponse{Success: true}, nil
++	}
++	_, err := manager.TestScoped(context.Background(), 9, "entry-deadline", []byte(`{}`))
++	require.NoError(t, err)
++}
++
++func TestPluginManagerTestScopedDuplicateWaitHonorsOwnDeadline(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	client := &scopedDiagnosticClient{valid: true}
++	client.testFn = func(ctx context.Context, _ []byte) (*pluginv1.TestConfigResponse, error) {
++		close(entered)
++		select {
++		case <-release:
++			return &pluginv1.TestConfigResponse{Success: true}, nil
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}
++	manager, _ := scopedDiagnosticManager(client)
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() { _, err := manager.TestScoped(ctx, 9, "duplicate-wait", []byte(`{}`)); done <- err }()
++	select {
++	case <-entered:
++	case <-ctx.Done():
++		t.Fatal("original test did not enter")
++	}
++	waitCtx, waitCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
++	defer waitCancel()
++	_, err := manager.TestScoped(waitCtx, 9, "duplicate-wait", []byte(`{}`))
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++	close(release)
++	require.NoError(t, <-done)
++	_, err = manager.TestScoped(context.Background(), 9, "duplicate-wait", []byte(`{}`))
++	require.NoError(t, err)
++	require.Equal(t, int32(1), client.tests.Load())
++}
++
++func TestPluginManagerTestScopedPinsClientAcrossRuntimeReplacement(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	oldClient := &scopedDiagnosticClient{valid: true}
++	newClient := &scopedDiagnosticClient{valid: true}
++	oldClient.validateFn = func(ctx context.Context) (*pluginv1.ValidateConfigResponse, error) {
++		close(entered)
++		select {
++		case <-release:
++			return &pluginv1.ValidateConfigResponse{Valid: true}, nil
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}
++	oldClient.testFn = func(context.Context, []byte) (*pluginv1.TestConfigResponse, error) {
++		return nil, errors.New("captured runtime was stopped")
++	}
++	manager, _ := scopedDiagnosticManager(oldClient)
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() { _, err := manager.TestScoped(ctx, 9, "replaced-runtime", []byte(`{}`)); done <- err }()
++	select {
++	case <-entered:
++	case <-ctx.Done():
++		t.Fatal("original validation did not enter")
++	}
++	manager.mu.Lock()
++	manager.runtimes[9].draining.Store(true)
++	manager.runtimes[9] = &pluginRuntime{api: newClient}
++	manager.mu.Unlock()
++	close(release)
++	require.ErrorContains(t, <-done, "captured runtime was stopped")
++	_, err := manager.TestScoped(context.Background(), 9, "replaced-runtime", []byte(`{}`))
++	require.ErrorContains(t, err, "captured runtime was stopped")
++	require.Equal(t, int32(1), oldClient.tests.Load())
++	require.Zero(t, newClient.validations.Load())
++	require.Zero(t, newClient.tests.Load())
++}
++
++func TestPluginManagerTestScopedRejectsDrainingOrMissingClient(t *testing.T) {
++	for _, state := range []string{"missing-runtime", "missing-client", "draining"} {
++		t.Run(state, func(t *testing.T) {
++			client := &scopedDiagnosticClient{valid: true}
++			manager, _ := scopedDiagnosticManager(client)
++			switch state {
++			case "missing-runtime":
++				delete(manager.runtimes, 9)
++			case "missing-client":
++				manager.runtimes[9].api = nil
++			case "draining":
++				manager.runtimes[9].draining.Store(true)
++			}
++			_, err := manager.TestScoped(context.Background(), 9, state, []byte(`{}`))
++			require.ErrorContains(t, err, "插件未运行")
++			require.Zero(t, client.validations.Load())
++			require.Zero(t, client.tests.Load())
++		})
++	}
++}
+diff --git a/backend/pkg/pluginapi/docs/ui-bridge.md b/backend/pkg/pluginapi/docs/ui-bridge.md
+index 7fe6e38247967ca66506b8793c29b8af84b03585..72571c376d05020fbdeaf7cefd82807a4e1fa2f1 100644
+--- a/backend/pkg/pluginapi/docs/ui-bridge.md
++++ b/backend/pkg/pluginapi/docs/ui-bridge.md
+@@ -41,14 +41,29 @@ UI 到宿主：
+ | `type` | UI 参数 | 成功响应 |
+ |---|---|---|
+ | `sub2api.plugin.ready` | 无 | 无响应 |
+-| `config.load` | 无 | `config` |
++| `config.load` | 无 | `config`、`capabilities` |
+ | `config.save` | `config` 对象 | 规范化后的 `config` |
+ | `config.test` | 无 | `result` |
++| `config.testScoped` | `config` 对象 | `result`（须宿主声明同名能力） |
+ | `plugin.status` | 无 | `result`（`Health`：`{healthy, message, status_json}`） |
+ | `ui.resize` | `height` | 无响应 |
+ | `ui.notify` | `level`、`message` | 无响应 |
+ 
+-`config.test` 在 v1 中测试已保存配置（需二次验证，可产生副作用）。UI 若要测试当前表单，应先调用 `config.save`。
++`config.test` 在 v1 中测试已保存配置（需二次验证，可产生副作用）。它不绑定调用页面的账号目标；不要用“保存临时检测字段，再测试”的方式实现主动账号检测。
++
++### 请求快照检测扩展
++
++支持此扩展的宿主在 `POST /admin/plugins/:id/ui-session` 返回 `capabilities: ["config.testScoped"]`，并在 `config.load` 回复中透传真实会话能力。插件 UI 只有收到该能力后才能发送 `config.testScoped`；旧宿主缺少能力时保持禁用，不得降级为保存加测试。
++
++宿主把消息信封中的 `request_id` 与 `config` 对象发送到 `POST /admin/plugins/:id/test-scoped`，请求正文为 `{"request_id":"UNIQUE_ID","config":{...}}`。该接口使用管理员认证及原有二次验证。ID 须为 1–128 个 ASCII 字母、数字或 `._:-`，一次新检测须使用新 ID。
++
++服务端只校验此请求的配置快照，再把同一快照作为 `TestConfigRequest.config_json` 发送给正在运行的插件；不会读取已保存配置替换快照，不调用 `ApplyConfig`，也不保存诊断字段。插件未运行时明确拒绝，须先启用插件。
++
++每次请求从入口起使用 30 秒总期限，包括校验、目录记录读取和重复请求等待。检测不占用配置保存和生命周期的全局操作锁，不同检测可以并行；每次检测固定使用捕获的运行时客户端。检测期间停用或替换运行时会使原客户端 RPC 报错，该错误仍进入去重缓存，不切换到新运行时重放。
++
++此专用路径给 `TestConfig` RPC 附加宿主生成的 gRPC metadata：`x-sub2api-test-scope: request-v1`、`x-sub2api-test-request-id: UNIQUE_ID`。插件应同时验证两个值，只有此路径才接受主动检测命令。普通 `config.test` 不携带这些标记。接口结果仍为标准 `TestConfigResponse`；插件可在结果状态中回显请求 ID 和实际目标用于 UI 校验。
++
++同一宿主进程按插件 ID 和请求 ID 缓存结果及不确定失败，完成后保留 10 分钟；并发重复请求共用结果，同一 ID 对应不同配置会拒绝。缓存最多 256 条，不提前驱逐仍有效或正在执行的请求，满额时拒绝新检测。此保护不跨宿主重启或多实例，也不保证超过缓存期限的重试只执行一次。UI 不应自动重试主动检测；网络超时应提示结果不确定。检测请求可能消耗账号额度，并按插件明确的检测规则记录状态。
+ 
+ `plugin.status` 是只读运行时状态通道：无副作用、免二次验证、不弹宿主提示，供状态面板轮询。它映射到插件 `Health`，`result.status_json` 是插件自定义的不透明 JSON 快照。带状态展示的插件应使用它，而不是把 `config.test` 当作状态轮询。
+ 
+diff --git a/frontend/src/api/__tests__/admin.plugins.spec.ts b/frontend/src/api/__tests__/admin.plugins.spec.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e26f814cdb70982f7811c93976874a6c1e2baa18
+--- /dev/null
++++ b/frontend/src/api/__tests__/admin.plugins.spec.ts
+@@ -0,0 +1,44 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++const { post } = vi.hoisted(() => ({ post: vi.fn() }))
++
++vi.mock('@/api/client', () => ({ apiClient: { post } }))
++
++import pluginsAPI, { createUISession, test, testScoped } from '@/api/admin/plugins'
++
++describe('admin plugin API', () => {
++  beforeEach(() => post.mockReset())
++
++  it('sends the supplied scoped configuration and request ID with a forty-second HTTP timeout', async () => {
++    const config = { model: 'selected-model', upstream_ids: ['row-3'], extra: { enabled: false } }
++    const result = { success: false, message: 'partial result', latency_ms: 123, status_json: '{}' }
++    post.mockResolvedValueOnce({ data: result })
++
++    expect(await testScoped(7, 'request-id', config)).toBe(result)
++    expect(post).toHaveBeenCalledTimes(1)
++    expect(post).toHaveBeenCalledWith('/admin/plugins/7/test-scoped', {
++      request_id: 'request-id', config,
++    }, { timeout: 40000 })
++    expect(post.mock.calls[0]![1].config).toBe(config)
++    expect(pluginsAPI.testScoped).toBe(testScoped)
++  })
++
++  it('keeps the legacy test endpoint unchanged', async () => {
++    const result = { success: true, message: 'ok', latency_ms: 1 }
++    post.mockResolvedValueOnce({ data: result })
++    expect(await test(7)).toBe(result)
++    expect(post).toHaveBeenCalledTimes(1)
++    expect(post).toHaveBeenCalledWith('/admin/plugins/7/test')
++  })
++
++  it('passes session capabilities through to the bridge', async () => {
++    const session = {
++      url: '/plugin-ui/index.html', bridge_token: 'bridge', ui_bridge_version: 1,
++      expires_at: '2026-09-27T01:00:00Z', capabilities: ['config.testScoped'],
++    }
++    post.mockResolvedValueOnce({ data: session })
++    expect(await createUISession(7)).toBe(session)
++    expect(post).toHaveBeenCalledTimes(1)
++    expect(post).toHaveBeenCalledWith('/admin/plugins/7/ui-session')
++  })
++})
+diff --git a/frontend/src/api/admin/plugins.ts b/frontend/src/api/admin/plugins.ts
+index a85c42ee696826f52c8f8373575059a9b4c00407..ff7de0d70257b332e6b01d11b5819f9a4653d8c7 100644
+--- a/frontend/src/api/admin/plugins.ts
++++ b/frontend/src/api/admin/plugins.ts
+@@ -89,6 +89,7 @@ export interface PluginUISession {
+   bridge_token: string
+   ui_bridge_version: number
+   expires_at: string
++  capabilities?: string[]
+ }
+ 
+ export async function list(): Promise<PluginInstallation[]> {
+@@ -145,6 +146,19 @@ export async function test(id: number): Promise<PluginTestResult> {
+   return data
+ }
+ 
++export async function testScoped(
++  id: number,
++  requestID: string,
++  config: Record<string, unknown>
++): Promise<PluginTestResult> {
++  const { data } = await apiClient.post<PluginTestResult>(
++    '/admin/plugins/' + id + '/test-scoped',
++    { request_id: requestID, config },
++    { timeout: 40000 }
++  )
++  return data
++}
++
+ export async function status(id: number): Promise<PluginStatusResult> {
+   const { data } = await apiClient.get<PluginStatusResult>(`/admin/plugins/${id}/status`)
+   return data
+@@ -164,6 +178,7 @@ export default {
+   getConfig,
+   saveConfig,
+   test,
++  testScoped,
+   status,
+   createUISession
+ }
+diff --git a/frontend/src/views/admin/PluginsView.vue b/frontend/src/views/admin/PluginsView.vue
+index 6c78fc69e90b59b4ed561e00f7dccef3267057e3..8b7fe09ed609cbb9f7614867d87108a887e17064 100644
+--- a/frontend/src/views/admin/PluginsView.vue
++++ b/frontend/src/views/admin/PluginsView.vue
+@@ -363,6 +363,15 @@ interface PluginBridgeMessage {
+   message?: unknown;
+ }
+ 
++interface PendingBridgeRequest {
++  requestID: string;
++  type: string;
++  pluginID: number;
++  bridgeToken: string;
++  targetWindow: Window;
++  timeout: number;
++}
++
+ const { t } = useI18n();
+ const appStore = useAppStore();
+ const pluginStepUp = useStepUp();
+@@ -379,7 +388,8 @@ const uiLoading = ref(false);
+ const uiError = ref("");
+ const iframeHeight = ref(640);
+ const pluginFrameLoaded = ref(false);
+-const pendingBridgeRequests = new Map<string, number>();
++const pendingBridgeRequests = new Map<string, PendingBridgeRequest>();
++let configurationGeneration = 0;
+ 
+ function errorMessage(error: unknown): string {
+   if (typeof error === "object" && error !== null && "message" in error) {
+@@ -523,6 +533,7 @@ async function testPlugin(plugin: PluginInstallation): Promise<void> {
+ }
+ 
+ async function openConfiguration(plugin: PluginInstallation): Promise<void> {
++  const generation = ++configurationGeneration;
+   configPlugin.value = plugin;
+   uiSession.value = null;
+   pluginFrameLoaded.value = false;
+@@ -531,14 +542,18 @@ async function openConfiguration(plugin: PluginInstallation): Promise<void> {
+   uiError.value = "";
+   iframeHeight.value = 640;
+   try {
+-    uiSession.value = await adminAPI.plugins.createUISession(plugin.id);
++    const session = await adminAPI.plugins.createUISession(plugin.id);
++    if (generation !== configurationGeneration) return;
++    uiSession.value = session;
+   } catch (error: unknown) {
++    if (generation !== configurationGeneration) return;
+     uiLoading.value = false;
+     uiError.value = errorMessage(error);
+   }
+ }
+ 
+ function closeConfiguration(): void {
++  configurationGeneration++;
+   clearPendingBridgeRequests();
+   pluginFrameLoaded.value = false;
+   configPlugin.value = null;
+@@ -548,7 +563,7 @@ function closeConfiguration(): void {
+ }
+ 
+ function clearPendingBridgeRequests(): void {
+-  for (const timeout of pendingBridgeRequests.values()) window.clearTimeout(timeout);
++  for (const request of pendingBridgeRequests.values()) window.clearTimeout(request.timeout);
+   pendingBridgeRequests.clear();
+ }
+ 
+@@ -560,27 +575,47 @@ function handlePluginFrameLoad(): void {
+   uiLoading.value = false;
+ }
+ 
+-function registerBridgeRequest(requestID: string): void {
+-  const timeout = window.setTimeout(() => {
+-    pendingBridgeRequests.delete(requestID);
+-  }, 30_000);
+-  pendingBridgeRequests.set(requestID, timeout);
++function registerBridgeRequest(
++  requestID: string,
++  type: string,
++  pluginID: number,
++  session: PluginUISession,
++  targetWindow: Window,
++): PendingBridgeRequest {
++  const request: PendingBridgeRequest = {
++    requestID,
++    type,
++    pluginID,
++    bridgeToken: session.bridge_token,
++    targetWindow,
++    timeout: 0,
++  };
++  request.timeout = window.setTimeout(() => {
++    if (pendingBridgeRequests.get(requestID) === request)
++      pendingBridgeRequests.delete(requestID);
++  }, 150_000);
++  pendingBridgeRequests.set(requestID, request);
++  return request;
+ }
+ 
+ function postBridgeResult(
+-  request: PluginBridgeMessage,
++  request: PendingBridgeRequest | undefined,
+   payload: Record<string, unknown>,
+ ): void {
+-  if (!pluginFrame.value?.contentWindow || !uiSession.value) return;
+-  const requestID = typeof request.request_id === "string" ? request.request_id.trim() : "";
+-  const timeout = pendingBridgeRequests.get(requestID);
+-  if (!requestID || timeout === undefined) return;
+-  window.clearTimeout(timeout);
++  if (
++    !request ||
++    pendingBridgeRequests.get(request.requestID) !== request ||
++    configPlugin.value?.id !== request.pluginID ||
++    uiSession.value?.bridge_token !== request.bridgeToken ||
++    pluginFrame.value?.contentWindow !== request.targetWindow
++  ) return;
++  const requestID = request.requestID;
++  window.clearTimeout(request.timeout);
+   pendingBridgeRequests.delete(requestID);
+-  pluginFrame.value.contentWindow.postMessage(
++  request.targetWindow.postMessage(
+     {
+       source: "sub2api-plugin-host",
+-      bridge_token: uiSession.value.bridge_token,
++      bridge_token: request.bridgeToken,
+       type: `${request.type}.result`,
+       request_id: requestID,
+       ...payload,
+@@ -592,10 +627,14 @@ function postBridgeResult(
+ }
+ 
+ async function handleBridgeMessage(event: MessageEvent): Promise<void> {
++  const session = uiSession.value;
++  const pluginID = configPlugin.value?.id;
++  const targetWindow = pluginFrame.value?.contentWindow;
+   if (
+-    !uiSession.value ||
+-    !configPlugin.value ||
+-    event.source !== pluginFrame.value?.contentWindow ||
++    !session ||
++    pluginID === undefined ||
++    !targetWindow ||
++    event.source !== targetWindow ||
+     event.origin !== "null"
+   )
+     return;
+@@ -603,7 +642,7 @@ async function handleBridgeMessage(event: MessageEvent): Promise<void> {
+   if (
+     !message ||
+     message.source !== "sub2api-plugin-ui" ||
+-    message.bridge_token !== uiSession.value.bridge_token
++    message.bridge_token !== session.bridge_token
+   )
+     return;
+ 
+@@ -612,10 +651,12 @@ async function handleBridgeMessage(event: MessageEvent): Promise<void> {
+     message.type === "config.load" ||
+     message.type === "config.save" ||
+     message.type === "config.test" ||
++    message.type === "config.testScoped" ||
+     message.type === "plugin.status";
++  let request: PendingBridgeRequest | undefined;
+   if (expectsResponse) {
+     if (!requestID || pendingBridgeRequests.has(requestID)) return;
+-    registerBridgeRequest(requestID);
++    request = registerBridgeRequest(requestID, message.type!, pluginID, session, targetWindow);
+   }
+ 
+   try {
+@@ -624,8 +665,8 @@ async function handleBridgeMessage(event: MessageEvent): Promise<void> {
+         uiLoading.value = false;
+         break;
+       case "config.load": {
+-        const config = await adminAPI.plugins.getConfig(configPlugin.value.id);
+-        postBridgeResult(message, { ok: true, config });
++        const config = await adminAPI.plugins.getConfig(pluginID);
++        postBridgeResult(request, { ok: true, config, capabilities: session.capabilities ?? [] });
+         break;
+       }
+       case "config.save": {
+@@ -638,19 +679,19 @@ async function handleBridgeMessage(event: MessageEvent): Promise<void> {
+         }
+         const config = await pluginStepUp.run(() =>
+           adminAPI.plugins.saveConfig(
+-            configPlugin.value!.id,
++            pluginID,
+             message.config as Record<string, unknown>,
+           ),
+         );
+-        postBridgeResult(message, { ok: true, config });
++        postBridgeResult(request, { ok: true, config });
+         appStore.showSuccess(t("common.saved"));
+         break;
+       }
+       case "config.test": {
+         const result = await pluginStepUp.run(() =>
+-          adminAPI.plugins.test(configPlugin.value!.id),
++          adminAPI.plugins.test(pluginID),
+         );
+-        postBridgeResult(message, { ok: result.success, result });
++        postBridgeResult(request, { ok: result.success, result });
+         // A successful result is delivered back to the plugin UI, which owns how it
+         // presents it (inline status, or an explicit ui.notify). Only force a host
+         // toast on failure so genuine errors are never silently dropped — plugins
+@@ -660,13 +701,36 @@ async function handleBridgeMessage(event: MessageEvent): Promise<void> {
+           appStore.showError(result.message || t("common.error"));
+         break;
+       }
++      case "config.testScoped": {
++        if (
++          !session.capabilities?.includes("config.testScoped") ||
++          !message.config ||
++          typeof message.config !== "object" ||
++          Array.isArray(message.config)
++        ) {
++          throw new Error(t("admin.plugins.bridgeRejected"));
++        }
++        const config = message.config as Record<string, unknown>;
++        const result = await pluginStepUp.run(async () => {
++          // Step-up may outlive the iframe or the bridge timeout. Recheck on
++          // every attempt so late verification cannot dispatch an abandoned test.
++          if (!request || pendingBridgeRequests.get(requestID) !== request) {
++            throw new Error(t("admin.plugins.bridgeRejected"));
++          }
++          return adminAPI.plugins.testScoped(pluginID, requestID, config);
++        });
++        // Transport success is separate from the test outcome. The plugin needs
++        // failed and partial results too, and owns how those are displayed.
++        postBridgeResult(request, { ok: true, result });
++        break;
++      }
+       case "plugin.status": {
+         // Read-only runtime status (the plugin's Health snapshot). It has no side
+         // effects, so it is intentionally NOT step-up gated and never raises a host
+         // toast — the plugin UI renders it however it likes. This is the generic
+         // channel for any plugin to surface live state without abusing config.test.
+-        const result = await adminAPI.plugins.status(configPlugin.value!.id);
+-        postBridgeResult(message, { ok: true, result });
++        const result = await adminAPI.plugins.status(pluginID);
++        postBridgeResult(request, { ok: true, result });
+         break;
+       }
+       case "ui.resize": {
+@@ -689,7 +753,7 @@ async function handleBridgeMessage(event: MessageEvent): Promise<void> {
+     }
+   } catch (error: unknown) {
+     if (isStepUpBlocked(error)) reportSensitiveActionError(error);
+-    postBridgeResult(message, {
++    postBridgeResult(request, {
+       ok: false,
+       error: isStepUpCancelled(error) ? t("common.cancel") : errorMessage(error),
+     });
+@@ -722,6 +786,7 @@ onMounted(() => {
+ });
+ 
+ onBeforeUnmount(() => {
++  configurationGeneration++;
+   window.removeEventListener("message", handleBridgeMessage);
+   clearPendingBridgeRequests();
+ });
+diff --git a/frontend/src/views/admin/__tests__/PluginsView.spec.ts b/frontend/src/views/admin/__tests__/PluginsView.spec.ts
+index 3fa4a7ed294d6feb6287791951804804c0143104..592c204b36b09447093a71c80de8281ed86ff3f3 100644
+--- a/frontend/src/views/admin/__tests__/PluginsView.spec.ts
++++ b/frontend/src/views/admin/__tests__/PluginsView.spec.ts
+@@ -1,5 +1,6 @@
+-import { flushPromises, mount } from '@vue/test-utils'
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import type { PluginTestResult, PluginUISession } from '@/api/admin'
+ 
+ import PluginsView from '../PluginsView.vue'
+ 
+@@ -8,15 +9,27 @@ const {
+   uploadPlugin,
+   enablePlugin,
+   savePluginConfig,
++  getPluginConfig,
++  testPlugin,
++  testPluginScoped,
++  pluginStatus,
+   createUISession,
+   stepUpRun,
++  showError,
++  showSuccess,
+ } = vi.hoisted(() => ({
+   listPlugins: vi.fn(),
+   uploadPlugin: vi.fn(),
+   enablePlugin: vi.fn(),
+   savePluginConfig: vi.fn(),
++  getPluginConfig: vi.fn(),
++  testPlugin: vi.fn(),
++  testPluginScoped: vi.fn(),
++  pluginStatus: vi.fn(),
+   createUISession: vi.fn(),
+   stepUpRun: vi.fn((action: () => Promise<unknown>) => action()),
++  showError: vi.fn(),
++  showSuccess: vi.fn(),
+ }))
+ 
+ vi.mock('@/api/admin', () => ({
+@@ -27,9 +40,11 @@ vi.mock('@/api/admin', () => ({
+       enable: enablePlugin,
+       disable: vi.fn(),
+       remove: vi.fn(),
+-      getConfig: vi.fn().mockResolvedValue({}),
++      getConfig: getPluginConfig,
+       saveConfig: savePluginConfig,
+-      test: vi.fn().mockResolvedValue({ success: true, message: 'ok', latency_ms: 1 }),
++      test: testPlugin,
++      testScoped: testPluginScoped,
++      status: pluginStatus,
+       createUISession,
+     },
+   },
+@@ -37,8 +52,8 @@ vi.mock('@/api/admin', () => ({
+ 
+ vi.mock('@/stores', () => ({
+   useAppStore: () => ({
+-    showError: vi.fn(),
+-    showSuccess: vi.fn(),
++    showError,
++    showSuccess,
+     showInfo: vi.fn(),
+   }),
+ }))
+@@ -111,10 +126,11 @@ const plugin = {
+ 
+ function mountView() {
+   return mount(PluginsView, {
++    attachTo: document.body,
+     global: {
+       stubs: {
+         AppLayout: { template: '<div><slot /></div>' },
+-        BaseDialog: { template: '<div><slot /></div>' },
++        BaseDialog: { name: 'BaseDialog', template: '<div><slot /></div>' },
+         Icon: true,
+         TotpStepUpDialog: true,
+       },
+@@ -122,6 +138,60 @@ function mountView() {
+   })
+ }
+ 
++enableAutoUnmount(afterEach)
++
++afterEach(() => {
++  vi.useRealTimers()
++  vi.restoreAllMocks()
++  document.body.innerHTML = ''
++})
++
++function deferred<T>() {
++  let resolve!: (value: T) => void
++  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
++  return { promise, resolve }
++}
++
++function sessionFor(id = 7): PluginUISession {
++  return {
++    url: '/api/v1/plugin-ui/token-' + id + '/index.html',
++    bridge_token: 'bridge-' + id,
++    ui_bridge_version: 1,
++    expires_at: '2026-08-22T01:00:00Z',
++    capabilities: ['config.testScoped'],
++  }
++}
++
++async function openConfiguration(wrapper: ReturnType<typeof mountView>, index = 0) {
++  const buttons = wrapper.findAll('button').filter((item) => item.text().includes('admin.plugins.configure'))
++  await buttons[index]!.trigger('click')
++  await flushPromises()
++  const frame = wrapper.get('iframe')
++  await frame.trigger('load')
++  const targetWindow = (frame.element as HTMLIFrameElement).contentWindow!
++  return { frame, targetWindow, postMessage: vi.spyOn(targetWindow, 'postMessage') }
++}
++
++function sendBridge(
++  targetWindow: Window,
++  type: string,
++  config?: unknown,
++  overrides: Record<string, unknown> = {},
++) {
++  window.dispatchEvent(new MessageEvent('message', {
++    origin: 'null',
++    source: targetWindow,
++    data: {
++      source: 'sub2api-plugin-ui',
++      bridge_token: 'bridge-7',
++      request_id: 'request-1',
++      type,
++      config,
++      ...overrides,
++    },
++  }))
++}
++
+ describe('管理员插件页二次验证', () => {
+   beforeEach(() => {
+     vi.clearAllMocks()
+@@ -130,12 +200,11 @@ describe('管理员插件页二次验证', () => {
+     uploadPlugin.mockResolvedValue(plugin)
+     enablePlugin.mockResolvedValue(plugin)
+     savePluginConfig.mockResolvedValue({ enabled: true })
+-    createUISession.mockResolvedValue({
+-      url: '/api/v1/plugin-ui/token/index.html#bridge_token=bridge',
+-      bridge_token: 'bridge',
+-      ui_bridge_version: 1,
+-      expires_at: '2026-08-22T01:00:00Z',
+-    })
++    getPluginConfig.mockResolvedValue({ enabled: true })
++    testPlugin.mockResolvedValue({ success: true, message: 'ok', latency_ms: 1 })
++    testPluginScoped.mockResolvedValue({ success: true, message: 'scoped ok', latency_ms: 1 })
++    pluginStatus.mockResolvedValue({ healthy: true, message: 'ok' })
++    createUISession.mockImplementation((id: number) => Promise.resolve(sessionFor(id)))
+   })
+ 
+   it('启用插件通过 step-up 控制器执行', async () => {
+@@ -166,4 +235,239 @@ describe('管理员插件页二次验证', () => {
+     expect(stepUpRun).toHaveBeenCalledTimes(1)
+     expect(uploadPlugin).toHaveBeenCalledTimes(1)
+   })
++
++  it('config.load returns capabilities from the UI session', async () => {
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++
++    sendBridge(bridge.targetWindow, 'config.load')
++    await flushPromises()
++
++    expect(bridge.postMessage).toHaveBeenCalledWith(expect.objectContaining({
++      type: 'config.load.result',
++      bridge_token: 'bridge-7',
++      ok: true,
++      config: { enabled: true },
++      capabilities: ['config.testScoped'],
++    }), '*')
++  })
++
++  it.each([undefined, []])('does not enable scoped tests without session capability %j', async (capabilities) => {
++    createUISession.mockResolvedValueOnce({ ...sessionFor(), capabilities })
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++
++    sendBridge(bridge.targetWindow, 'config.load')
++    await flushPromises()
++    expect(bridge.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ capabilities: [] }), '*')
++
++    sendBridge(bridge.targetWindow, 'config.testScoped', {})
++    await flushPromises()
++    expect(testPluginScoped).not.toHaveBeenCalled()
++    expect(stepUpRun).not.toHaveBeenCalled()
++    expect(bridge.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({
++      type: 'config.testScoped.result', ok: false, error: 'admin.plugins.bridgeRejected',
++    }), '*')
++  })
++
++  it.each([undefined, null, [], 'invalid', 1])('rejects invalid scoped configuration %j', async (config) => {
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    sendBridge(bridge.targetWindow, 'config.testScoped', config)
++    await flushPromises()
++
++    expect(testPluginScoped).not.toHaveBeenCalled()
++    expect(stepUpRun).not.toHaveBeenCalled()
++    expect(bridge.postMessage).toHaveBeenCalledWith(expect.objectContaining({ ok: false }), '*')
++  })
++
++  it('passes the submitted scoped configuration through step-up without saving it', async () => {
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    const config = { model: 'selected-model', upstream_ids: ['row-2', 'row-9'], enabled: false }
++    sendBridge(bridge.targetWindow, 'config.testScoped', config, { request_id: 'snapshot-request' })
++    await flushPromises()
++
++    expect(stepUpRun).toHaveBeenCalledTimes(1)
++    expect(testPluginScoped).toHaveBeenCalledWith(7, 'snapshot-request', config)
++    expect(testPluginScoped.mock.calls[0]![2]).toBe(config)
++    expect(savePluginConfig).not.toHaveBeenCalled()
++    expect(getPluginConfig).not.toHaveBeenCalled()
++    expect(bridge.postMessage).toHaveBeenCalledWith(expect.objectContaining({
++      type: 'config.testScoped.result', request_id: 'snapshot-request', ok: true,
++    }), '*')
++    expect(showSuccess).not.toHaveBeenCalled()
++  })
++
++  it('delivers unsuccessful scoped results as transport success without host toasts', async () => {
++    const result = { success: false, message: 'one target failed', latency_ms: 12, status_json: '{"partial":true}' }
++    testPluginScoped.mockResolvedValueOnce(result)
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    sendBridge(bridge.targetWindow, 'config.testScoped', {})
++    await flushPromises()
++
++    expect(bridge.postMessage).toHaveBeenCalledWith(expect.objectContaining({ ok: true, result }), '*')
++    expect(showError).not.toHaveBeenCalled()
++    expect(showSuccess).not.toHaveBeenCalled()
++  })
++
++  it('returns scoped network errors to the plugin', async () => {
++    testPluginScoped.mockRejectedValueOnce(new Error('connection failed'))
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    sendBridge(bridge.targetWindow, 'config.testScoped', {})
++    await flushPromises()
++
++    expect(bridge.postMessage).toHaveBeenCalledWith(expect.objectContaining({
++      ok: false, error: 'connection failed',
++    }), '*')
++  })
++
++  it('preserves the legacy config.test outcome and step-up behavior', async () => {
++    const result = { success: false, message: 'legacy failure', latency_ms: 1 }
++    testPlugin.mockResolvedValueOnce(result)
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    sendBridge(bridge.targetWindow, 'config.test')
++    await flushPromises()
++
++    expect(stepUpRun).toHaveBeenCalledTimes(1)
++    expect(testPlugin).toHaveBeenCalledWith(7)
++    expect(testPluginScoped).not.toHaveBeenCalled()
++    expect(bridge.postMessage).toHaveBeenCalledWith(expect.objectContaining({ ok: false, result }), '*')
++    expect(showError).toHaveBeenCalledWith('legacy failure')
++  })
++
++  it('keeps a scoped response pending through ninety seconds of step-up and the HTTP budget', async () => {
++    const verified = deferred<void>()
++    const tested = deferred<PluginTestResult>()
++    stepUpRun.mockImplementationOnce(async (action) => { await verified.promise; return action() })
++    testPluginScoped.mockReturnValueOnce(tested.promise)
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
++    sendBridge(bridge.targetWindow, 'config.testScoped', {})
++
++    await vi.advanceTimersByTimeAsync(90_000)
++    verified.resolve()
++    await flushPromises()
++    expect(testPluginScoped).toHaveBeenCalledWith(7, 'request-1', {})
++    await vi.advanceTimersByTimeAsync(39_000)
++    tested.resolve({ success: true, message: 'completed', latency_ms: 39000 })
++    await flushPromises()
++
++    expect(bridge.postMessage).toHaveBeenCalledWith(expect.objectContaining({ ok: true }), '*')
++  })
++
++  it.each(['first attempt', 'retry'])('does not dispatch the scoped %s after the bridge request expires', async (attempt) => {
++    const verified = deferred<void>()
++    const retried = attempt === 'retry'
++    if (retried) {
++      testPluginScoped.mockRejectedValueOnce({ code: 'STEP_UP_REQUIRED' })
++      stepUpRun.mockImplementationOnce(async (action) => {
++        try { return await action() } catch {
++          await verified.promise
++          return action()
++        }
++      })
++    } else {
++      stepUpRun.mockImplementationOnce(async (action) => { await verified.promise; return action() })
++    }
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
++    sendBridge(bridge.targetWindow, 'config.testScoped', {})
++    await flushPromises()
++    expect(testPluginScoped).toHaveBeenCalledTimes(retried ? 1 : 0)
++
++    await vi.advanceTimersByTimeAsync(150_001)
++    verified.resolve()
++    await flushPromises()
++
++    expect(testPluginScoped).toHaveBeenCalledTimes(retried ? 1 : 0)
++    expect(bridge.postMessage).not.toHaveBeenCalled()
++  })
++
++  it('does not dispatch a pending scoped test after switching plugins during step-up', async () => {
++    const verified = deferred<void>()
++    stepUpRun.mockImplementationOnce(async (action) => { await verified.promise; return action() })
++    listPlugins.mockResolvedValueOnce([plugin, { ...plugin, id: 8, name: 'Second Plugin' }])
++    const wrapper = mountView()
++    await flushPromises()
++    const first = await openConfiguration(wrapper)
++    const config = { upstream_ids: ['original-target'] }
++    sendBridge(first.targetWindow, 'config.testScoped', config)
++    const second = await openConfiguration(wrapper, 1)
++    verified.resolve()
++    await flushPromises()
++
++    expect(testPluginScoped).not.toHaveBeenCalled()
++    expect(first.postMessage).not.toHaveBeenCalled()
++    expect(second.postMessage).not.toHaveBeenCalled()
++  })
++
++  it('suppresses pending scoped results after closing the configuration', async () => {
++    const tested = deferred<PluginTestResult>()
++    testPluginScoped.mockReturnValueOnce(tested.promise)
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    sendBridge(bridge.targetWindow, 'config.testScoped', {})
++    wrapper.findComponent({ name: 'BaseDialog' }).vm.$emit('close')
++    await flushPromises()
++    tested.resolve({ success: true, message: 'late response', latency_ms: 1 })
++    await flushPromises()
++
++    expect(wrapper.find('iframe').exists()).toBe(false)
++    expect(bridge.postMessage).not.toHaveBeenCalled()
++  })
++
++  it('does not let an old response consume a reused request ID after iframe navigation', async () => {
++    const oldTest = deferred<PluginTestResult>()
++    const newTest = deferred<PluginTestResult>()
++    testPluginScoped.mockReturnValueOnce(oldTest.promise).mockReturnValueOnce(newTest.promise)
++    const wrapper = mountView()
++    await flushPromises()
++    const bridge = await openConfiguration(wrapper)
++    sendBridge(bridge.targetWindow, 'config.testScoped', { selection: 'old' })
++    await bridge.frame.trigger('load')
++    sendBridge(bridge.targetWindow, 'config.testScoped', { selection: 'new' })
++
++    oldTest.resolve({ success: true, message: 'old result', latency_ms: 1 })
++    await flushPromises()
++    expect(bridge.postMessage).not.toHaveBeenCalled()
++    const result = { success: true, message: 'new result', latency_ms: 1 }
++    newTest.resolve(result)
++    await flushPromises()
++    expect(bridge.postMessage).toHaveBeenCalledTimes(1)
++    expect(bridge.postMessage).toHaveBeenCalledWith(expect.objectContaining({ ok: true, result }), '*')
++  })
++
++  it('does not install a late UI session after another plugin has been opened', async () => {
++    const firstSession = deferred<PluginUISession>()
++    createUISession.mockReturnValueOnce(firstSession.promise)
++    listPlugins.mockResolvedValueOnce([plugin, { ...plugin, id: 8, name: 'Second Plugin' }])
++    const wrapper = mountView()
++    await flushPromises()
++    const buttons = wrapper.findAll('button').filter((item) => item.text().includes('admin.plugins.configure'))
++    await buttons[0]!.trigger('click')
++    const second = await openConfiguration(wrapper, 1)
++    firstSession.resolve(sessionFor(7))
++    await flushPromises()
++
++    expect(wrapper.get('iframe').attributes('src')).toBe(sessionFor(8).url)
++    sendBridge(second.targetWindow, 'config.testScoped', {}, { bridge_token: 'bridge-8' })
++    await flushPromises()
++    expect(testPluginScoped).toHaveBeenCalledWith(8, 'request-1', {})
++  })
+ })

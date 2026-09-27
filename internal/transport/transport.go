@@ -515,7 +515,10 @@ func (t *Transport) TestConfig(ctx context.Context, r *pluginv1.TestConfigReques
 	if err != nil {
 		return &pluginv1.TestConfigResponse{Success: false, Message: safeError(err)}, nil
 	}
-	if c.DegradationCheck || c.DegradationCheckAccountID != 0 {
+	if c.DegradationCheck || c.DegradationCheckAccountID != 0 || c.DegradationCheckAccountIDs != nil {
+		if requestID, ok := scopedDegradationRequestID(ctx); ok {
+			return t.testScopedDegradation(ctx, c, requestID), nil
+		}
 		// Bridge v1 reloads shared saved config for each Test and cannot bind
 		// the RPC to the caller's target. Reject old pages and stale persisted
 		// triggers before resolving credentials or sending a charged request.

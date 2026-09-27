@@ -18,7 +18,7 @@ import (
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.6.0"
+	Version = "0.6.1"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -39,6 +39,8 @@ const (
 	DefaultMaxResponseBytes = 64 << 20
 	// DefaultAuthMode 是 Basis Points 的鉴权模式。
 	DefaultAuthMode = "chatgpt"
+	// MaxDegradationCheckAccountIDs bounds one explicit diagnostic snapshot.
+	MaxDegradationCheckAccountIDs = 10000
 )
 
 // defaultModels 是未指定 enabled_models 时启用的模型。
@@ -76,18 +78,20 @@ type Config struct {
 	BPSDeviceConvergence bool `json:"bps_device_convergence"`
 	// Acknowledging one block never clears a newer persisted BPS 403.
 	BPSReenabledAccounts map[string]string `json:"bps_reenabled_accounts,omitempty"`
-	// Legacy diagnostic fields remain parseable so old saved configurations
-	// can be loaded and cleared by ordinary saving. Public TestConfig rejects
-	// them: UI Bridge v1 cannot bind a request to the caller's intended target.
+	// Diagnostic commands are temporary fields. Legacy saved configurations
+	// remain parseable, but only the request-scoped TestConfig bridge executes
+	// commands bound to an explicit account or caller-supplied bulk snapshot.
 	DegradationCheck bool `json:"degradation_check,omitempty"`
-	// DegradationCheckAccountID selects a target only for the private probe
-	// runner. It cannot authorize an account request through legacy TestConfig.
-	DegradationCheckAccountID int64  `json:"degradation_check_account_id,omitempty"`
-	MaxResponseBytes          int    `json:"max_response_bytes"`
-	AuthMode                  string `json:"auth_mode"`
-	ToolsVersionID            string `json:"tools_version_id,omitempty"`
-	RewriteTools              bool   `json:"rewrite_tools"`
-	TransformResponses        bool   `json:"transform_responses"`
+	// DegradationCheckAccountID selects one account for a request-scoped probe.
+	// It cannot authorize an account request through legacy TestConfig.
+	DegradationCheckAccountID int64 `json:"degradation_check_account_id,omitempty"`
+	// DegradationCheckAccountIDs freezes the bulk directory visible to the caller.
+	DegradationCheckAccountIDs []int64 `json:"degradation_check_account_ids,omitempty"`
+	MaxResponseBytes           int     `json:"max_response_bytes"`
+	AuthMode                   string  `json:"auth_mode"`
+	ToolsVersionID             string  `json:"tools_version_id,omitempty"`
+	RewriteTools               bool    `json:"rewrite_tools"`
+	TransformResponses         bool    `json:"transform_responses"`
 }
 
 // Default 返回一份完整可用的默认配置。宿主极少提交空对象，但空对象必须
@@ -232,6 +236,23 @@ func (c *Config) Normalize() error {
 	if c.DegradationCheckAccountID != 0 && !c.DegradationCheck {
 		return fmt.Errorf("degradation_check_account_id requires degradation_check")
 	}
+	if c.DegradationCheckAccountIDs != nil {
+		if !c.DegradationCheck {
+			return fmt.Errorf("degradation_check_account_ids requires degradation_check")
+		}
+		if c.DegradationCheckAccountID != 0 {
+			return fmt.Errorf("degradation check must select either one account or a bulk snapshot")
+		}
+		if len(c.DegradationCheckAccountIDs) > MaxDegradationCheckAccountIDs {
+			return fmt.Errorf("degradation_check_account_ids exceeds the maximum snapshot size")
+		}
+		for _, id := range c.DegradationCheckAccountIDs {
+			if id <= 0 {
+				return fmt.Errorf("degradation_check_account_ids must contain positive account IDs")
+			}
+		}
+		c.DegradationCheckAccountIDs = normalizeAccountIDs(c.DegradationCheckAccountIDs)
+	}
 	c.AccountIDs = normalizeAccountIDs(c.AccountIDs)
 	c.ExcludedAccountIDs = normalizeAccountIDs(c.ExcludedAccountIDs)
 	for key, blockID := range c.BPSReenabledAccounts {
@@ -258,6 +279,7 @@ func (c Config) Clone() Config {
 	c.EnabledModels = cloneStrings(c.EnabledModels)
 	c.AccountIDs = append([]int64(nil), c.AccountIDs...)
 	c.ExcludedAccountIDs = append([]int64(nil), c.ExcludedAccountIDs...)
+	c.DegradationCheckAccountIDs = append([]int64(nil), c.DegradationCheckAccountIDs...)
 	c.BPSReenabledAccounts = maps.Clone(c.BPSReenabledAccounts)
 	return c
 }
