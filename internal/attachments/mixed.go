@@ -48,7 +48,7 @@ func ValidateMixedInputs(ctx context.Context, source map[string]any) error {
 				code = "invalid_image"
 				imageCount++
 				if imageCount > maxRequestImages {
-					return invalid(code, "At most 20 inline images are allowed per request; conversation history, tool screenshots, and repeated images count toward this limit")
+					return invalid(code, fmt.Sprintf("The plugin allows at most %d inline images per request; received at least %d. Conversation history, tool screenshots, and repeated images count toward this limit", maxRequestImages, imageCount))
 				}
 				if value, exists := part["file_id"]; exists && value != nil && value != "" {
 					return invalid(code, "input_image cannot contain both image_url and file_id")

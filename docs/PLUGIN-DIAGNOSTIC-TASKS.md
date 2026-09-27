@@ -15,7 +15,7 @@ UI Bridge v1、HostService 账号目录、出站身份和插件 KV，不要求�
 - 当前源码中，单号、批量与自动探针均固定请求原生 Codex，即使账号业务
   已经走 BPS 也不例外；使用同一账号的宿主 OAuth 身份与关联代理，拒绝
   重定向，不使用 BPS responses_url、已选模型列表或请求体转换。
-- degradation_check_model 独立控制原生模型，默认 gpt-5.4。
+- 原生模型固定为 gpt-6-astra，无需配置；旧配置字段和持久化任务中的模型不能覆盖固定值。
 - 每个任务使用独立任务编号，账号和检测参数在准备后不可替换。
 - 页面通过两次已有的 config.save 消息准备和确认任务，通过 plugin.status
   查询结果；不通过普通 config.test 启动任务。
@@ -84,8 +84,10 @@ backend，仅通过 Go overlay 增加测试文件；不修改宿主工作副本�
 不变、双页面任务隔离、重复确认、保存失败回滚、普通测试、重启和 KV 故障。
 
 源码集成命令：python tools/host-diagnostic-integration/run.py --host-source <基准仓库路径>。
-当前固定原生端点的跨进程模拟使用仅测试的 Go overlay 与环境变量，严格只
-允许 http://127.0.0.1:<port>。工具明确拒绝 --plugin-binary 模式：实际安装包
+当前固定原生端点的跨进程模拟使用仅测试的 Go overlay；每个测试实例将测试
+二进制复制到独立临时目录，并以排他创建的旁路文件传递本地地址，结束后清理。
+原版宿主会移除子进程环境变量，因此不依赖其传递测试地址；仅测试构建读取
+该文件并严格只允许 http://127.0.0.1:<port>。工具明确拒绝 --plugin-binary 模式：实际安装包
 的固定原生端点不能用该模拟替换，不能据此声称完成包验收。此工具也不替代
 安装包签名验证或真实数据库部署验收。UI 模拟回归使用 node --test tools/ui.test.cjs，
 真实浏览器沙箱回归使用 node tools/test-ui-browser.mjs。

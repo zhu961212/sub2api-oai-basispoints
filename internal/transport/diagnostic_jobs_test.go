@@ -311,8 +311,8 @@ func TestDiagnosticJobKeepsPreparedRequestParametersAfterProductionSave(t *testi
 				if actual.remaining < tc.wantDeadline-2*time.Second || actual.remaining > tc.wantDeadline {
 					t.Fatalf("request deadline changed with production config: got %v, want near %v", actual.remaining, tc.wantDeadline)
 				}
-				if actual.model != "gpt-5.4-mini" || actual.url != nativeDegradationResponsesURL {
-					t.Fatalf("request did not preserve native model/endpoint: %+v", actual)
+				if actual.model != "gpt-6-astra" || actual.url != nativeDegradationResponsesURL {
+					t.Fatalf("request did not use fixed native model/endpoint: %+v", actual)
 				}
 			default:
 				t.Fatal("diagnostic did not reach the injected transport")

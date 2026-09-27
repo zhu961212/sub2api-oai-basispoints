@@ -130,6 +130,16 @@ type bpsDiagnosticHarness struct {
 	production  json.RawMessage
 }
 
+func writeBPSDiagnosticFixtureFile(t *testing.T, path string, data []byte, mode os.FileMode) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	require.NoError(t, err)
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	require.NoError(t, writeErr)
+	require.NoError(t, closeErr)
+}
+
 func newBPSDiagnosticHarness(t *testing.T) *bpsDiagnosticHarness {
 	t.Helper()
 	require.Equal(t, "loopback-v1", os.Getenv("BPS_DIAGNOSTIC_SOURCE_OVERLAY"),
@@ -139,6 +149,10 @@ func newBPSDiagnosticHarness(t *testing.T) *bpsDiagnosticHarness {
 	data, err := os.ReadFile(binary)
 	require.NoError(t, err)
 	checksum := sha256.Sum256(data)
+	// A private executable per harness prevents shared-origin races. TempDir
+	// cleans both files after the child processes registered below are killed.
+	binary = filepath.Join(t.TempDir(), filepath.Base(binary))
+	writeBPSDiagnosticFixtureFile(t, binary, data, 0700)
 	h := &bpsDiagnosticHarness{t: t, store: &bpsDiagnosticStore{fakePluginKVStore: newFakePluginKVStore()}}
 	h.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -155,6 +169,11 @@ func newBPSDiagnosticHarness(t *testing.T) *bpsDiagnosticHarness {
 		}
 		if json.NewDecoder(r.Body).Decode(&payload) != nil {
 			t.Error("invalid fixture request JSON")
+		}
+		if payload.Model != "gpt-6-astra" {
+			t.Errorf("native diagnostic model must be gpt-6-astra, got %q", payload.Model)
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 		account := r.Header.Get("Chatgpt-Account-Id")
 		expectedToken := map[string]string{"synthetic-account-7": "Bearer synthetic-token-7", "synthetic-account-9": "Bearer synthetic-token-9"}[account]
@@ -176,9 +195,10 @@ func newBPSDiagnosticHarness(t *testing.T) *bpsDiagnosticHarness {
 		_, _ = w.Write([]byte(`{"output_text":"iPhone 17"}`))
 	}))
 	t.Cleanup(h.upstream.Close)
-	// The overlaid plugin inherits this origin when h.start spawns it. A missing
-	// or non-loopback value aborts that test binary before any request can run.
-	t.Setenv("BPS_DIAGNOSTIC_NATIVE_FIXTURE_URL", h.upstream.URL)
+	// The original host strips child environment variables. Only the overlaid
+	// test binary reads this exclusive private sidecar; a missing or non-loopback
+	// origin aborts it before any request. The release binary has no such reader.
+	writeBPSDiagnosticFixtureFile(t, binary+".native-fixture-origin", []byte(h.upstream.URL), 0600)
 	installation := &PluginInstallation{ID: 73, PluginKey: os.Getenv("BPS_DIAGNOSTIC_PLUGIN_ID"),
 		Version: os.Getenv("BPS_DIAGNOSTIC_PLUGIN_VERSION"), BinaryPath: binary, BinarySHA256: hex.EncodeToString(checksum[:])}
 	h.repo = &bpsDiagnosticRepo{installation: installation}
@@ -335,7 +355,7 @@ func TestBasispointsUnpatchedHostDiagnostics(t *testing.T) {
 		h.requestMu.Lock()
 		requests := append([]bpsDiagnosticRequest(nil), h.requests...)
 		h.requestMu.Unlock()
-		require.Equal(t, []bpsDiagnosticRequest{{"synthetic-account-7", "gpt-5.4"}}, requests)
+		require.Equal(t, []bpsDiagnosticRequest{{"synthetic-account-7", "gpt-6-astra"}}, requests)
 		oldOwner := h.status().Tasks.Owner
 		h.manager.runtimes[73].kill()
 		h.start()

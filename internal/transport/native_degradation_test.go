@@ -53,7 +53,7 @@ func TestNativeDegradationRequestIgnoresBPSRoutingAndPayloadSettings(t *testing.
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body["model"] != "gpt-5.4-mini" || body["store"] != false || body["stream"] != true || body["instructions"] == "" {
+		if body["model"] != "gpt-6-astra" || body["store"] != false || body["stream"] != true || body["instructions"] == "" {
 			t.Fatalf("wrong native payload: %#v", body)
 		}
 		if body["model_selection"] != nil || body["reasoning_effort"] != nil || body["metadata"] != nil {
@@ -65,7 +65,8 @@ func TestNativeDegradationRequestIgnoresBPSRoutingAndPayloadSettings(t *testing.
 		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(protocol.JSONBytes(map[string]any{"output_text": "iPhone 17"}))))}, nil
 	})}
-	status, answer, err := tr.checkDegradationAccount(context.Background(), cfg, host, client, 7, degradationModel(cfg))
+	// A legacy job argument must not override the model even before config normalization.
+	status, answer, err := tr.checkDegradationAccount(context.Background(), cfg, host, client, 7, "stale-job-model")
 	if err != nil || status != "ok" || answer != "iPhone 17" || calls != 1 {
 		t.Fatalf("native check result = %s %q %v; calls=%d", status, answer, err, calls)
 	}

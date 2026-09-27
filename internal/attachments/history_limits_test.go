@@ -35,7 +35,7 @@ func TestGrowingImageHistoryReportsCumulativeLimits(t *testing.T) {
 			t.Run(kind+"/"+limit, func(t *testing.T) {
 				data := testPNG(t)
 				lastAccepted := maxRequestImages
-				want := "received at least 21"
+				want := fmt.Sprintf("received at least %d", maxRequestImages+1)
 				if limit == "bytes" {
 					padded := make([]byte, 11<<20)
 					copy(padded, data)

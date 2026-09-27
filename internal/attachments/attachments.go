@@ -16,7 +16,7 @@ import (
 const (
 	maxImageBytes    = 20 << 20
 	maxRequestBytes  = 32 << 20
-	maxRequestImages = 20
+	maxRequestImages = 128
 	maxPixels        = 64 * 1024 * 1024
 	maxCacheEntries  = 512
 	maxUploads       = 32
@@ -149,7 +149,7 @@ func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesUR
 			path := fmt.Sprintf("input[%d].%s[%d]", i, field, j)
 			invalid := func(message string) error { return fail(400, "invalid_image", message+" (path="+path+")") }
 			if len(edits) >= maxRequestImages {
-				return false, invalid(fmt.Sprintf("At most 20 inline images are allowed per request; received at least %d. Conversation history, tool screenshots, and repeated images all count toward this limit; start a new conversation or use fewer images", len(edits)+1))
+				return false, invalid(fmt.Sprintf("The plugin allows at most %d inline images per request; received at least %d. Conversation history, tool screenshots, and repeated images all count toward this limit; start a new conversation or use fewer images", maxRequestImages, len(edits)+1))
 			}
 			if value, exists := part["file_id"]; exists && value != nil && value != "" {
 				return false, invalid("input_image cannot contain both image_url and file_id")

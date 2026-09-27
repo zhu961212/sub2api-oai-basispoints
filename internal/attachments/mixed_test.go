@@ -71,7 +71,7 @@ func TestMixedPreflightKeepsIndependentOccurrenceLimits(t *testing.T) {
 	for _, tc := range []struct {
 		part map[string]any
 		want string
-	}{{imagePart(imageRaw), "20 inline images"}, {filePart(fileRaw, "report.pdf"), "20 inline files"}} {
+	}{{imagePart(imageRaw), "128 inline images"}, {filePart(fileRaw, "report.pdf"), "20 inline files"}} {
 		err := ValidateMixedInputs(context.Background(), message(append(parts, tc.part)...))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("occurrence limit missing: %v", err)

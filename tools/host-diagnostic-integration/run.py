@@ -22,6 +22,7 @@ NATIVE_ENDPOINT_DECLARATION = (
     '"https://chatgpt.com/backend-api/codex/responses"'
 )
 NATIVE_FIXTURE_ENV = "BPS_DIAGNOSTIC_NATIVE_FIXTURE_URL"
+NATIVE_FIXTURE_SIDECAR = ".native-fixture-origin"
 SOURCE_OVERLAY_MODE = "loopback-v1"
 NATIVE_FIXTURE_HELPER = r'''// Only compiled by the source integration test's explicit Go overlay.
 package transport
@@ -33,7 +34,15 @@ import (
 )
 
 func nativeDegradationFixtureURL() string {
-    raw := os.Getenv("BPS_DIAGNOSTIC_NATIVE_FIXTURE_URL")
+    executable, err := os.Executable()
+    if err != nil {
+        panic("source integration cannot locate its private fixture executable")
+    }
+    data, err := os.ReadFile(executable + ".native-fixture-origin")
+    if err != nil {
+        panic("source integration requires its private native fixture origin file")
+    }
+    raw := string(data)
     endpoint, err := url.Parse(raw)
     if err != nil || endpoint == nil || endpoint.Scheme != "http" ||
         endpoint.Hostname() != "127.0.0.1" || endpoint.User != nil ||
@@ -127,7 +136,10 @@ def main():
                    BPS_DIAGNOSTIC_PLUGIN_ID=manifest["id"],
                    BPS_DIAGNOSTIC_PLUGIN_VERSION=manifest["version"],
                    BPS_DIAGNOSTIC_SOURCE_OVERLAY=SOURCE_OVERLAY_MODE)
-        env.pop(NATIVE_FIXTURE_ENV, None)  # Each harness supplies its own server origin.
+        # The host intentionally strips child environment variables. Each
+        # harness copies the test binary into its own temporary directory and
+        # creates an exclusive origin sidecar next to that private executable.
+        env.pop(NATIVE_FIXTURE_ENV, None)
         command = [args.go, "test", "-overlay", str(overlay), "-count=1", "-timeout=120s",
                    "-run", "^TestBasispointsUnpatchedHostDiagnostics$", "-v"]
         if args.race:

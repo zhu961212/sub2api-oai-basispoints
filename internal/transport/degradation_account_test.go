@@ -30,7 +30,7 @@ func TestDegradationCheckTargetsOneAccountUsingItsCredentialAndProxy(t *testing.
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("invalid request body: %v", err)
-		} else if body["model"] != "gpt-5.4-mini" {
+		} else if body["model"] != "gpt-6-astra" {
 			t.Errorf("check model = %v, want configured model", body["model"])
 		}
 		w.Header().Set("Content-Type", "application/json")

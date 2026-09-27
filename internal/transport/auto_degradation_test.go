@@ -83,7 +83,7 @@ func TestAutoDegradationConfirmsBothDirectionsAndPreservesErrors(t *testing.T) {
 	}
 }
 
-func TestAutoDegradationModelAndStaleConfirmationsDoNotCombine(t *testing.T) {
+func TestAutoDegradationLegacyModelAndStaleConfirmationsDoNotCombine(t *testing.T) {
 	cfg := protocol.DefaultConfig()
 	cfg.AccountIDs = []int64{9}
 	now := time.Now()
@@ -92,7 +92,7 @@ func TestAutoDegradationModelAndStaleConfirmationsDoNotCombine(t *testing.T) {
 	if stale.Decided || stale.Consecutive != 1 {
 		t.Fatal("stale answer confirmed switching")
 	}
-	cfg.DegradationCheckModel = "another-native-model"
+	first.Model = "legacy-native-model"
 	changed := nextAutoDegradationRecord(cfg, first, degradationAccountResult{AccountID: 7, Status: "degraded"}, now.Add(autoDegradationRetry))
 	if changed.Decided || changed.Consecutive != 1 {
 		t.Fatal("answers from different models were combined")
@@ -335,11 +335,12 @@ func TestAutoDegradationScopedManualAdmission(t *testing.T) {
 	tr.releaseAutomaticDiagnostic()
 }
 
-func TestAutoDegradationInterruptedNewModelDropsOldConfirmation(t *testing.T) {
+func TestAutoDegradationInterruptedLegacyModelDropsOldConfirmation(t *testing.T) {
 	tr, host, _ := newAutoDetectionTestTransport(t)
 	first := nextAutoDegradationRecord(tr.cfg, autoDegradationRecord{AccountID: 7}, degradationAccountResult{AccountID: 7, Status: "degraded"}, time.Now())
+	first.Model = "legacy-native-model"
 	tr.autoDegradation.records[7] = first
-	tr.cfg.DegradationCheckModel = "different-native-model"
+	tr.cfg.DegradationCheckModel = "ignored-legacy-config-model"
 	ctx, cancel := context.WithCancel(context.Background())
 	tr.client = &http.Client{Transport: degradationRoundTripper(func(r *http.Request) (*http.Response, error) { cancel(); return nil, context.Canceled })}
 	tr.runAutomaticBatch(ctx, host, 1, 1, tr.cfg, []int64{7})

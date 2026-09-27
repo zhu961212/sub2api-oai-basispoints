@@ -38,7 +38,6 @@
     "auto_degradation_interval_minutes",
     "auto_degradation_manual_revision",
     "native_timezone_by_ip",
-    "degradation_check_model",
     "max_response_bytes",
     "auth_mode",
     "tools_version_id",
@@ -403,35 +402,24 @@
   function autoDegradationSettings(config) {
     return { enabled: config.auto_degradation_enabled === true,
       interval: config.auto_degradation_interval_minutes == null ? 30 : config.auto_degradation_interval_minutes,
-      revision: config.auto_degradation_manual_revision == null ? 0 : config.auto_degradation_manual_revision,
-      model: config.degradation_check_model == null ? "gpt-5.4" : config.degradation_check_model };
+      revision: config.auto_degradation_manual_revision == null ? 0 : config.auto_degradation_manual_revision };
   }
 
   function verifyAutoDegradation(config, expected) {
     if (JSON.stringify(autoDegradationSettings(config)) !== JSON.stringify(autoDegradationSettings(expected))) {
-      throw new Error("宿主返回的自动检测开关、周期、原生模型或手动选择版本与提交内容不一致，请重新保存");
+      throw new Error("宿主返回的自动检测开关、周期或手动选择版本与提交内容不一致，请重新保存");
     }
   }
 
   function readAutoDegradationSettings(config) {
     var interval = Number(id("auto-degradation-interval").value);
-    var model = id("degradation-check-model").value;
     if (!Number.isInteger(interval) || interval < 5 || interval > 1440) {
       throw new Error("常规检测间隔必须是 5–1440 分钟的整数");
     }
-    var modelBytes = typeof model === "string" ? Array.from(model).reduce(function (total, character) {
-      var point = character.codePointAt(0);
-      return total + (point < 128 ? 1 : point < 2048 ? 2 : point < 65536 ? 3 : 4);
-    }, 0) : 0;
-    if (!modelBytes || modelBytes > 128 || Array.from(model).some(function (character) {
-      var code = character.codePointAt(0);
-      return !character.trim() || code < 32 || (code >= 127 && code <= 159);
-    })) {
-      throw new Error("原生检测模型不能为空，不得包含空格或控制字符，且最多 128 字节");
-    }
     config.auto_degradation_enabled = autoDegradationEnabled;
     config.auto_degradation_interval_minutes = interval;
-    config.degradation_check_model = model;
+    // Native probes use a fixed backend model; retire any saved override.
+    delete config.degradation_check_model;
   }
 
   function applyAutoDegradationSelections() {
@@ -928,7 +916,6 @@
     pendingManualAccountSelection = null;
     var autoSettings = autoDegradationSettings(loaded);
     id("auto-degradation-interval").value = String(autoSettings.interval);
-    id("degradation-check-model").value = autoSettings.model;
     renderAutoDegradation();
     renderBps403Toggle();
     // A diagnostic save preserves confirmed acknowledgements only. Keep a

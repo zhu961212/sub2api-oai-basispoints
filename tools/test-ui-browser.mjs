@@ -113,7 +113,7 @@ const driver = String.raw`
       if (assert403Policy(initial403Policy).disabled) throw new Error('403 policy control did not become ready');
       const autoToggle = document.getElementById('auto-degradation-toggle');
       const autoInterval = document.getElementById('auto-degradation-interval');
-      const nativeModel = document.getElementById('degradation-check-model');
+      const fixedNativeModel = document.getElementById('degradation-fixed-model');
       const timezoneToggle = document.getElementById('native-timezone-toggle');
       if (!timezoneToggle || timezoneToggle.disabled || timezoneToggle.type !== 'button' || timezoneToggle.getAttribute('aria-pressed') !== 'false')
         throw new Error('Request timezone toggle is missing, locked, or not default-off');
@@ -126,7 +126,8 @@ const driver = String.raw`
         throw new Error('Request timezone copy does not describe both native and BPS scope');
       if (!autoToggle || autoToggle.disabled || autoToggle.type !== 'button' || autoToggle.getAttribute('aria-pressed') !== 'false' ||
           !autoInterval || autoInterval.value !== '30' || autoInterval.min !== '5' || autoInterval.max !== '1440' ||
-          !nativeModel || nativeModel.value !== 'gpt-5.4')
+          document.getElementById('degradation-check-model') || !fixedNativeModel ||
+          !fixedNativeModel.textContent.includes('原生检测固定使用 gpt-6-astra'))
         throw new Error('Native automatic diagnostic defaults or controls are incorrect');
       if (stage === 'select') {
         timezoneToggle.click();
@@ -359,7 +360,7 @@ const host = `
   const defaultModels = ['gpt-6-astra', 'gpt-5.6-sol'];
   const subset = ['gpt-6-sol', 'gpt-5.6-luna'];
   let config = { account_ids: [], enabled_models: defaultModels,
-    timeout_seconds: 123, auth_mode: 'chatgpt', rewrite_tools: false };
+    timeout_seconds: 123, auth_mode: 'chatgpt', rewrite_tools: false, degradation_check_model: 'gpt-5.4-mini' };
   let frame;
   let token;
   let stage;
@@ -514,7 +515,7 @@ const host = `
       const single = scopedTestCount <= 2;
       const targets = single ? [accountIDs[scopedTestCount === 1 ? 1 : 0]] : accountIDs;
       const expectedSelection = scopedTestCount <= 3 ? [accountIDs[0], accountIDs[1], accountIDs[3]] : [accountIDs[1], accountIDs[2], accountIDs[3]];
-      if (!snapshot || snapshot.degradation_check !== true || !sameIDs(snapshot.account_ids, expectedSelection) ||
+      if (!snapshot || snapshot.degradation_check !== true || 'degradation_check_model' in snapshot || !sameIDs(snapshot.account_ids, expectedSelection) ||
           !same(snapshot.enabled_models, subset) || snapshot.timeout_seconds !== 123 || snapshot.auth_mode !== 'chatgpt' || snapshot.rewrite_tools !== false ||
           (single ? snapshot.degradation_check_account_id !== targets[0] || 'degradation_check_account_ids' in snapshot :
             !same(snapshot.degradation_check_account_ids, targets) || 'degradation_check_account_id' in snapshot))
@@ -550,6 +551,8 @@ const host = `
         return void finish(false, { error: 'Scoped diagnostics must not save configuration automatically or while busy' });
       if (stage === 'reopen-empty')
         return void finish(false, { error: 'Paused account diagnostics must never save configuration' });
+      if ('degradation_check_model' in data.config)
+        return void finish(false, { error: 'Saving configuration retained a retired diagnostic model override' });
       if (data.config.timeout_seconds !== 123 || data.config.auth_mode !== 'chatgpt' || data.config.rewrite_tools !== false)
         return void finish(false, { error: 'Saving account selection overwrote unrelated configuration' });
       if (stage === 'scoped' && (data.config.degradation_check === true ||

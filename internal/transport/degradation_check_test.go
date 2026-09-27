@@ -14,12 +14,11 @@ import (
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
 
-func TestDegradationModelIsIndependentOfBPSModels(t *testing.T) {
-	if got := degradationModel(protocol.Config{DegradationCheckModel: " gpt-5.4-mini ", EnabledModels: []string{"gpt-5.6-sol"}}); got != "gpt-5.4-mini" {
-		t.Fatalf("degradationModel = %q, want configured model", got)
-	}
-	if got := degradationModel(protocol.Config{EnabledModels: []string{"gpt-5.6-sol"}}); got != "gpt-5.4" {
-		t.Fatalf("degradationModel without native model = %q, want gpt-5.4", got)
+func TestDegradationModelIsFixedAndIndependentOfBPSModels(t *testing.T) {
+	for _, legacy := range []string{"", " gpt-5.4-mini ", "gpt-6-sol", "malformed model"} {
+		if got := degradationModel(protocol.Config{DegradationCheckModel: legacy, EnabledModels: []string{"gpt-5.6-sol"}}); got != "gpt-6-astra" {
+			t.Fatalf("legacy model %q changed fixed probe model to %q", legacy, got)
+		}
 	}
 }
 

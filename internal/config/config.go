@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"unicode"
 )
 
 const (
@@ -41,8 +40,9 @@ const (
 	// DefaultAuthMode 是 Basis Points 的鉴权模式。
 	DefaultAuthMode = "chatgpt"
 	// MaxDegradationCheckAccountIDs bounds one explicit diagnostic snapshot.
-	MaxDegradationCheckAccountIDs         = 10000
-	DefaultDegradationCheckModel          = "gpt-5.4"
+	MaxDegradationCheckAccountIDs = 10000
+	// Native diagnostic model is fixed, independently of business routing.
+	DefaultDegradationCheckModel          = "gpt-6-astra"
 	DefaultAutoDegradationIntervalMinutes = 30
 )
 
@@ -82,8 +82,9 @@ type Config struct {
 	AutoDegradationEnabled         bool `json:"auto_degradation_enabled"`
 	AutoDegradationIntervalMinutes int  `json:"auto_degradation_interval_minutes"`
 	// Manual revision invalidates automatic route overrides even when IDs return to an old baseline.
-	AutoDegradationManualRevision int64  `json:"auto_degradation_manual_revision"`
-	DegradationCheckModel         string `json:"degradation_check_model"`
+	AutoDegradationManualRevision int64 `json:"auto_degradation_manual_revision"`
+	// Retained only to read legacy settings; Normalize always fixes this value.
+	DegradationCheckModel string `json:"degradation_check_model"`
 	// NativeTimezoneByIP adjusts native Codex and BPS request environment context using the forwarding account's exit timezone.
 	// The field and JSON key retain their original names for configuration compatibility.
 	NativeTimezoneByIP bool `json:"native_timezone_by_ip"`
@@ -207,9 +208,6 @@ func Parse(raw []byte) (Config, error) {
 		if c.AutoDegradationIntervalMinutes == 0 {
 			return Config{}, fmt.Errorf("auto_degradation_interval_minutes must be between 5 and 1440")
 		}
-		if c.DegradationCheckModel == "" {
-			return Config{}, fmt.Errorf("degradation_check_model must not be empty")
-		}
 	}
 	if err := c.Normalize(); err != nil {
 		return Config{}, err
@@ -256,17 +254,7 @@ func (c *Config) Normalize() error {
 	if c.AutoDegradationManualRevision < 0 || c.AutoDegradationManualRevision > 9007199254740991 {
 		return fmt.Errorf("auto_degradation_manual_revision must be between 0 and 9007199254740991")
 	}
-	if c.DegradationCheckModel == "" {
-		c.DegradationCheckModel = DefaultDegradationCheckModel
-	}
-	if len(c.DegradationCheckModel) > 128 {
-		return fmt.Errorf("degradation_check_model must be a non-empty model ID of at most 128 bytes")
-	}
-	for _, r := range c.DegradationCheckModel {
-		if unicode.IsSpace(r) || unicode.IsControl(r) {
-			return fmt.Errorf("degradation_check_model must not contain whitespace or control characters")
-		}
-	}
+	c.DegradationCheckModel = DefaultDegradationCheckModel
 	if c.DegradationCheckAccountID < 0 {
 		return fmt.Errorf("degradation_check_account_id must be a positive account ID or zero")
 	}

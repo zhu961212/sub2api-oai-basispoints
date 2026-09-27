@@ -174,11 +174,11 @@ func TestValidationCompletesBeforeUploadAndCommit(t *testing.T) {
 			}
 		})
 	}
-	parts := make([]map[string]any, 21)
+	parts := make([]map[string]any, maxRequestImages+1)
 	for i := range parts {
 		parts[i] = imagePart(raw)
 	}
-	if changed, err := New().Rewrite(context.Background(), server.Client(), server.URL+"/responses", testHeaders(), message(parts...), "scope"); changed || err == nil || !strings.Contains(err.Error(), "20 inline") {
+	if changed, err := New().Rewrite(context.Background(), server.Client(), server.URL+"/responses", testHeaders(), message(parts...), "scope"); changed || err == nil || !strings.Contains(err.Error(), "128 inline") {
 		t.Fatalf("image count limit missing: %v", err)
 	}
 	if calls.Load() != 0 {

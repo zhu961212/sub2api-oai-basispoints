@@ -114,7 +114,7 @@ func (t *Transport) configureAutoDegradation(old, next protocol.Config) {
 	if old.AutoDegradationEnabled == next.AutoDegradationEnabled &&
 		old.AutoDegradationIntervalMinutes == next.AutoDegradationIntervalMinutes &&
 		old.NativeTimezoneByIP == next.NativeTimezoneByIP &&
-		old.DegradationCheckModel == next.DegradationCheckModel && autoSelectionBase(old) == autoSelectionBase(next) {
+		autoSelectionBase(old) == autoSelectionBase(next) {
 		return
 	}
 	s := &t.autoDegradation
@@ -153,7 +153,7 @@ func nextAutoDegradationRecord(c protocol.Config, old autoDegradationRecord, res
 	base := autoSelectionBase(c)
 	current := autoRecordSelection(c, old, base)
 	record := old
-	record.AccountID, record.SelectionBase, record.Model = result.AccountID, base, c.DegradationCheckModel
+	record.AccountID, record.SelectionBase, record.Model = result.AccountID, base, degradationModel(c)
 	record.NativeTimezoneByIP = c.NativeTimezoneByIP
 	record.BPSEnabled = current
 	record.Decided = old.Decided && old.SelectionBase == base
@@ -173,7 +173,7 @@ func nextAutoDegradationRecord(c protocol.Config, old autoDegradationRecord, res
 		return record
 	}
 	record.PendingStatus, record.Consecutive = result.Status, 1
-	if old.SelectionBase == base && old.Model == c.DegradationCheckModel &&
+	if old.SelectionBase == base && old.Model == degradationModel(c) &&
 		old.NativeTimezoneByIP == c.NativeTimezoneByIP && old.PendingStatus == result.Status &&
 		!old.CheckedAt.IsZero() && now.Sub(old.CheckedAt) <= 2*autoDegradationRetry {
 		record.Consecutive = min(old.Consecutive+1, 2)
@@ -402,7 +402,7 @@ func (t *Transport) runAutoDegradation(ctx context.Context, host pluginv1.HostSe
 			}
 			r, exists := s.records[id]
 			due := r.NextCheckAt
-			if !exists || due.IsZero() || r.Model != cfg.DegradationCheckModel ||
+			if !exists || due.IsZero() || r.Model != degradationModel(cfg) ||
 				r.NativeTimezoneByIP != cfg.NativeTimezoneByIP || r.SelectionBase != base {
 				due = s.firstDue[id]
 				if due.IsZero() {
@@ -544,11 +544,11 @@ func (t *Transport) runAutomaticBatch(parent context.Context, host pluginv1.Host
 		if lease.SelectionBase != autoSelectionBase(cfg) {
 			lease.BPSEnabled, lease.Decided = cfg.HandlesAccount(id), false
 		}
-		if lease.SelectionBase != autoSelectionBase(cfg) || lease.Model != cfg.DegradationCheckModel ||
+		if lease.SelectionBase != autoSelectionBase(cfg) || lease.Model != degradationModel(cfg) ||
 			lease.NativeTimezoneByIP != cfg.NativeTimezoneByIP {
 			lease.PendingStatus, lease.Consecutive = "", 0
 		}
-		lease.SelectionBase, lease.Model, lease.InFlight = autoSelectionBase(cfg), cfg.DegradationCheckModel, true
+		lease.SelectionBase, lease.Model, lease.InFlight = autoSelectionBase(cfg), degradationModel(cfg), true
 		lease.NativeTimezoneByIP = cfg.NativeTimezoneByIP
 		lease.NextCheckAt = time.Now().Add(time.Duration(cfg.AutoDegradationIntervalMinutes) * time.Minute)
 		if err := t.persistAutoDegradationRecord(ctx, host, generation, revision, lease); err != nil {

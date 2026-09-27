@@ -37,7 +37,10 @@ func completeToolHistory(items []any) bool {
 			}
 			pending[callID], seen[callID] = kind+"_output", true
 		} else if strings.HasSuffix(kind, "_call_output") {
-			if callID == "" || pending[callID] != kind {
+			// Client transports may replay a custom call result as a function
+			// output. Request preparation already normalizes this explicit pair.
+			customOutputAlias := pending[callID] == "custom_tool_call_output" && kind == "function_call_output"
+			if callID == "" || pending[callID] != kind && !customOutputAlias {
 				return false
 			}
 			delete(pending, callID)
@@ -53,16 +56,22 @@ func truncatedRelayCanRegenerate(native, source map[string]any) bool {
 	return eligible
 }
 
-// A nonempty target pins the known custom tool for complete code-string
+type toolRepairTarget struct {
+	toolSpec
+	field          string
+	knownArguments map[string]any
+}
+
+// A nonempty target pins the known tool for complete code-string
 // syntax repairs. Older unknown-name and truncated repairs keep their rules.
-func malformedRelayRepairTarget(native, source map[string]any) (bool, toolSpec) {
+func malformedRelayRepairTarget(native, source map[string]any) (bool, toolRepairTarget) {
 	if stringValue(native["type"]) != "function_call" || !isTransportName(stringValue(native["name"])) {
-		return false, toolSpec{}
+		return false, toolRepairTarget{}
 	}
 	arguments := parseTransportArguments(native["arguments"])
 	raw, ok := arguments["code"].(string)
 	if !ok || len(raw) > maxRecoveredEnvelopeBytes {
-		return false, toolSpec{}
+		return false, toolRepairTarget{}
 	}
 	raw = strings.TrimSpace(raw)
 	// Match code recovery's four JSON layers, but unwrap only complete
@@ -71,12 +80,12 @@ func malformedRelayRepairTarget(native, source map[string]any) (bool, toolSpec) 
 		value, _, valid := relayJSONValue(raw, true)
 		quoted, ok := value.(string)
 		if !valid || !ok {
-			return false, toolSpec{}
+			return false, toolRepairTarget{}
 		}
 		raw = strings.TrimSpace(quoted)
 	}
 	if !strings.HasPrefix(raw, "{") {
-		return false, toolSpec{}
+		return false, toolRepairTarget{}
 	}
 	value, _, err := strictRelayJSONValue(raw, true)
 	var syntax *json.SyntaxError
@@ -85,21 +94,24 @@ func malformedRelayRepairTarget(native, source map[string]any) (bool, toolSpec) 
 		// Complete but underescaped custom code is also eligible for the
 		// existing one-shot correction, never for local quote guessing.
 		if !errors.As(err, &syntax) {
-			return false, toolSpec{}
+			return false, toolRepairTarget{}
 		}
-		target, eligible := customTextRelayTarget(raw, source)
+		if target, eligible := customTextRelayTarget(raw, source); eligible {
+			return true, toolRepairTarget{toolSpec: target}
+		}
+		target, eligible := functionTextRelayTarget(raw, source)
 		return eligible, target
 	}
 	envelope := unambiguousEnvelope(objectValue(value))
 	if envelope == nil {
-		return false, toolSpec{}
+		return false, toolRepairTarget{}
 	}
 	name := recoveryEnvelopeName(envelope)
 	if isTransportName(name) {
-		return false, toolSpec{}
+		return false, toolRepairTarget{}
 	}
 	_, exists := resolveClientTool(clientToolSpecs(source), name)
-	return exists, toolSpec{}
+	return exists, toolRepairTarget{}
 }
 
 // Regenerate only the final unexecuted relay. Explicit prior tool history must
@@ -158,7 +170,10 @@ func PrepareToolRepairBody(prepared, source, response map[string]any) (map[strin
 	call := objectValue(output[len(output)-1])
 	feedback := "The proxy rejected the preceding relay because its inner tool name is absent from the active client catalog. No client tool was executed. A helper documented inside an executor is callable only from that executor's raw input. Regenerate exactly one tool call using an explicitly declared client tool. Do not repeat commentary or change the task, model, account, scope, or input."
 	if transportEnvelope(call) == nil {
-		feedback = "The proxy rejected the preceding relay because its code contains incomplete JSON or invalid JSON string quoting. No client tool was executed. Regenerate exactly one complete relay for the declared client tool. Serialize the entire inner object as the code string, preserving quotes and backslashes. Use a JSON serializer for source code and patches; do not manually interpolate them into the envelope. Do not guess missing arguments, repeat commentary, or change the task, model, account, scope, or input."
+		feedback = "The proxy rejected the preceding relay because its code contains incomplete JSON or invalid JSON string quoting. No client tool was executed. Regenerate exactly one complete relay for the declared client tool. Serialize the entire inner object as the code string, preserving quotes and backslashes. Use a JSON serializer for source code and patches; do not manually interpolate them into the envelope. For a function with a damaged string argument, correct only that string and preserve every other argument field and value exactly; do not add, remove, rename, or change unaffected arguments. Do not guess missing arguments, repeat commentary, or change the task, model, account, scope, or input."
+		if _, target := malformedRelayRepairTarget(call, source); target.knownArguments != nil {
+			feedback += " Repair only the damaged string argument. Preserve every other argument field and its exact value; do not add, remove, or rename fields."
+		}
 	}
 	added := append([]any{}, cloneJSONValue(output).([]any)...)
 	added = append(added, map[string]any{"type": "function_call_output", "call_id": call["call_id"], "output": feedback}, messageItem("developer", feedback+" "+clientToolProtocolReminder(source)))
@@ -190,8 +205,27 @@ func MergeToolRepairResponse(source, original, repaired map[string]any) (map[str
 		if reason != "" {
 			return nil, fail(502, "invalid_tool_call", reason)
 		}
-		if expected.Key != "" && (clientToolKey(call) != expected.Key || stringValue(call["type"]) != "custom_tool_call") {
+		expectedType := "function_call"
+		if expected.Type == "custom" {
+			expectedType = "custom_tool_call"
+		}
+		if expected.Key != "" && (clientToolKey(call) != expected.Key || stringValue(call["type"]) != expectedType) {
 			return nil, fail(502, "invalid_tool_call", "Basis Points code string correction changed the declared client tool")
+		}
+		if expected.knownArguments != nil {
+			arguments := parseArguments(call["arguments"])
+			if len(arguments) != len(expected.knownArguments)+1 {
+				return nil, fail(502, "invalid_tool_call", "Basis Points code string correction changed unaffected arguments")
+			}
+			if _, ok := arguments[expected.field].(string); !ok {
+				return nil, fail(502, "invalid_tool_call", "Basis Points code string correction changed the damaged argument field")
+			}
+			for key, value := range expected.knownArguments {
+				actual, exists := arguments[key]
+				if !exists || !jsonValuesEqual(actual, value) {
+					return nil, fail(502, "invalid_tool_call", "Basis Points code string correction changed unaffected arguments")
+				}
+			}
 		}
 	}
 	if tools != 1 {

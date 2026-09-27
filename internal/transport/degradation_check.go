@@ -218,11 +218,8 @@ type degradationAccount struct {
 	unavailable bool
 }
 
-func degradationModel(c protocol.Config) string {
-	if model := strings.TrimSpace(c.DegradationCheckModel); model != "" {
-		return model
-	}
-	return "gpt-5.4"
+func degradationModel(_ protocol.Config) string {
+	return nativeDegradationModel
 }
 
 func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Config, host pluginv1.HostServiceClient, base *http.Client, accountID int64, model string) (string, string, error) {

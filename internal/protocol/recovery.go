@@ -18,6 +18,16 @@ func recoverTransportEnvelope(raw string) map[string]any {
 	for depth := 0; depth < 4; depth++ {
 		raw = strings.TrimSpace(raw)
 		value, _, ok := relayJSONValue(raw, true)
+		if !ok {
+			// Repair syntax within this layer; only unwrapping a complete JSON
+			// string consumes the layer budget. Keep the same strict decoder so
+			// repaired duplicate keys and trailing values remain rejected.
+			fixed := repairEnvelopeStrings(raw)
+			if fixed != raw {
+				raw = fixed
+				value, _, ok = relayJSONValue(raw, true)
+			}
+		}
 		if ok {
 			switch value := value.(type) {
 			case map[string]any:
@@ -28,13 +38,6 @@ func recoverTransportEnvelope(raw string) map[string]any {
 			default:
 				return nil
 			}
-		}
-		// Repair only characters that JSON forbids inside strings. Valid JSON
-		// escapes, quotes, separators, and structural delimiters are never guessed.
-		fixed := repairEnvelopeStrings(raw)
-		if fixed != raw {
-			raw = fixed
-			continue
 		}
 		return recoverEmbeddedEnvelope(raw)
 	}

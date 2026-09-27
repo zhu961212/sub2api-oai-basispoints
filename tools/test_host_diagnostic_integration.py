@@ -54,7 +54,8 @@ class NativeDiagnosticIsolationTests(unittest.TestCase):
 
     def test_test_only_helper_has_no_public_endpoint_fallback(self):
         helper = runner.NATIVE_FIXTURE_HELPER
-        for guard in ('os.Getenv("BPS_DIAGNOSTIC_NATIVE_FIXTURE_URL")',
+        for guard in ('os.Executable()',
+                      'os.ReadFile(executable + ".native-fixture-origin")',
                       'endpoint.Scheme != "http"', 'endpoint.Hostname() != "127.0.0.1"',
                       'endpoint.Host != "127.0.0.1:" + endpoint.Port()',
                       'endpoint.User != nil', 'endpoint.Path != ""',
@@ -62,13 +63,15 @@ class NativeDiagnosticIsolationTests(unittest.TestCase):
                       'endpoint.Fragment != ""', 'endpoint.Opaque != ""',
                       'port < 1 || port > 65535'):
             self.assertIn(guard, helper)
-        self.assertEqual(helper.count("panic("), 2)
+        self.assertEqual(helper.count("panic("), 4)
         self.assertEqual(helper.count("return "), 1)
         self.assertIn('return raw + "/backend-api/codex/responses"', helper)
         self.assertNotIn("chatgpt.com", helper)
         self.assertNotIn("responses_url", helper)
+        self.assertNotIn("os.Getenv", helper)
         production = (ROOT / "internal/transport/native_degradation.go").read_text(encoding="utf-8")
         self.assertNotIn(runner.NATIVE_FIXTURE_ENV, production)
+        self.assertNotIn(runner.NATIVE_FIXTURE_SIDECAR, production)
         self.assertIn(runner.NATIVE_ENDPOINT_DECLARATION, production)
 
     def test_prebuilt_binary_is_rejected_before_git_build_or_execution(self):
@@ -85,14 +88,33 @@ class NativeDiagnosticIsolationTests(unittest.TestCase):
         self.assertIn("--plugin-binary is unsupported", stderr.getvalue())
         self.assertIn("must not receive synthetic fixture credentials", stderr.getvalue())
 
-    def test_fixture_sets_loopback_environment_before_spawning_child(self):
+    def test_fixture_creates_private_loopback_sidecar_before_spawning_child(self):
         fixture = (ENTRY.parent / "diagnostic_jobs_host_test.go.txt").read_text(encoding="utf-8")
-        setting = 't.Setenv("BPS_DIAGNOSTIC_NATIVE_FIXTURE_URL", h.upstream.URL)'
+        setting = 'writeBPSDiagnosticFixtureFile(t, binary+".native-fixture-origin", []byte(h.upstream.URL), 0600)'
         self.assertEqual(fixture.count(setting), 1)
         self.assertLess(fixture.index(setting), fixture.index("h.start()"))
+        private = 'binary = filepath.Join(t.TempDir(), filepath.Base(binary))'
+        self.assertEqual(fixture.count(private), 1)
+        self.assertLess(fixture.index(private), fixture.index(setting))
+        self.assertIn('writeBPSDiagnosticFixtureFile(t, binary, data, 0700)', fixture)
+        self.assertIn('os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)', fixture)
+        self.assertNotIn('t.Setenv("BPS_DIAGNOSTIC_NATIVE_FIXTURE_URL"', fixture)
         self.assertIn('require.Equal(t, "loopback-v1", os.Getenv("BPS_DIAGNOSTIC_SOURCE_OVERLAY")', fixture)
         self.assertIn('r.URL.Path != "/backend-api/codex/responses"', fixture)
-        self.assertIn('[]bpsDiagnosticRequest{{"synthetic-account-7", "gpt-5.4"}}', fixture)
+        self.assertIn('[]bpsDiagnosticRequest{{"synthetic-account-7", "gpt-6-astra"}}', fixture)
+
+    def test_loopback_fixture_requires_fixed_native_model_before_recording(self):
+        fixture = (ENTRY.parent / "diagnostic_jobs_host_test.go.txt").read_text(encoding="utf-8")
+        check = 'if payload.Model != "gpt-6-astra" {'
+        self.assertEqual(fixture.count(check), 1)
+        start = fixture.index(check)
+        end = fixture.index('account := r.Header.Get', start)
+        guard = fixture[start:end]
+        self.assertIn('t.Errorf("native diagnostic model must be gpt-6-astra, got %q", payload.Model)', guard)
+        self.assertIn('w.WriteHeader(http.StatusBadRequest)', guard)
+        self.assertIn('return', guard)
+        self.assertLess(end, fixture.index('h.requests = append(h.requests, bpsDiagnosticRequest{account, payload.Model})'))
+        self.assertNotIn('gpt-5.4', fixture)
 
     def test_source_execution_always_builds_with_overlay_and_clears_inherited_origin(self):
         for race in (False, True):

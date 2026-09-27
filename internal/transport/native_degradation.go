@@ -9,6 +9,7 @@ import (
 
 	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/auth"
+	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/config"
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
 
@@ -16,10 +17,14 @@ import (
 // BPS responses_url must never redirect the native account probe.
 const nativeDegradationResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 
+const nativeDegradationModel = config.DefaultDegradationCheckModel
+
 // Matches the supported host's canonical native OAuth probe identity.
 const nativeDegradationUserAgent = "codex-tui/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
 
-func prepareNativeDegradationRequest(ctx context.Context, host pluginv1.HostServiceClient, accountID int64, model string) (*http.Request, string, error) {
+// The legacy model argument cannot override the fixed probe, including when
+// a previously prepared job or persisted state supplies an older value.
+func prepareNativeDegradationRequest(ctx context.Context, host pluginv1.HostServiceClient, accountID int64, _ string) (*http.Request, string, error) {
 	if host == nil {
 		return nil, "", fmt.Errorf("host services are unavailable; cannot resolve account")
 	}
@@ -65,7 +70,7 @@ func prepareNativeDegradationRequest(ctx context.Context, host pluginv1.HostServ
 		headers.Set("Version", "0.146.0")
 	}
 	body := protocol.JSONBytes(map[string]any{
-		"model":        model,
+		"model":        nativeDegradationModel,
 		"input":        []map[string]any{{"role": "user", "content": []map[string]any{{"type": "input_text", "text": degradationCheckPrompt}}}},
 		"instructions": "Answer the user's question directly and accurately.",
 		"stream":       true, "store": false,

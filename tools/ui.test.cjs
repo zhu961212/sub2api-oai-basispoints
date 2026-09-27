@@ -15,7 +15,7 @@ const htmlSource = fs.readFileSync(path.join(root, "ui/index.html"), "utf8");
 const modelIDs = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const modelCatalogIDs = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna"];
 const defaultModels = ["gpt-6-astra", "gpt-5.6-sol"];
-const defaultAutoDegradation = { auto_degradation_enabled: false, auto_degradation_interval_minutes: 30, auto_degradation_manual_revision: 0, degradation_check_model: "gpt-5.4", native_timezone_by_ip: false };
+const defaultAutoDegradation = { auto_degradation_enabled: false, auto_degradation_interval_minutes: 30, auto_degradation_manual_revision: 0, native_timezone_by_ip: false };
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const deferred = () => {
   let resolve;
@@ -127,7 +127,6 @@ function createPage(options = {}) {
     "auto-degradation-fields": "fieldset",
     "auto-degradation-toggle": "button",
     "auto-degradation-interval": "input",
-    "degradation-check-model": "input",
     "auto-degradation-status": "span",
     "native-environment-fields": "fieldset",
     "native-timezone-toggle": "button",
@@ -148,7 +147,7 @@ function createPage(options = {}) {
   ids["config-form"].appendChild(ids["auto-degradation-fields"]);
   ids["config-form"].appendChild(ids["native-environment-fields"]);
   ids["native-environment-fields"].appendChild(ids["native-timezone-toggle"]);
-  for (const id of ["auto-degradation-toggle", "auto-degradation-interval", "degradation-check-model", "auto-degradation-status"]) {
+  for (const id of ["auto-degradation-toggle", "auto-degradation-interval", "auto-degradation-status"]) {
     ids["auto-degradation-fields"].appendChild(ids[id]);
   }
   ids["model-fields"].appendChild(ids["model-list"]);
@@ -360,34 +359,56 @@ test("automatic native diagnostics default off and settings survive saving and r
   await flush();
   assert.equal(page.ids["auto-degradation-toggle"].getAttribute("aria-pressed"), "false");
   assert.equal(page.ids["auto-degradation-interval"].value, "30");
-  assert.equal(page.ids["degradation-check-model"].value, "gpt-5.4");
+  assert.equal(page.ids["degradation-check-model"], undefined);
   page.toggleAutoDegradation();
   assert.match(page.ids["auto-degradation-toggle"].textContent, /已开启.*待保存/);
   assert.equal(page.calls.save.length, 0);
   assert.equal(page.accountRow(1).checkbox.disabled, true);
   page.ids["auto-degradation-interval"].userInput("45");
-  page.ids["degradation-check-model"].userInput("gpt-5.4-mini");
   page.save();
   await flush();
   assert.equal(page.store.config.auto_degradation_enabled, true);
   assert.equal(page.store.config.auto_degradation_interval_minutes, 45);
-  assert.equal(page.store.config.degradation_check_model, "gpt-5.4-mini");
+  assert.equal(Object.hasOwn(page.store.config, "degradation_check_model"), false);
   assert.equal(page.calls.test, 0);
   assert.match(page.ids["form-hint"].textContent, /已保存/);
   const reopened = createPage({ store: page.store });
   await flush();
   assert.equal(reopened.ids["auto-degradation-toggle"].getAttribute("aria-pressed"), "true");
   assert.equal(reopened.ids["auto-degradation-interval"].value, "45");
-  assert.equal(reopened.ids["degradation-check-model"].value, "gpt-5.4-mini");
+  assert.equal(reopened.ids["degradation-check-model"], undefined);
+});
+
+test("retired diagnostic model overrides are dropped from snapshots and saved configuration", async t => {
+  for (const legacyModel of ["gpt-5.4-mini", "invalid model override"]) {
+    await t.test(legacyModel, async () => {
+      const store = { config: { account_ids: [1], enabled_models: ["gpt-6-luna"], degradation_check_model: legacyModel } };
+      const page = createPage({ store, scoped: true, testScoped: config => Promise.resolve(scopedResult(config)) });
+      await flush();
+      assert.equal(page.ids["degradation-check-model"], undefined);
+      page.degradationCheck();
+      await flush();
+      assert.equal(page.calls.scoped.length, 1);
+      assert.equal(Object.hasOwn(page.calls.scoped[0], "degradation_check_model"), false);
+      assert.deepEqual(page.calls.scoped[0].enabled_models, ["gpt-6-luna"]);
+      assert.equal(page.calls.save.length, 0);
+      assert.equal(store.config.degradation_check_model, legacyModel);
+      page.save();
+      await flush();
+      assert.equal(Object.hasOwn(store.config, "degradation_check_model"), false);
+      assert.deepEqual(store.config.enabled_models, ["gpt-6-luna"]);
+      assert.match(page.ids["form-hint"].textContent, /已保存/);
+      const reopened = createPage({ store });
+      await flush();
+      assert.equal(reopened.ids["degradation-check-model"], undefined);
+    });
+  }
 });
 
 test("automatic diagnostic inputs reject invalid values without writes or requests", async t => {
   for (const [field, value] of [
     ["auto-degradation-interval", ""], ["auto-degradation-interval", "4"],
     ["auto-degradation-interval", "1441"], ["auto-degradation-interval", "5.5"],
-    ["degradation-check-model", ""], ["degradation-check-model", "gpt 5.4"],
-    ["degradation-check-model", "gpt" + String.fromCharCode(0) + "5.4"],
-    ["degradation-check-model", "x".repeat(129)],
   ]) {
     await t.test(field + " / " + JSON.stringify(value), async () => {
       const page = createPage({ scoped: true });
@@ -398,7 +419,7 @@ test("automatic diagnostic inputs reject invalid values without writes or reques
       await flush();
       assert.equal(page.calls.save.length, 0);
       assert.equal((page.calls.scoped || []).length, 0);
-      assert.match(page.ids["form-hint"].textContent, /间隔|原生检测模型/);
+      assert.match(page.ids["form-hint"].textContent, /间隔/);
     });
   }
 });
@@ -466,7 +487,7 @@ test("automatic bulk checks only display results and BPS blocks still permit nat
   await flush();
   assert.deepEqual(page.selected(), [3]);
   assert.equal(page.calls.save.length, 0);
-  assert.equal(page.calls.scoped[0].degradation_check_model, "gpt-5.4");
+  assert.equal(Object.hasOwn(page.calls.scoped[0], "degradation_check_model"), false);
   assert.match(page.ids["form-hint"].textContent, /未按探针结果调整/);
 });
 
@@ -1184,7 +1205,9 @@ test("automatic images need no configuration controls", async () => {
   assert.match(htmlSource, /支持直接发送图片和截图，无需额外配置/);
   assert.doesNotMatch(htmlSource, /image-relay|图片中转|公网 HTTPS|反向代理|监听地址|存储目录/);
   const inputs = [...htmlSource.matchAll(/<input[^>]+id="([^"]+)"/g)].map(match => match[1]);
-  assert.deepEqual(inputs, ["auto-degradation-interval", "degradation-check-model"]);
+  assert.deepEqual(inputs, ["auto-degradation-interval"]);
+  assert.doesNotMatch(htmlSource, /degradation-check-model/);
+  assert.match(htmlSource, /id="degradation-fixed-model"[^>]*>原生检测固定使用 gpt-6-astra/);
   assert.doesNotMatch(htmlSource, /<select |<details /);
   const page = createPage();
   await flush();

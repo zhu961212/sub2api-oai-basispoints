@@ -13,7 +13,7 @@ func TestAutoDegradationDefaultsAndRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.AutoDegradationEnabled || cfg.AutoDegradationIntervalMinutes != 30 || cfg.DegradationCheckModel != "gpt-5.4" {
+		if cfg.AutoDegradationEnabled || cfg.AutoDegradationIntervalMinutes != 30 || cfg.DegradationCheckModel != "gpt-6-astra" {
 			t.Fatalf("unexpected default diagnostics: %+v", cfg)
 		}
 		for _, enabled := range []bool{false, true} {
@@ -28,6 +28,7 @@ func TestAutoDegradationDefaultsAndRoundTrip(t *testing.T) {
 				t.Fatal("explicit disabled setting omitted")
 			}
 			again, err := Parse(raw)
+			cfg.DegradationCheckModel = DefaultDegradationCheckModel
 			if err != nil || !reflect.DeepEqual(again, cfg) {
 				t.Fatalf("round trip: %+v, %v", again, err)
 			}
@@ -86,14 +87,14 @@ func TestAutoDegradationValidation(t *testing.T) {
 	}
 	for _, model := range []string{"", " gpt-5.4", "gpt 5.4", "gpt" + string(rune(10)) + "5.4", "gpt" + string(rune(9)) + "5.4", "gpt" + string(rune(0)) + "5.4", "gpt" + string(rune(0x85)) + "5.4", strings.Repeat("x", 129)} {
 		raw, _ := json.Marshal(map[string]any{"degradation_check_model": model})
-		if _, err := Parse(raw); err == nil {
-			t.Fatalf("accepted model %q", model)
+		if cfg, err := Parse(raw); err != nil || cfg.DegradationCheckModel != DefaultDegradationCheckModel {
+			t.Fatalf("legacy model %q did not normalize to the fixed model: %+v, %v", model, cfg, err)
 		}
 	}
 	for _, model := range []string{"gpt-5.4", "gpt-5.4-mini", "custom/native-model:2026-09-01", strings.Repeat("x", 128)} {
 		raw, _ := json.Marshal(map[string]any{"degradation_check_model": model})
 		cfg, err := Parse(raw)
-		if err != nil || cfg.DegradationCheckModel != model {
+		if err != nil || cfg.DegradationCheckModel != DefaultDegradationCheckModel {
 			t.Fatalf("model %q: %v", model, err)
 		}
 	}

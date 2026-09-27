@@ -10,7 +10,7 @@
 https://chatgpt.com/backend-api/codex/responses
 ~~~
 
-即使该账号的正常业务已经使用 BPS，探针仍检测原生 Codex。检测不使用 BPS 的 responses_url、已选模型列表或请求体转换，也不跟随 HTTP 重定向。原生检测模型由 degradation_check_model 独立设置，默认 gpt-5.4；修改正常业务的 BPS 模型选择不会更换探针模型。
+即使该账号的正常业务已经使用 BPS，探针仍检测原生 Codex。检测不使用 BPS 的 responses_url、已选模型列表或请求体转换，也不跟随 HTTP 重定向。原生检测模型固定为 gpt-6-astra，无需配置；手动单号、批量和自动检测统一使用该模型。旧 degradation_check_model 字段仅为兼容历史配置保留，归一化为固定值，不影响探针；修改正常业务的 BPS 模型选择也不会更换探针模型。
 
 判定仍沿用固定问题“不联网，不猜测，直接说出你知道的最新苹果手机。只输出手机型号，不要解释。”及“苹果17 / iPhone 17”规则。这是固定启发式路由辅助，不是通用智力测评，也不会自动追踪新手机型号。含糊、冲突、截断或失败回答不作为明确降智或恢复依据。检测会发送真实请求并消耗账号额度。
 
@@ -22,7 +22,8 @@ https://chatgpt.com/backend-api/codex/responses
 | --- | --- | --- |
 | 自动检测与切换 | auto_degradation_enabled | false，默认关闭 |
 | 常规检测间隔（分钟） | auto_degradation_interval_minutes | 30，整数 5–1440 |
-| 原生检测模型 | degradation_check_model | gpt-5.4，非空且不含空白或控制字符，最多 128 字节 |
+
+原生检测模型固定为 gpt-6-astra，界面只显示说明，不提供模型输入框。
 
 自动开关与“403 自动停用”开关独立。页面标记“待保存”时，后台仍按已保存设置运行；关闭页面不会停止已启用的后台检测。
 

@@ -147,7 +147,7 @@ func TestToolScreenshotsShareRequestResourceLimits(t *testing.T) {
 			}
 			source := map[string]any{"input": []any{toolImageInput(kind, parts...)}}
 			changed, err := New().Rewrite(context.Background(), nil, "INVALID", nil, source, "")
-			if changed || err == nil || !strings.Contains(err.Error(), "20 inline") || parts[0]["detail"] != nil {
+			if changed || err == nil || !strings.Contains(err.Error(), "128 inline") || parts[0]["detail"] != nil {
 				t.Fatalf("screenshot count budget: changed=%v err=%v", changed, err)
 			}
 		})
@@ -191,7 +191,7 @@ func TestMixedMessageAndToolImagesShareRequestBudgets(t *testing.T) {
 				}))
 				defer server.Close()
 				data := testPNG(t)
-				count, want := maxRequestImages, "20 inline"
+				count, want := maxRequestImages, "128 inline"
 				if limit == "bytes" {
 					padded := make([]byte, 17<<20)
 					copy(padded, data)

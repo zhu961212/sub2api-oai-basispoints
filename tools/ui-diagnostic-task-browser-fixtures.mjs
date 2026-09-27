@@ -163,7 +163,7 @@ export function createDiagnosticTaskHost(accounts, reopen, finish) {
   const assert = (ok, message) => { if (!ok) throw new Error(message); };
   function reset() {
     config = { account_ids: base.slice(), auto_select_new_accounts: false, enabled_models: baseModels.slice(),
-      timeout_seconds: 123, auth_mode: 'chatgpt', rewrite_tools: false, bps_auto_disable_on_403: false };
+      timeout_seconds: 123, auth_mode: 'chatgpt', rewrite_tools: false, bps_auto_disable_on_403: false, degradation_check_model: 'gpt-5.4-mini' };
     owner = 'browser-task-instance'; tasks = new Map(); commands = []; ordinarySaves = 0; starts = 0;
     explicitSaveAllowed = false; closedWindow = null; closedRequests = 0;
   }
@@ -256,6 +256,7 @@ export function createDiagnosticTaskHost(accounts, reopen, finish) {
           assert(stage !== 'task-success' || explicitSaveAllowed, 'Task auto-saved before an explicit click');
           assert(!Object.hasOwn(data.config, 'degradation_check') && !Object.hasOwn(data.config, 'degradation_check_account_id') && !Object.hasOwn(data.config, 'degradation_check_account_ids'), 'Ordinary save retained diagnostic targets');
           assert(!Object.hasOwn(data.config, 'bps_device_convergence'), 'Ordinary save includes removed device convergence setting');
+          assert(!Object.hasOwn(data.config, 'degradation_check_model'), 'Ordinary save includes retired diagnostic model override');
           assert(data.config.timeout_seconds === 123 && data.config.auth_mode === 'chatgpt' && data.config.rewrite_tools === false, 'Task save changed unrelated settings');
           ordinarySaves++; config = clone(data.config); return respond({ ok: true, config: clone(config) });
         }
@@ -270,6 +271,7 @@ export function createDiagnosticTaskHost(accounts, reopen, finish) {
           assert(snapshot.degradation_check === true && sameSet(snapshot.account_ids, base), 'Task changed account snapshot');
           assert(sameSet(snapshot.enabled_models, stage === 'task-success' ? ['gpt-6-astra', ...baseModels] : baseModels) && snapshot.bps_auto_disable_on_403 === (stage === 'task-success'), 'Task changed model or parameter snapshot');
           assert(!Object.hasOwn(snapshot, 'bps_device_convergence'), 'Task snapshot includes removed device convergence setting');
+          assert(!Object.hasOwn(snapshot, 'degradation_check_model'), 'Task snapshot includes retired diagnostic model override');
           assert(snapshot.timeout_seconds === 123 && snapshot.auth_mode === 'chatgpt' && snapshot.rewrite_tools === false, 'Task discarded unrelated snapshot parameters');
           assert(same(targets, stage === 'task-success' ? (tasks.size === 0 ? [ids[1]] : ids) : [ids[0]]), 'Task did not freeze explicit target IDs');
           tasks.set(command.task_id, { task_id: command.task_id, state: 'prepared', receipt: 'receipt-' + command.task_id, targets: clone(targets), config: clone(snapshot) });

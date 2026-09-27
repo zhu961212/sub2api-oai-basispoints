@@ -77,11 +77,13 @@ change only after every necessary user-message upload succeeds. A failed batch
 may have already uploaded earlier images to the provider, but does not partially
 rewrite the request. The adapter does not invent an upstream deletion endpoint.
 
-Limits are 20 MiB per image, 32 MiB decoded total, 20 inline image occurrences,
+Limits are 20 MiB per image, 32 MiB decoded total, 128 inline image occurrences,
 64 × 1024 × 1024 pixels per image, and 32 active uploads. User images and tool
 screenshots share the per-request limits; repeated occurrences count separately.
 Expanded conversation history is included in these limits, even when each new
-turn adds only one image. Limit errors report the encountered count or decoded
+turn adds only one image. The count is a local resource safeguard, not a provider
+capability guarantee; the adapter never drops or compresses historical images.
+Limit errors report the encountered count or decoded
 size, identify the offending field, and explain that history/screenshots count.
 Only PNG/JPEG/GIF/WebP are accepted. Screenshot-only requests also participate
 in the transport's image-request admission and estimated concurrency budget.
