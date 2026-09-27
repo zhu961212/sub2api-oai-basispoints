@@ -311,8 +311,7 @@ button.account-check-button {
   font-size: 12px;
 }
 
-#bps-403-toggle[aria-pressed="true"],
-#bps-device-toggle[aria-pressed="true"] {
+#bps-403-toggle[aria-pressed="true"] {
   border-color: var(--ok-text);
   color: var(--ok-text);
   background: var(--ok-bg);

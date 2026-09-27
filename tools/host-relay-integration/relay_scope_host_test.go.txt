@@ -1,0 +1,156 @@
+// Test-only Go overlay: actual host classifiers and readers, synthetic streams.
+package service
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+)
+
+const bpsRelayScopeMessage = "Basis Points returned a malformed or ambiguous client tool relay envelope"
+
+type bpsRelayScopeCase struct {
+	name, code, kind, message string
+	retryBeforeOutput         bool
+}
+
+var bpsRelayScopeCases = []bpsRelayScopeCase{
+	{"reported_40445_untyped", "invalid_tool_call", "", bpsRelayScopeMessage, true},
+	{"fixed_request_scoped", "invalid_tool_call", "invalid_request_error", bpsRelayScopeMessage, false},
+	{"existing_service_rejection", "bps_service_rejected", "invalid_request_error", "Basis Points service rejected this request (HTTP 403)", false},
+	{"transient_still_retries", "server_error", "server_error", "Temporary upstream error; please retry", true},
+}
+
+func bpsRelayScopePayload(t *testing.T, test bpsRelayScopeCase) []byte {
+	t.Helper()
+	failure := map[string]any{"code": test.code, "message": test.message}
+	if test.kind != "" {
+		failure["type"] = test.kind
+	}
+	payload, err := json.Marshal(map[string]any{
+		"type": "response.failed", "sequence_number": 2,
+		"response": map[string]any{"status": "failed", "output": []any{}, "error": failure},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func TestBasispointsRelayScopeClassification(t *testing.T) {
+	for _, test := range bpsRelayScopeCases {
+		t.Run(test.name, func(t *testing.T) {
+			payload := bpsRelayScopePayload(t, test)
+			if got := openAIStreamFailedEventShouldFailover(payload, test.message); got != test.retryBeforeOutput {
+				t.Fatalf("failover = %v, want %v", got, test.retryBeforeOutput)
+			}
+			if test.kind == "invalid_request_error" && openAIStreamErrorEventShouldFailover(payload, test.message) {
+				t.Fatal("request-scoped bare error must not fail over")
+			}
+		})
+	}
+}
+
+func bpsRelayScopeSSE(t *testing.T, event string, payload map[string]any) string {
+	t.Helper()
+	payload["type"] = event
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("event: %s\ndata: %s\n\n", event, body)
+}
+
+func TestBasispointsRelayScopeStreamingReaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	readers := []struct {
+		name string
+		run  func(*OpenAIGatewayService, *gin.Context, *http.Response, *Account) error
+	}{
+		{"native", func(s *OpenAIGatewayService, c *gin.Context, r *http.Response, a *Account) error {
+			_, err := s.handleStreamingResponse(c.Request.Context(), r, c, a, time.Now(), "gpt-6-astra", "gpt-6-astra")
+			return err
+		}},
+		{"passthrough", func(s *OpenAIGatewayService, c *gin.Context, r *http.Response, a *Account) error {
+			_, err := s.handleStreamingResponsePassthrough(c.Request.Context(), r, c, a, time.Now(), "gpt-6-astra", "gpt-6-astra")
+			return err
+		}},
+	}
+	metadata := bpsRelayScopeSSE(t, "response.created", map[string]any{
+		"sequence_number": 0, "response": map[string]any{"id": "resp_relay_scope", "status": "in_progress", "output": []any{}},
+	}) + bpsRelayScopeSSE(t, "response.in_progress", map[string]any{
+		"sequence_number": 1, "response": map[string]any{"id": "resp_relay_scope", "status": "in_progress"},
+	})
+	visible := bpsRelayScopeSSE(t, "response.output_text.delta", map[string]any{"delta": "visible text", "output_index": 0, "content_index": 0})
+	for _, reader := range readers {
+		for _, prefix := range []struct {
+			name, body string
+			visible    bool
+		}{
+			{"no_output", "", false},
+			{"metadata_only", metadata, false},
+			{"after_visible_output", metadata + visible, true},
+		} {
+			for _, test := range bpsRelayScopeCases {
+				t.Run(reader.name+"/"+prefix.name+"/"+test.name, func(t *testing.T) {
+					response := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(response)
+					c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+					stream := prefix.body + fmt.Sprintf("event: response.failed\ndata: %s\n\n", bpsRelayScopePayload(t, test)) + "data: [DONE]\n\n"
+					upstream := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(stream))}
+					svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}}
+					err := reader.run(svc, c, upstream, &Account{ID: 40445, Platform: PlatformOpenAI, Type: AccountTypeOAuth})
+					if err == nil {
+						t.Fatal("failed response must not be reported as success")
+					}
+					var failover *UpstreamFailoverError
+					wantFailover := test.retryBeforeOutput && !prefix.visible
+					if got := errors.As(err, &failover); got != wantFailover {
+						t.Fatalf("failover = %v, want %v; error: %v", got, wantFailover, err)
+					}
+					if wantFailover {
+						if c.Writer.Written() {
+							t.Fatal("retryable pre-output error committed client response")
+						}
+						return
+					}
+					if !c.Writer.Written() {
+						t.Fatal("terminal error was not sent to client")
+					}
+					failedCount := 0
+					for _, line := range strings.Split(response.Body.String(), "\n") {
+						if !strings.HasPrefix(line, "data: ") {
+							continue
+						}
+						data := strings.TrimPrefix(line, "data: ")
+						if gjson.Get(data, "type").String() != "response.failed" {
+							continue
+						}
+						failedCount++
+						for path, want := range map[string]string{"response.error.code": test.code, "response.error.type": test.kind, "response.error.message": test.message} {
+							if got := gjson.Get(data, path).String(); got != want {
+								t.Fatalf("%s = %q, want %q", path, got, want)
+							}
+						}
+					}
+					if failedCount != 1 {
+						t.Fatalf("response.failed count = %d, want 1; body: %s", failedCount, response.Body.String())
+					}
+					if strings.Contains(response.Body.String(), "Upstream service temporarily unavailable") {
+						t.Fatal("original terminal error replaced with generic error")
+					}
+				})
+			}
+		}
+	}
+}

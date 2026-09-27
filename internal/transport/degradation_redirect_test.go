@@ -16,7 +16,7 @@ func TestDegradationProbeDoesNotFollowRedirectOrRetry(t *testing.T) {
 	var redirected atomic.Int32
 	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		redirected.Add(1)
-		deviceIntegrationResponse(w)
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer destination.Close()
 	for _, code := range []int{301, 302, 303, 307, 308} {

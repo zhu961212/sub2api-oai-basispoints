@@ -99,6 +99,9 @@ func relayJSONValue(raw string, complete bool) (any, int, bool) {
 }
 
 // Unwrap only complete JSON string layers; never recover prose or guess code.
+// The outer arguments can contain the same literal control characters and
+// invalid string escapes as code. Repair those without consuming an unwrap
+// layer, then still require one complete object with no duplicate keys.
 func parseTransportArguments(value any) map[string]any {
 	for depth := 0; depth <= 4; depth++ {
 		if object := objectValue(value); object != nil {
@@ -112,6 +115,12 @@ func parseTransportArguments(value any) map[string]any {
 			return nil
 		}
 		decoded, _, valid := relayJSONValue(raw, true)
+		if !valid {
+			fixed := repairEnvelopeStrings(raw)
+			if fixed != raw {
+				decoded, _, valid = relayJSONValue(fixed, true)
+			}
+		}
 		if !valid {
 			return nil
 		}

@@ -123,9 +123,9 @@ function createPage(options = {}) {
     "select-all-button": "button",
     "degradation-check-button": "button",
     "bps-403-toggle": "button",
-    "bps-device-toggle": "button",
     "degradation-result": "div",
     "account-check-hint": "span",
+    "diagnostic-task-status": "span",
     "retry-button": "button",
   };
   for (const [id, tagName] of Object.entries(tags)) {
@@ -142,7 +142,6 @@ function createPage(options = {}) {
   ids["account-fields"].appendChild(ids["select-all-button"]);
   ids["account-fields"].appendChild(ids["degradation-check-button"]);
   ids["account-fields"].appendChild(ids["bps-403-toggle"]);
-  ids["account-fields"].appendChild(ids["bps-device-toggle"]);
   ids["account-fields"].appendChild(ids["account-list"]);
   ids["account-fields"].appendChild(ids["account-hint"]);
   ids["account-fields"].appendChild(ids["degradation-result"]);
@@ -158,7 +157,7 @@ function createPage(options = {}) {
       { id: 3, name: "Third", schedulable: true },
     ] }),
   };
-  const bridge = {
+  const bridge = options.bridge || {
     hasToken: true,
     supportsScopedTest() { return options.scoped === true; },
     testScoped(config) {
@@ -245,7 +244,6 @@ function createPage(options = {}) {
     selectAll: () => ids["select-all-button"].click(),
     degradationCheck: () => ids["degradation-check-button"].click(),
     toggle403: () => ids["bps-403-toggle"].click(),
-    toggleDevice: () => ids["bps-device-toggle"].click(),
     checkAccount: (accountID) => {
       const button = accountRow(accountID).button;
       assert.ok(button, "Account #" + accountID + " must have its own diagnostic button");
@@ -258,7 +256,7 @@ function createPage(options = {}) {
 }
 
 test("configuration actions work without sandboxed form submission", () => {
-  for (const id of ["save-button", "retry-button", "select-all-button", "bps-403-toggle", "bps-device-toggle"]) {
+  for (const id of ["save-button", "retry-button", "select-all-button", "bps-403-toggle"]) {
     const tag = htmlSource.match(new RegExp("<button\\b[^>]*\\bid=[\"']" + id + "[\"'][^>]*>"));
     assert.ok(tag, id + " exists");
     assert.match(tag[0], /\btype=["']button["']/);
@@ -578,153 +576,17 @@ test("403 auto-disable rejects a dropped setting in save acknowledgement or relo
   }
 });
 
-test("device convergence is opt-in and requires the strict true configuration value", async (t) => {
-  for (const value of [undefined, null, false, 0, 1, "true", true]) {
-    await t.test(String(value), async () => {
-      const page = createPage({ store: { config: { account_ids: [], bps_device_convergence: value } } });
-      assert.equal(page.ids["bps-device-toggle"].disabled, true);
-      page.toggleDevice();
-      await flush();
-      assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(value === true));
-      assert.equal(page.ids["bps-device-toggle"].textContent, "设备收敛：" + (value === true ? "已开启" : "已关闭"));
-      assert.equal(page.calls.save.length, 0);
-    });
-  }
-});
-
-test("device convergence saves on and off across reopen without polling over unsaved changes", async () => {
-  const store = { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2], bps_auto_disable_on_403: false } };
-  const options = { store, getStatus: () => Promise.resolve({ healthy: true, status_json: JSON.stringify({
-    accounts: [1, 2, 3].map((id) => ({ id, schedulable: true })), bps_device_convergence: true,
-  }) }) };
-  let page = createPage(options);
+test("configuration UI no longer exposes device convergence", async () => {
+  assert.doesNotMatch(htmlSource, /bps-device-toggle|bps-device-hint/);
+  assert.doesNotMatch(appSource, /bps_device_convergence/);
+  const page = createPage();
   await flush();
-  assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "false");
-  for (const expected of [true, false]) {
-    page.toggleDevice();
-    assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(expected));
-    assert.match(page.ids["bps-device-toggle"].textContent, /待保存/);
-    assert.equal(page.calls.save.length, 0);
-    page.pollStatus();
-    await flush();
-    assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(expected));
-    assert.match(page.ids["bps-device-toggle"].textContent, /待保存/);
-    page.save();
-    assert.equal(page.ids["bps-device-toggle"].disabled, true);
-    page.ids["bps-device-toggle"].emit("click");
-    await flush();
-    assert.equal(store.config.bps_device_convergence, expected);
-    assert.equal(store.config.bps_auto_disable_on_403, false);
-    assert.deepEqual(page.selected(), [1, 3]);
-    assert.deepEqual(store.config.excluded_account_ids, [2]);
-    assert.match(page.ids["form-hint"].textContent, /已保存/);
-    assert.doesNotMatch(page.ids["bps-device-toggle"].textContent, /待保存/);
-    assert.equal(page.ids["bps-device-toggle"].disabled, false);
-    page = createPage(options);
-    await flush();
-    assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), String(expected));
-  }
+  page.save();
+  await flush();
+  assert.equal(Object.hasOwn(page.calls.save[0], "bps_device_convergence"), false);
+  assert.equal(Object.hasOwn(page.store.config, "bps_device_convergence"), false);
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
-
-test("device convergence rejects unsupported save acknowledgements and read-back values", async (t) => {
-  for (const phase of ["save", "reload"]) {
-    for (const value of [undefined, false, "true", 1]) {
-      await t.test(phase + "/" + String(value), async () => {
-        const tamper = (reply) => {
-          if (value === undefined) delete reply.bps_device_convergence;
-          else reply.bps_device_convergence = value;
-          return reply;
-        };
-        const page = createPage({
-          save(config, store) { store.config = clone(config); return Promise.resolve(phase === "save" ? tamper(clone(config)) : clone(config)); },
-          load(number, store) { const reply = clone(store.config); return Promise.resolve(number > 1 && phase === "reload" ? tamper(reply) : reply); },
-        });
-        await flush();
-        page.toggleDevice();
-        page.save();
-        await flush();
-        assert.match(page.ids["form-hint"].textContent, /设备收敛开关与提交内容不一致/);
-        assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
-        assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "true");
-        assert.match(page.ids["bps-device-toggle"].textContent, /待保存/);
-        assert.equal(page.ids["bps-device-toggle"].disabled, false);
-      });
-    }
-  }
-});
-
-test("disabled device convergence accepts an omitted false value but rejects a true reply", async (t) => {
-  for (const phase of ["save", "reload"]) {
-    for (const unexpectedTrue of [false, true]) {
-      await t.test(phase + "/unexpected_true=" + unexpectedTrue, async () => {
-        const page = createPage({
-          store: { config: { account_ids: [], bps_device_convergence: true } },
-          save(config, store) {
-            store.config = clone(config);
-            delete store.config.bps_device_convergence;
-            const reply = clone(store.config);
-            if (phase === "save" && unexpectedTrue) reply.bps_device_convergence = true;
-            return Promise.resolve(reply);
-          },
-          load(number, store) {
-            const reply = clone(store.config);
-            if (number > 1 && phase === "reload" && unexpectedTrue) reply.bps_device_convergence = true;
-            return Promise.resolve(reply);
-          },
-        });
-        await flush();
-        page.toggleDevice();
-        page.save();
-        await flush();
-        assert.equal(page.calls.save[0].bps_device_convergence, false);
-        assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "false");
-        if (unexpectedTrue) {
-          assert.match(page.ids["form-hint"].textContent, /设备收敛开关与提交内容不一致/);
-        } else {
-          assert.match(page.ids["form-hint"].textContent, /已保存/);
-          assert.doesNotMatch(page.ids["bps-device-toggle"].textContent, /待保存/);
-          const reopened = createPage({ store: page.store });
-          await flush();
-          assert.equal(reopened.ids["bps-device-toggle"].getAttribute("aria-pressed"), "false");
-        }
-      });
-    }
-  }
-});
-
-test("failed device convergence saves preserve the user's pending setting and unlock controls", async (t) => {
-  for (const phase of ["save", "reload"]) {
-    await t.test(phase, async () => {
-      const page = createPage({
-        save(config, store) {
-          if (phase === "save") return Promise.reject(new Error("save unavailable"));
-          store.config = clone(config);
-          return Promise.resolve(clone(config));
-        },
-        load(number, store) { return number > 1 && phase === "reload" ? Promise.reject(new Error("reload unavailable")) : Promise.resolve(clone(store.config)); },
-      });
-      await flush();
-      page.toggleDevice();
-      page.save();
-      await flush();
-      assert.match(page.ids["form-hint"].textContent, /失败|未确认/);
-      assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "true");
-      assert.match(page.ids["bps-device-toggle"].textContent, /待保存/);
-      assert.equal(page.ids["bps-device-toggle"].disabled, false);
-    });
-  }
-});
-
-
-
-
-
-
-
-
-
-
-
 
 test("ordinary saves discard a stale single-account diagnostic selector", async () => {
   const page = createPage({ store: { config: { account_ids: [1], degradation_check: true, degradation_check_account_id: 2 } } });
@@ -840,7 +702,7 @@ test("selected accounts save on click, persist on read-back, and survive reopeni
   assert.equal(page.calls.load, 2, "Saving must confirm the persisted host configuration");
   const submitted = clone(page.calls.save[0]);
   submitted.account_ids.sort((a, b) => a - b);
-  assert.deepEqual(submitted, { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false, bps_auto_disable_on_403: true, bps_device_convergence: false });
+  assert.deepEqual(submitted, { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3], enabled_models: defaultModels, timeout_seconds: 123, rewrite_tools: false, bps_auto_disable_on_403: true });
   assert.deepEqual(page.selected(), [1, 2]);
   assert.match(page.ids["form-hint"].textContent, /已保存/);
   assert.equal(page.ids["account-fields"].disabled, false);
@@ -983,7 +845,7 @@ test("automatic images need no configuration controls", async () => {
   await flush();
   page.save();
   await flush();
-  assert.deepEqual(page.calls.save[0], { account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels, bps_auto_disable_on_403: true, bps_device_convergence: false });
+  assert.deepEqual(page.calls.save[0], { account_ids: [1, 2, 3], auto_select_new_accounts: true, excluded_account_ids: [], enabled_models: defaultModels, bps_auto_disable_on_403: true });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
@@ -1027,7 +889,7 @@ test("a rejected save preserves account edits for retry", async () => {
   page.save();
   await flush();
   assert.equal(page.calls.save.length, 2);
-  assert.deepEqual(page.store.config, { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels, bps_auto_disable_on_403: true, bps_device_convergence: false });
+  assert.deepEqual(page.store.config, { account_ids: [1], auto_select_new_accounts: true, excluded_account_ids: [2, 3], enabled_models: defaultModels, bps_auto_disable_on_403: true });
   assert.match(page.ids["form-hint"].textContent, /已保存/);
 });
 
@@ -1693,11 +1555,21 @@ function createBridgeHarness(options = {}) {
   const sent = [];
   const timers = new Map();
   let nextID = 0;
-  const parent = { postMessage(data, targetOrigin) { sent.push({ data: clone(data), targetOrigin }); } };
+  function deliver(request, overrides = {}, source = parent) {
+    const data = Object.assign({ source: "sub2api-plugin-host", bridge_token: "trusted-token", request_id: request.request_id, ok: true }, overrides);
+    for (const listener of listeners) listener({ source, data });
+  }
+  const parent = { postMessage(data, targetOrigin) {
+    sent.push({ data: clone(data), targetOrigin });
+    if (data.request_id && options.onRequest) {
+      const response = options.onRequest(clone(data));
+      if (response !== undefined) Promise.resolve(response).then(value => deliver(data, value));
+    }
+  } };
   const window = {
     parent,
     location: { hash: options.hash === undefined ? "#bridge_token=trusted-token" : options.hash },
-    crypto: { randomUUID: () => "request-" + (++nextID) },
+    crypto: { randomUUID: () => (options.idPrefix || "request-") + (++nextID) },
     addEventListener(type, callback) { assert.equal(type, "message"); listeners.add(callback); },
     removeEventListener(type, callback) { assert.equal(type, "message"); listeners.delete(callback); },
     setTimeout(callback, delay) { const id = ++nextID; timers.set(id, { callback, delay }); return id; },
@@ -1710,8 +1582,7 @@ function createBridgeHarness(options = {}) {
     reply(overrides = {}, source = parent) {
       assert.ok(sent.length, "A pending bridge request must have been posted");
       const request = sent[sent.length - 1].data;
-      const data = Object.assign({ source: "sub2api-plugin-host", bridge_token: "trusted-token", request_id: request.request_id, ok: true }, overrides);
-      for (const listener of listeners) listener({ source, data });
+      deliver(request, overrides, source);
     },
     expire() {
       for (const [id, timer] of [...timers]) {
@@ -1722,11 +1593,412 @@ function createBridgeHarness(options = {}) {
   };
 }
 
-test("Bridge v1 concurrent configuration pages never save or dispatch account tests", async (t) => {
+function createTaskServer(options = {}) {
+  const server = {
+    store: options.store || { config: { account_ids: [1] } }, ownerID: "instance-a",
+    tasks: new Map(), commands: [], diagnostics: 0, ordinarySaves: [], legacyTests: 0,
+    prepareMode: options.prepareMode, commitMode: options.commitMode, statusError: false,
+    verdicts: options.verdicts || {}, statusDetails: options.statusDetails || {},
+    complete(task) {
+      const result = scopedResult(task.config, server.verdicts);
+      const details = JSON.parse(result.status_json);
+      details.degradation_check.request_id = task.task_id;
+      result.status_json = JSON.stringify(details);
+      task.state = "completed";
+      task.result = result;
+    },
+    handle(request) {
+      if (request.type === "config.load") return { config: clone(server.store.config) };
+      if (request.type === "plugin.status") {
+        if (server.statusError) return { ok: false, error: "status unavailable" };
+        const busy = [...server.tasks.values()].some(task => ["prepared", "queued", "running", "unknown"].includes(task.state));
+        return { result: { healthy: true, status_json: JSON.stringify({
+          accounts: [1, 2, 3].map(id => ({ id, name: "Account " + id, schedulable: true })),
+          ...server.statusDetails,
+          diagnostic_tasks: { protocol: "config-job-v1", owner_id: server.ownerID, available: true,
+            error: busy ? "另一个检测任务正在执行或等待确认" : undefined,
+            tasks: [...server.tasks.values()].map(task => ({ task_id: task.task_id, state: task.state,
+              receipt: task.state === "prepared" && server.prepareMode !== "missing-receipt" ? task.receipt : undefined,
+              result: task.result, error: task.error })) },
+        }) } };
+      }
+      if (request.type === "config.test" || request.type === "config.testScoped") {
+        server.legacyTests++;
+        return { ok: false, error: "unexpected host test" };
+      }
+      if (request.type !== "config.save") return {};
+      const command = request.config.diagnostic_task;
+      if (!command) {
+        server.ordinarySaves.push(clone(request.config));
+        server.store.config = clone(request.config);
+        return { config: clone(server.store.config) };
+      }
+      assert.deepEqual(Object.keys(request.config), ["diagnostic_task"]);
+      server.commands.push(clone(command));
+      if (command.owner_id !== server.ownerID) return { ok: false, error: "owner mismatch" };
+      if (command.action === "prepare") {
+        assert.equal(server.tasks.has(command.task_id), false, "prepare must never be retried");
+        const task = { task_id: command.task_id, state: "prepared", receipt: "receipt-" + command.task_id, config: clone(command.config) };
+        if (server.prepareMode !== "unknown") server.tasks.set(task.task_id, task);
+        if (server.prepareMode === "reject" || server.prepareMode === "unknown") return { ok: false, error: "prepare acknowledgement lost" };
+        if (server.prepareMode === "invalid-ack") return { config: null };
+        if (server.prepareMode === "timeout") return undefined;
+        return { config: clone(server.store.config) };
+      }
+      assert.equal(command.action, "commit");
+      const task = server.tasks.get(command.task_id);
+      assert.ok(task);
+      assert.equal(command.receipt, task.receipt);
+      assert.equal(command.config, undefined);
+      if (server.commitMode === "prepared") return { ok: false, error: "commit was not confirmed" };
+      server.diagnostics++;
+      if (server.commitMode === "running" || server.commitMode === "unknown") task.state = server.commitMode;
+      else server.complete(task);
+      if (server.commitMode === "timeout-completed") return undefined;
+      if (server.commitMode === "error-completed" || server.commitMode === "unknown") return { ok: false, error: "commit acknowledgement lost" };
+      return { config: clone(server.store.config) };
+    },
+  };
+  return server;
+}
+
+function taskHost(server, options = {}) {
+  return createBridgeHarness({ onRequest: request => server.handle(request), ...options });
+}
+
+test("unpatched hosts run a single diagnostic through command-only saves without replacing the form", async () => {
+  const server = createTaskServer();
+  const before = clone(server.store.config);
+  const host = taskHost(server);
+  const page = createPage({ bridge: host.bridge });
+  await flush();
+  assert.equal(host.bridge.supportsScopedTest(), false);
+  assert.equal(page.accountRow(2).button.disabled, false);
+  assert.match(page.ids["account-check-hint"].textContent, /无需修改宿主/);
+  page.check(2, true);
+  page.checkModel("gpt-6-sol", true);
+  page.checkAccount(2);
+  await flush();
+  assert.deepEqual(server.commands.map(command => command.action), ["prepare", "commit"]);
+  assert.equal(server.commands[0].config.degradation_check_account_id, 2);
+  assert.ok(server.commands[0].config.enabled_models.includes("gpt-6-sol"));
+  assert.equal(Object.hasOwn(server.commands[0].config, "bps_device_convergence"), false);
+  assert.deepEqual(server.store.config, before);
+  assert.deepEqual(page.selected(), [1, 2]);
+  assert.ok(page.selectedModels().includes("gpt-6-sol"));
+  assert.match(page.accountRow(2).result.textContent, /符合检测规则/);
+  assert.equal(server.diagnostics, 1);
+  assert.equal(server.legacyTests, 0);
+  assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+  assert.equal(page.ids["diagnostic-task-status"].hidden, false);
+  assert.ok(page.ids["diagnostic-task-status"].textContent.includes(server.commands[0].task_id));
+  assert.match(page.ids["diagnostic-task-status"].textContent, /已完成/);
+});
+
+test("unpatched hosts select completed bulk results locally and require an ordinary save", async () => {
+  const server = createTaskServer({ store: { config: { account_ids: [1, 3, 99] } }, verdicts: {
+    2: { status: "degraded", answer: "苹果16" }, 3: { status: "error", answer: "", error: "HTTP 429" },
+  } });
+  const page = createPage({ bridge: taskHost(server).bridge });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.deepEqual(server.commands[0].config.degradation_check_account_ids, [1, 2, 3]);
+  assert.deepEqual(page.selected(), [2, 3]);
+  assert.deepEqual(server.store.config.account_ids, [1, 3, 99]);
+  assert.match(page.ids["form-hint"].textContent, /保存后生效/);
+  page.save();
+  await flush();
+  assert.deepEqual(server.store.config.account_ids.sort((a, b) => a - b), [2, 3, 99]);
+  assert.equal(server.ordinarySaves.length, 1);
+  assert.equal(server.store.config.diagnostic_task, undefined);
+  assert.equal(server.legacyTests, 0);
+});
+
+test("compatible detection preserves unsaved 403 restores and model and routing edits", async () => {
+  const server = createTaskServer({ statusDetails: JSON.parse(bpsStatus([[2, bpsBlockA]]).status_json),
+    store: { config: { account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2] } } });
+  const page = createPage({ bridge: taskHost(server).bridge });
+  await flush();
+  page.check(2, true);
+  page.check(3, false);
+  page.toggle403();
+  page.checkAccount(1);
+  await flush();
+  assert.deepEqual(page.selected(), [1, 2]);
+  assert.ok(!server.commands[0].config.bps_reenabled_accounts || !server.commands[0].config.bps_reenabled_accounts[2]);
+  assert.match(page.accountRow(2).availability.textContent, /待恢复/);
+  assert.equal(page.ids["bps-403-toggle"].getAttribute("aria-pressed"), "false");
+  assert.equal(server.store.config.bps_reenabled_accounts, undefined);
+  assert.deepEqual(server.store.config.account_ids, [1, 3]);
+});
+
+test("two compatible pages respect a busy instance and never dispatch another task", async () => {
+  const server = createTaskServer({ commitMode: "running" });
+  const firstHost = taskHost(server, { idPrefix: "first-" });
+  const first = createPage({ bridge: firstHost.bridge });
+  await flush();
+  first.checkAccount(1);
+  await flush();
+  const secondHost = taskHost(server, { idPrefix: "second-" });
+  const second = createPage({ bridge: secondHost.bridge });
+  await flush();
+  assert.equal(second.accountRow(2).button.disabled, true);
+  assert.match(second.ids["account-check-hint"].textContent, /另一个检测任务/);
+  second.accountRow(2).button.emit("click");
+  await flush();
+  assert.equal(server.commands.length, 2);
+  assert.equal(server.diagnostics, 1);
+  server.complete([...server.tasks.values()][0]);
+  firstHost.expire();
+  await flush();
+  assert.equal(firstHost.bridge.hasPendingDiagnosticTask(), false);
+  second.pollStatus();
+  await flush();
+  assert.equal(second.accountRow(2).button.disabled, false);
+  assert.equal(server.legacyTests, 0);
+});
+
+test("lost or invalid prepare acknowledgements never auto-commit and retain a query-only task", async t => {
+  for (const prepareMode of ["reject", "invalid-ack", "unknown", "timeout"]) {
+    await t.test(prepareMode, async () => {
+      const server = createTaskServer({ prepareMode });
+      const host = taskHost(server);
+      const page = createPage({ bridge: host.bridge });
+      await flush();
+      page.checkAccount(1);
+      await flush();
+      if (prepareMode === "timeout") { host.expire(); await flush(); }
+      assert.equal(server.commands.length, 1);
+      assert.equal(server.diagnostics, 0);
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+      assert.equal(page.accountRow(2).button.disabled, true);
+      assert.equal(page.ids["degradation-check-button"].textContent, "继续查询上次检测");
+      assert.match(page.ids["form-hint"].textContent, /继续查询/);
+      page.degradationCheck();
+      await flush();
+      assert.equal(server.commands.length, 1);
+      assert.equal(server.diagnostics, 0);
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+      if (prepareMode !== "unknown") {
+        [...server.tasks.values()][0].state = "expired";
+        page.degradationCheck();
+        await flush();
+        assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+        assert.equal(page.ids["degradation-check-button"].textContent, "一键检测降智账号");
+      }
+    });
+  }
+});
+
+test("missing preparation receipts require a later query before a single commit", async () => {
+  const server = createTaskServer({ prepareMode: "missing-receipt" });
+  const host = taskHost(server);
+  const page = createPage({ bridge: host.bridge });
+  await flush();
+  page.checkAccount(1);
+  await flush();
+  assert.equal(server.commands.length, 1);
+  assert.equal(server.diagnostics, 0);
+  assert.match(page.ids["form-hint"].textContent, /准备回执/);
+  server.prepareMode = undefined;
+  page.degradationCheck();
+  await flush();
+  assert.equal(server.commands.length, 2);
+  assert.equal(server.diagnostics, 1);
+  assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+});
+
+test("lost commit acknowledgements recover completed results without resubmitting", async t => {
+  for (const commitMode of ["error-completed", "timeout-completed"]) {
+    await t.test(commitMode, async () => {
+      const server = createTaskServer({ commitMode });
+      const host = taskHost(server);
+      const page = createPage({ bridge: host.bridge });
+      await flush();
+      page.checkAccount(2);
+      await flush();
+      if (commitMode === "timeout-completed") { host.expire(); await flush(); }
+      assert.equal(server.commands.length, 2);
+      assert.equal(server.diagnostics, 1);
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+      assert.match(page.accountRow(2).result.textContent, /符合检测规则/);
+      assert.deepEqual(page.selected(), [1]);
+    });
+  }
+});
+
+test("unknown commit outcomes survive passive polling and ordinary saves and never retry writes", async t => {
+  for (const commitMode of ["unknown", "prepared"]) {
+    await t.test(commitMode, async () => {
+      const server = createTaskServer({ commitMode });
+      const host = taskHost(server);
+      const page = createPage({ bridge: host.bridge });
+      await flush();
+      page.checkAccount(1);
+      await flush();
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+      page.check(2, true);
+      page.checkModel("gpt-6-sol", true);
+      page.pollStatus();
+      page.save();
+      await flush();
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+      assert.deepEqual(server.store.config.account_ids, [1, 2]);
+      assert.ok(server.store.config.enabled_models.includes("gpt-6-sol"));
+      assert.equal(page.ids["degradation-check-button"].textContent, "继续查询上次检测");
+      page.degradationCheck();
+      await flush();
+      assert.equal(server.commands.length, 2);
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+      assert.equal(page.accountRow(2).button.disabled, true);
+      const task = [...server.tasks.values()][0];
+      if (commitMode === "unknown") server.complete(task);
+      else task.state = "expired";
+      page.degradationCheck();
+      await flush();
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+      assert.equal(server.commands.length, 2);
+      assert.deepEqual(page.selected(), [1, 2]);
+    });
+  }
+});
+
+test("owner changes and invalid results stay tied to the original task and target snapshot", async t => {
+  for (const failure of ["owner", "request-id", "targets", "duplicate-results", "missing-results"]) {
+    await t.test(failure, async () => {
+      const server = createTaskServer({ commitMode: "running" });
+      const host = taskHost(server);
+      const page = createPage({ bridge: host.bridge });
+      await flush();
+      page.degradationCheck();
+      await flush();
+      const task = [...server.tasks.values()][0];
+      server.complete(task);
+      if (failure === "owner") server.ownerID = "instance-b";
+      else {
+        const details = JSON.parse(task.result.status_json);
+        if (failure === "request-id") details.degradation_check.request_id = "another-task";
+        if (failure === "targets") details.degradation_check.target_account_ids = [1, 2, 99];
+        if (failure === "duplicate-results") details.degradation_check.results[1] = details.degradation_check.results[0];
+        if (failure === "missing-results") details.degradation_check.results = [];
+        task.result.status_json = JSON.stringify(details);
+      }
+      host.expire();
+      await flush();
+      assert.deepEqual(page.selected(), [1]);
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+      assert.match(page.ids["form-hint"].textContent, /实例已改变|不匹配/);
+      page.degradationCheck();
+      await flush();
+      assert.equal(server.commands.length, 2);
+      assert.equal(server.diagnostics, 1);
+      server.ownerID = "instance-a";
+      server.complete(task);
+      page.degradationCheck();
+      await flush();
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+    });
+  }
+});
+
+test("poll exhaustion retains a resumable task and unloading cancels all pending polls", async () => {
+  const server = createTaskServer({ commitMode: "running" });
+  const host = taskHost(server, { settings: { diagnosticMaxPolls: 1 } });
+  const page = createPage({ bridge: host.bridge });
+  await flush();
+  page.checkAccount(1);
+  await flush();
+  host.expire();
+  await flush();
+  assert.equal(host.timers.size, 0);
+  assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+  assert.match(page.ids["form-hint"].textContent, /轮询已结束/);
+  page.degradationCheck();
+  await flush();
+  assert.equal(host.timers.size, 1);
+  page.unload();
+  await flush();
+  assert.equal(host.timers.size, 0);
+  const requests = host.sent.length;
+  host.expire();
+  await flush();
+  assert.equal(host.sent.length, requests);
+  assert.equal(server.commands.length, 2);
+});
+
+test("owner replacement after preparation cannot commit on another runtime", async () => {
+  const server = createTaskServer();
+  const host = createBridgeHarness({ onRequest(request) {
+    const response = server.handle(request);
+    if (request.config && request.config.diagnostic_task && request.config.diagnostic_task.action === "prepare") {
+      server.ownerID = "replacement-instance";
+    }
+    return response;
+  } });
+  const page = createPage({ bridge: host.bridge });
+  await flush();
+  page.checkAccount(1);
+  await flush();
+  assert.equal(server.commands.length, 1);
+  assert.equal(server.diagnostics, 0);
+  assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+  assert.match(page.ids["form-hint"].textContent, /实例已改变/);
+  page.degradationCheck();
+  await flush();
+  assert.equal(server.commands.length, 1);
+});
+
+test("status failures before prepare write nothing and failures after commit retain the same task", async t => {
+  for (const phase of ["preflight", "after-commit"]) {
+    await t.test(phase, async () => {
+      const server = createTaskServer();
+      const host = createBridgeHarness({ onRequest(request) {
+        const response = server.handle(request);
+        if (phase === "after-commit" && request.config && request.config.diagnostic_task && request.config.diagnostic_task.action === "commit") {
+          server.statusError = true;
+        }
+        return response;
+      } });
+      const page = createPage({ bridge: host.bridge });
+      await flush();
+      if (phase === "preflight") server.statusError = true;
+      page.checkAccount(1);
+      await flush();
+      assert.equal(server.commands.length, phase === "preflight" ? 0 : 2);
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), phase !== "preflight");
+      server.statusError = false;
+      if (phase === "after-commit") {
+        page.degradationCheck();
+        await flush();
+        assert.equal(server.commands.length, 2);
+        assert.equal(server.diagnostics, 1);
+        assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+      }
+    });
+  }
+});
+
+test("loading stale diagnostic commands never replays them and an ordinary save strips them", async () => {
+  const server = createTaskServer({ store: { config: { account_ids: [1], diagnostic_task: {
+    protocol: "config-job-v1", action: "commit", owner_id: "stale-owner", task_id: "stale-task", receipt: "stale-receipt",
+  } } } });
+  const page = createPage({ bridge: taskHost(server).bridge });
+  await flush();
+  assert.equal(server.commands.length, 0);
+  assert.equal(server.diagnostics, 0);
+  page.save();
+  await flush();
+  assert.equal(server.commands.length, 0);
+  assert.equal(server.store.config.diagnostic_task, undefined);
+  assert.match(page.ids["form-hint"].textContent, /已保存/);
+});
+
+test("hosts without either scoped support or plugin task capability never dispatch account tests", async (t) => {
   for (const markers of [{}, { degradation_check: true, degradation_check_account_id: 1 }]) {
     await t.test(JSON.stringify(markers), async () => {
       const store = { config: { account_ids: [1, 2], auto_select_new_accounts: true,
-        bps_auto_disable_on_403: false, bps_device_convergence: true, ...markers } };
+        bps_auto_disable_on_403: false, ...markers } };
       const before = clone(store.config);
       const dispatched = [];
       const options = { store, test: (_n, shared) => {
@@ -1761,16 +2033,15 @@ test("Bridge v1 concurrent configuration pages never save or dispatch account te
   }
 });
 
-test("blocked diagnostics preserve unsaved route and device edits and explicit restores", async () => {
+test("blocked diagnostics preserve unsaved route and policy edits and explicit restores", async () => {
   const page = createPage({ status: bpsStatus([[2, bpsBlockA]]), store: { config: {
     account_ids: [1, 3], auto_select_new_accounts: true, excluded_account_ids: [2],
-    bps_reenabled_accounts: { 88: bpsBlockB }, bps_device_convergence: false,
+    bps_reenabled_accounts: { 88: bpsBlockB },
   } } });
   await flush();
   const before = clone(page.store.config);
   page.check(2, true);
   page.check(3, false);
-  page.toggleDevice();
   page.toggle403();
   page.accountRow(1).button.emit("click");
   await flush();
@@ -1779,7 +2050,6 @@ test("blocked diagnostics preserve unsaved route and device edits and explicit r
   assert.equal(page.calls.test, 0);
   assert.deepEqual(page.selected(), [1, 2]);
   assert.match(page.accountRow(2).availability.textContent, /待恢复/);
-  assert.equal(page.ids["bps-device-toggle"].getAttribute("aria-pressed"), "true");
   assert.equal(page.ids["bps-403-toggle"].getAttribute("aria-pressed"), "false");
   page.save();
   await flush();
@@ -1848,7 +2118,7 @@ test("scoped bridge requires advertised support and correlates the diagnostic re
   assert.equal(host.bridge.supportsScopedTest(), false);
 });
 
-test("Bridge v1 documents its account test limitation while retaining ordinary testing", async () => {
+test("Bridge v1 keeps account tasks capability-gated while retaining ordinary testing", async () => {
   const host = createBridgeHarness();
   assert.match(host.bridge.accountCheckUnavailableReason, /原子绑定检测账号/);
   assert.equal(host.bridge.supportsScopedTest(), false);

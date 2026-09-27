@@ -238,6 +238,12 @@ func (u *Uploader) Rewrite(ctx context.Context, client *http.Client, responsesUR
 func (u *Uploader) cached(key [32]byte) string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	return u.cachedLocked(key)
+}
+
+// cachedLocked requires u.mu. Keep lookup, expiry, and recency updates atomic
+// with pending-upload registration so misses do not need a second lookup.
+func (u *Uploader) cachedLocked(key [32]byte) string {
 	entry, ok := u.cache[key]
 	if !ok {
 		return ""
@@ -263,14 +269,10 @@ func (u *Uploader) getOrUploadAttempt(ctx context.Context, key [32]byte, reusabl
 	if !reusable {
 		return upload()
 	}
-	if id := u.cached(key); id != "" {
-		return id, nil
-	}
 	u.mu.Lock()
-	// Another upload can finish between cached() and this lock.
-	if entry, ok := u.cache[key]; ok && u.now().Before(entry.expires) {
+	if id := u.cachedLocked(key); id != "" {
 		u.mu.Unlock()
-		return entry.fileID, nil
+		return id, nil
 	}
 	if pending := u.pending[key]; pending != nil {
 		u.mu.Unlock()
@@ -303,20 +305,24 @@ func (u *Uploader) getOrUploadAttempt(ctx context.Context, key [32]byte, reusabl
 	delete(u.pending, key)
 	if err == nil {
 		now := u.now()
-		for key, value := range u.cache {
-			if !now.Before(value.expires) {
-				delete(u.cache, key)
-			}
-		}
+		// Expired entries are rejected on lookup. Reclaim unrelated expired
+		// metadata only when space is needed, rather than scanning the whole
+		// cache after every upload. One pass also finds the oldest live entry.
 		if len(u.cache) >= maxCacheEntries {
 			var oldest [32]byte
 			oldestUsed := ^uint64(0)
 			for key, value := range u.cache {
+				if !now.Before(value.expires) {
+					delete(u.cache, key)
+					continue
+				}
 				if value.used < oldestUsed {
 					oldest, oldestUsed = key, value.used
 				}
 			}
-			delete(u.cache, oldest)
+			if len(u.cache) >= maxCacheEntries {
+				delete(u.cache, oldest)
+			}
 		}
 		u.sequence++
 		u.cache[key] = cacheEntry{fileID: id, expires: now.Add(cacheTTL), used: u.sequence}

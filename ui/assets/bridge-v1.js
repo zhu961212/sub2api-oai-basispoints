@@ -47,6 +47,12 @@
     var pending = new Map();
     var disposed = false;
     var scopedTestsAvailable = false;
+    var diagnosticInfo = null;
+    var diagnosticTask = null;
+    var diagnosticOperation = null;
+    var diagnosticWaiters = new Map();
+    var diagnosticPollMs = settings.diagnosticPollMs || 1000;
+    var diagnosticMaxPolls = settings.diagnosticMaxPolls || 150;
 
     function onMessage(event) {
       if (disposed) {
@@ -130,14 +136,155 @@
       return response.config;
     }
 
+    function readDiagnosticInfo(result) {
+      var details;
+      try { details = result && typeof result.status_json === "string" ? JSON.parse(result.status_json) : null; }
+      catch (_error) { details = null; }
+      var info = details && details.diagnostic_tasks;
+      diagnosticInfo = info && info.protocol === "config-job-v1" &&
+        typeof info.owner_id === "string" && info.owner_id ? info : null;
+      return diagnosticInfo;
+    }
+
+    function readStatus() {
+      return request("plugin.status").then(function (response) {
+        var result = response.result && typeof response.result === "object" ? response.result : {};
+        readDiagnosticInfo(result);
+        return result;
+      });
+    }
+
+    function diagnosticBusyReason(info) {
+      var busy = info && Array.isArray(info.tasks) && info.tasks.some(function (entry) {
+        return entry && (entry.state === "prepared" || entry.state === "queued" || entry.state === "running");
+      });
+      return busy ? "当前插件实例已有检测任务正在准备、排队或执行，请稍后查询状态" : "";
+    }
+
+    function pendingDiagnosticError(message) {
+      var error = new Error(message);
+      error.diagnosticPending = !!diagnosticTask;
+      return error;
+    }
+
+    function diagnosticDelay() {
+      return new Promise(function (resolve, reject) {
+        if (disposed) { reject(new Error("配置页已关闭")); return; }
+        var timer = global.setTimeout(function () { diagnosticWaiters.delete(timer); resolve(); }, diagnosticPollMs);
+        diagnosticWaiters.set(timer, reject);
+      });
+    }
+
+    function notifyDiagnosticTask(task, state) {
+      if (!disposed && typeof settings.onDiagnosticTask === "function") {
+        settings.onDiagnosticTask({ task_id: task.taskID, owner_id: task.ownerID, state: state });
+      }
+    }
+
+    function queryDiagnosticTask(task) {
+      return readStatus().then(function (snapshot) {
+        var info = readDiagnosticInfo(snapshot);
+        if (!info || info.owner_id !== task.ownerID) {
+          throw pendingDiagnosticError("检测运行实例已改变或暂不可达，原任务结果未确认；仅可继续查询");
+        }
+        var matches = (Array.isArray(info.tasks) ? info.tasks : []).filter(function (entry) {
+          return entry && entry.task_id === task.taskID;
+        });
+        if (matches.length !== 1) throw pendingDiagnosticError("尚未查询到唯一的检测任务回执，结果未确认；仅可继续查询");
+        notifyDiagnosticTask(task, matches[0].state);
+        return matches[0];
+      });
+    }
+
+    function verifiedDiagnosticResult(task, entry) {
+      var result = entry.result;
+      var details;
+      try { details = result && typeof result.status_json === "string" ? JSON.parse(result.status_json) : null; }
+      catch (_error) { details = null; }
+      var check = details && details.degradation_check;
+      var targets = check && check.target_account_ids;
+      var rows = check && check.results;
+      var expected = new Set(task.targets);
+      if (!check || check.request_id !== task.taskID || !Array.isArray(targets) ||
+          targets.length !== task.targets.length || new Set(targets).size !== targets.length ||
+          targets.some(function (value) { return !expected.has(value); }) || !Array.isArray(rows) ||
+          rows.length !== task.targets.length || new Set(rows.map(function (row) { return row && row.account_id; })).size !== rows.length ||
+          rows.some(function (row) { return !row || !expected.has(row.account_id); })) {
+        throw pendingDiagnosticError("检测结果与本次任务或账号快照不匹配，保留原账号选择；仅可继续查询");
+      }
+      diagnosticTask = null;
+      return result;
+    }
+
+    function followDiagnosticTask(task, entry, polls) {
+      if (polls === 0) task.pollDeadline = Date.now() + 150000;
+      if (entry.state === "completed" || entry.state === "failed") {
+        if (entry.result) return verifiedDiagnosticResult(task, entry);
+        if (entry.state === "failed") {
+          diagnosticTask = null;
+          throw new Error(entry.error || "插件已确认检测任务失败，账号选择未改变");
+        }
+        throw pendingDiagnosticError("检测已结束但未返回可验证的结果；仅可继续查询");
+      }
+      if (entry.state === "expired") {
+        diagnosticTask = null;
+        throw new Error("检测任务已过期，未取得可验证结果；可重新发起检测");
+      }
+      if (entry.state !== "queued" && entry.state !== "running") {
+        throw pendingDiagnosticError(entry.state === "prepared"
+          ? "检测提交未确认，任务仍处于准备状态；仅继续查询，等待任务过期后再试"
+          : "检测任务状态未知，可能已提交；仅可继续查询，不能重复发起");
+      }
+      if (polls >= diagnosticMaxPolls || Date.now() >= task.pollDeadline) throw pendingDiagnosticError("检测仍在执行或排队，当前轮询已结束；点击继续查询，不会重复提交");
+      return diagnosticDelay().then(function () { return queryDiagnosticTask(task); })
+        .then(function (next) { return followDiagnosticTask(task, next, polls + 1); });
+    }
+
+    function saveDiagnosticCommand(task, action, receipt) {
+      notifyDiagnosticTask(task, action === "prepare" ? "preparing" : "committing");
+      var command = { protocol: "config-job-v1", action: action, owner_id: task.ownerID, task_id: task.taskID };
+      if (action === "prepare") command.config = task.config;
+      else command.receipt = receipt;
+      // The outer config is command-only. The plugin preserves production
+      // config; the response must never replace this page's unsaved form.
+      return request("config.save", { config: { diagnostic_task: command } }, STEP_UP_TIMEOUT_MS).then(readConfigResponse);
+    }
+
+    function commitDiagnosticTask(task, entry) {
+      if (entry.state !== "prepared" || typeof entry.receipt !== "string" || !entry.receipt) {
+        if (entry.state === "failed" || entry.state === "expired") return followDiagnosticTask(task, entry, 0);
+        throw pendingDiagnosticError("插件尚未返回有效的准备回执；仅可继续查询");
+      }
+      task.commitSent = true;
+      return saveDiagnosticCommand(task, "commit", entry.receipt).catch(function () {
+        // An error/timeout does not prove rejection. Query; never resend.
+      }).then(function () { return queryDiagnosticTask(task); })
+        .then(function (next) { return followDiagnosticTask(task, next, 0); });
+    }
+
+    function runDiagnosticOperation(work) {
+      if (diagnosticOperation) return Promise.reject(new Error("正在查询检测任务，请等待当前操作结束"));
+      var operation = Promise.resolve().then(work).catch(function (error) {
+        if (diagnosticTask) {
+          error.diagnosticPending = true;
+          notifyDiagnosticTask(diagnosticTask, "unknown");
+        }
+        throw error;
+      });
+      diagnosticOperation = operation;
+      return operation.then(function (result) { diagnosticOperation = null; return result; }, function (error) {
+        diagnosticOperation = null; throw error;
+      });
+    }
+
     return {
       token: token,
       // hasToken 为 false 时说明 URL fragment 里没有 bridge_token，
       // 宿主会静默丢弃消息，此时只能提示用户从插件管理页重新打开配置。
       hasToken: token !== "",
-      // UI Bridge v1 tests shared saved config, not a request-local target.
-      // Never implement account diagnostics as saveConfig followed by testConfig.
-      accountCheckUnavailableReason: "当前宿主未提供原子绑定检测账号的接口，单账号和批量检测已暂停。请同步升级配套宿主和插件后重新打开配置页。账号状态查询、路由保存和宿主连通性测试仍可使用。",
+      // Legacy config.test uses shared saved config. Account diagnostics use
+      // scoped requests or command-only plugin tasks, never save + config.test.
+      accountCheckUnavailableReason: "尚未确认可原子绑定检测账号的插件任务能力，账号检测已暂停。请更新插件并重新打开配置页；无需修改宿主。账号状态查询和路由保存仍可使用。",
       ready: function () {
         post("sub2api.plugin.ready");
       },
@@ -149,6 +296,53 @@
         });
       },
       supportsScopedTest: function () { return scopedTestsAvailable; },
+      onDiagnosticTask: function (listener) { settings.onDiagnosticTask = listener; },
+      supportsDiagnosticTasks: function () { return !!diagnosticInfo && diagnosticInfo.available === true && !diagnosticBusyReason(diagnosticInfo); },
+      diagnosticTaskInfo: function () {
+        return diagnosticInfo && Object.assign({}, diagnosticInfo, { error: diagnosticInfo.error || diagnosticBusyReason(diagnosticInfo) });
+      },
+      hasPendingDiagnosticTask: function () { return !!diagnosticTask; },
+      testDiagnosticTask: function (config) {
+        if (diagnosticTask) return Promise.reject(pendingDiagnosticError("上次检测结果未确认，请先继续查询"));
+        return runDiagnosticOperation(function () {
+          return readStatus().then(function (snapshot) {
+            var info = readDiagnosticInfo(snapshot);
+            if (!info || info.available !== true) {
+              throw new Error(info && info.error || "插件任务能力尚不可用，请稍后刷新状态");
+            }
+            if (diagnosticBusyReason(info)) throw new Error(diagnosticBusyReason(info));
+            var singleID = config && config.degradation_check_account_id;
+            var targets = singleID ? [singleID] : config && config.degradation_check_account_ids;
+            if (!Array.isArray(targets) || !targets.length || new Set(targets).size !== targets.length ||
+                targets.some(function (value) { return !Number.isSafeInteger(value) || value <= 0; })) {
+              throw new Error("检测账号快照无效");
+            }
+            var task = diagnosticTask = { taskID: newRequestID(), ownerID: info.owner_id,
+              config: JSON.parse(JSON.stringify(config)), targets: targets.slice(), prepareAcknowledged: false, commitSent: false };
+            return saveDiagnosticCommand(task, "prepare").then(function () {
+              task.prepareAcknowledged = true;
+            }, function () {
+              // A lost prepare acknowledgement must never start a request.
+            }).then(function () { return queryDiagnosticTask(task); }).then(function (entry) {
+              if (!task.prepareAcknowledged) {
+                if (entry.state === "expired" || entry.state === "failed") return followDiagnosticTask(task, entry, 0);
+                throw pendingDiagnosticError("准备提交未确认，已查询任务但不会自动开始检测；请继续查询至任务过期");
+              }
+              return commitDiagnosticTask(task, entry);
+            });
+          });
+        });
+      },
+      resumeDiagnosticTask: function () {
+        if (!diagnosticTask) return Promise.reject(new Error("没有待确认的检测任务"));
+        return runDiagnosticOperation(function () {
+          var task = diagnosticTask;
+          return queryDiagnosticTask(task).then(function (entry) {
+            if (!task.commitSent && task.prepareAcknowledged && entry.state === "prepared") return commitDiagnosticTask(task, entry);
+            return followDiagnosticTask(task, entry, 0);
+          });
+        });
+      },
       testScoped: function (config) {
         if (!scopedTestsAvailable) return Promise.reject(new Error("宿主不支持按请求绑定账号的检测接口，请升级宿主后重新打开配置页"));
         var requestID = newRequestID();
@@ -170,9 +364,7 @@
         });
       },
       status: function () {
-        return request("plugin.status").then(function (response) {
-          return response.result && typeof response.result === "object" ? response.result : {};
-        });
+        return readStatus();
       },
       notify: function (level, message) {
         post("ui.notify", { level: level, message: message });
@@ -190,6 +382,8 @@
           entry.reject(new Error("配置页已关闭"));
         });
         pending.clear();
+        diagnosticWaiters.forEach(function (reject, timer) { global.clearTimeout(timer); reject(new Error("配置页已关闭")); });
+        diagnosticWaiters.clear();
         global.removeEventListener("message", onMessage);
       },
     };

@@ -86,6 +86,14 @@ func TestStreamKeepaliveFailuresAfterHeartbeatEndInsideSSE(t *testing.T) {
 			if len(events) != 1 || events[0]["type"] != "response.failed" {
 				t.Fatalf("expected one failure event after heartbeat: %s", result.body)
 			}
+			failure := relayObject(relayObject(events[0]["response"])["error"])
+			if tt.code == "invalid_tool_call" {
+				if failure["type"] != "invalid_request_error" {
+					t.Fatal("tool failure after heartbeat may trigger host failover")
+				}
+			} else if failure["type"] == "invalid_request_error" {
+				t.Fatal("transport failure was incorrectly made request-scoped")
+			}
 			if strings.Count(string(result.body), "data: [DONE]") != 1 || !strings.HasSuffix(string(result.body), "data: [DONE]\n\n") {
 				t.Fatalf("failure did not terminate with exactly one DONE: %s", result.body)
 			}

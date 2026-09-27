@@ -33,7 +33,7 @@ func TestParseEmptyObjectYieldsCompleteDefaults(t *testing.T) {
 	if err := json.Unmarshal(encoded, &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, removed := range []string{"models", "model_map", "upstream_model", "image_relay_enabled", "image_relay_public_url", "image_relay_listen", "image_relay_storage_dir"} {
+	for _, removed := range []string{"models", "model_map", "upstream_model", "image_relay_enabled", "image_relay_public_url", "image_relay_listen", "image_relay_storage_dir", "bps_device_convergence"} {
 		if _, exists := fields[removed]; exists {
 			t.Fatalf("default configuration still contains removed field %q", removed)
 		}
@@ -104,45 +104,17 @@ func TestBPSAutoDisableOn403Configuration(t *testing.T) {
 	}
 }
 
-func TestBPSDeviceConvergenceConfiguration(t *testing.T) {
-	for _, test := range []struct {
-		name, raw string
-		want      bool
-	}{
-		{"missing payload", "", false},
-		{"old config", `{"account_ids":[7]}`, false},
-		{"explicit enabled", `{"bps_device_convergence":true}`, true},
-		{"explicit disabled", `{"bps_device_convergence":false}`, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			c, err := Parse([]byte(test.raw))
-			if err != nil || c.BPSDeviceConvergence != test.want {
-				t.Fatalf("parsed device policy = %t want %t; err=%v", c.BPSDeviceConvergence, test.want, err)
-			}
-			raw, err := json.Marshal(c.Clone())
-			if err != nil {
-				t.Fatal(err)
-			}
-			var fields map[string]any
-			if err := json.Unmarshal(raw, &fields); err != nil {
-				t.Fatal(err)
-			}
-			if fields["bps_device_convergence"] != test.want {
-				t.Fatalf("device policy must serialize explicit false: %s", raw)
-			}
-			again, err := Parse(raw)
-			if err != nil || again.BPSDeviceConvergence != test.want {
-				t.Fatalf("device policy changed after round-trip: %v %v", again, err)
-			}
-		})
-	}
-	for _, raw := range []string{`{"bps_device_convergence":"true"}`, `{"bps_device_convergence":1}`} {
-		if _, err := Parse([]byte(raw)); err == nil {
-			t.Fatalf("invalid device policy accepted: %s", raw)
+func TestParseRejectsRemovedDeviceConvergenceConfiguration(t *testing.T) {
+	for _, value := range []any{true, false, nil} {
+		raw, err := json.Marshal(map[string]any{"bps_device_convergence": value})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(raw); err == nil || !strings.Contains(err.Error(), "unknown field") || !strings.Contains(err.Error(), "bps_device_convergence") {
+			t.Fatalf("removed configuration field must be rejected for %s, got %v", raw, err)
 		}
 	}
 }
-
 func TestParseRejectsUnknownFields(t *testing.T) {
 	if _, err := Parse([]byte(`{"responses_urll":"https://example.test"}`)); err == nil {
 		t.Fatal("unknown field was accepted")

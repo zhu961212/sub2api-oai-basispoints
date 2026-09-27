@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"time"
 )
@@ -99,17 +100,38 @@ func iterToolValues(tools any, namespace string, callback func(toolSpec)) {
 }
 
 func clientToolSpecs(source map[string]any) map[string]toolSpec {
-	result := map[string]toolSpec{}
 	if strings.EqualFold(strings.TrimSpace(stringValue(source["tool_choice"])), "none") {
-		return result
+		return nil
 	}
-	iterToolValues(sourceTools(source), "", func(spec toolSpec) {
+	// Prepared requests own a frozen catalog. Reuse its read-only index for
+	// history translation, streaming validation, and repair without rebuilding
+	// it for every output item. Unprepared callers retain dynamic discovery.
+	if specs, ok := source["__bps_client_tool_specs"].(map[string]toolSpec); ok {
+		return specs
+	}
+	return indexClientToolSpecs(sourceTools(source))
+}
+
+func indexClientToolSpecs(tools any) map[string]toolSpec {
+	result := map[string]toolSpec{}
+	iterToolValues(tools, "", func(spec toolSpec) {
 		if prior, exists := result[spec.Key]; exists {
 			spec.Ambiguous = prior.Ambiguous || prior.Type != spec.Type || !jsonValuesEqual(prior.Spec, spec.Spec)
 		}
 		result[spec.Key] = spec
 	})
 	return result
+}
+
+func sortedCallableToolNames(specs map[string]toolSpec) []string {
+	names := make([]string, 0, len(specs))
+	for name, spec := range specs {
+		if !spec.Ambiguous {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Only functions is a host presentation alias. Other namespaces are never
@@ -217,11 +239,16 @@ func messageItem(role, text string) map[string]any {
 
 func clientToolProtocolInstructions(source map[string]any) string {
 	specs := clientToolSpecs(source)
-	if len(specs) == 0 {
+	names := sortedCallableToolNames(specs)
+	if len(names) == 0 {
 		return "This request is relayed by an external Responses API client, not by the live Excel workbook. Do not call server-injected Excel, Office, connector, or workbook tools. Return the answer as assistant text."
 	}
-	catalog := make([]string, 0, len(specs))
-	iterToolValues(sourceTools(source), "", func(spec toolSpec) {
+	// Equivalent catalogs must produce the same reusable prompt prefix even
+	// when clients reorder or repeat declarations. Ambiguous tools stay
+	// rejected by validation and must not be advertised as callable here.
+	catalog := make([]string, 0, len(names))
+	for _, name := range names {
+		spec := specs[name]
 		line := "- " + spec.Key + " (" + spec.Type + ")"
 		if spec.Type == "function" {
 			if parameters := firstMap(spec.Spec, "parameters", "inputSchema", "input_schema"); parameters != nil {
@@ -232,7 +259,7 @@ func clientToolProtocolInstructions(source map[string]any) string {
 			line += ". It receives raw text in code.args; the proxy emits it as custom_tool_call.input." + describeToolContract(spec)
 		}
 		catalog = append(catalog, line)
-	})
+	}
 	catalogText := strings.Join(catalog, "\n")
 	return toolCatalogPrefix + " Other native server-injected Excel, Office, connector, workbook, list_skills, and web-search tools are unavailable. Never claim shell, filesystem, or workspace access is unavailable when the catalog contains a suitable tool. For repository inspection, invoke a suitable declared client tool through run_officejs. Transport has two layers and they must not be mixed: the outer native tool is run_officejs (some hosts display it as functions.run_officejs); the inner code value is JSON text containing exactly one compact JSON object for one catalog client tool. Outer arguments include summary, extended_summary, destructive=false, and references=[]." + clientRelayContract + " Do not put JavaScript, OfficeJS, a second run_officejs envelope, or a functions.run_officejs wrapper directly inside code. The field is named code for compatibility; it is not JavaScript. Raw source for a declared custom tool belongs only in the inner args string. Serialize the complete inner object before placing it there, including backslashes and quotes. The proxy converts this native call into the real client tool call, then replays the original run_officejs identity with the client tool result on the next request. Interpret that result as the named client tool output. Never repeat a tool request whose output is already present. Available client tools:\n" + catalogText + "\n" + toolCatalogReminder +
 		" Remember: call the outer native run_officejs tool once; put exactly one catalog-tool JSON object in its code field." +
@@ -258,32 +285,15 @@ func describeParameterNames(parameters map[string]any) string {
 		}
 		names = append(names, name+" ("+suffix+")")
 	}
-	for i := 0; i < len(names); i++ {
-		for j := i + 1; j < len(names); j++ {
-			if names[j] < names[i] {
-				names[i], names[j] = names[j], names[i]
-			}
-		}
-	}
+	sort.Strings(names)
 	return strings.Join(names, ", ")
 }
 
 func clientToolProtocolReminder(source map[string]any) string {
 	specs := clientToolSpecs(source)
-	if len(specs) == 0 {
+	names := sortedCallableToolNames(specs)
+	if len(names) == 0 {
 		return ""
-	}
-	names := make([]string, 0, len(specs))
-	for name := range specs {
-		names = append(names, name)
-	}
-	// Small deterministic ordering without importing sort in every caller.
-	for i := 0; i < len(names); i++ {
-		for j := i + 1; j < len(names); j++ {
-			if names[j] < names[i] {
-				names[i], names[j] = names[j], names[i]
-			}
-		}
 	}
 	reminder := toolCatalogReminder + clientRelayContract + " When the task requires a tool, make the call using the active catalog. Client tools (exact code.tool allowlist): " + string(jsonBytes(names)) + ". Other native tools are unavailable."
 	for _, name := range names {
@@ -744,6 +754,9 @@ func prepareResponsesBodyWithImages(source map[string]any, cfg Config, allowInli
 	if _, frozen := source["__bps_effective_tools"]; !frozen {
 		source["__bps_effective_tools"] = cloneJSONValue(sourceTools(source))
 	}
+	// Build eagerly before the source is shared with response processing.
+	// Keeping tool_choice outside the index preserves explicit none overrides.
+	source["__bps_client_tool_specs"] = indexClientToolSpecs(source["__bps_effective_tools"])
 	cacheNamespace := nativeCallNamespace(source)
 	inputItems := translateInputItemsInNamespace(source["input"], clientToolSpecs(source), cacheNamespace)
 	historyRoot := conversationFingerprint(inputItems)
@@ -1235,7 +1248,7 @@ func decodeNativeClientToolCallFromItem(native, source map[string]any, remember 
 			cacheItem = fallbackTransportCall(result)
 		}
 		if stringValue(native["call_id"]) == "" {
-			cacheItem = objectValue(cloneJSONValue(native))
+			cacheItem = objectValue(cloneJSONValue(cacheItem))
 			cacheItem["call_id"] = callID
 		}
 		rememberNativeCallInNamespace(namespace, cacheItem)
@@ -1351,8 +1364,7 @@ func syntheticStream(response map[string]any) []byte {
 					writeSSE(&builder, "response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": index, "item_id": stringValue(item["id"]), "arguments": arguments})
 				}
 			} else if stringValue(item["type"]) == "custom_tool_call" {
-				input := stringValue(item["input"])
-				if input != "" {
+				if input, ok := item["input"].(string); ok {
 					writeSSE(&builder, "response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": index, "item_id": stringValue(item["id"]), "input": input})
 				}
 			}

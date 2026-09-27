@@ -27,13 +27,12 @@
             <button id="select-all-button" type="button" class="ghost" disabled>全选列表账号</button>
             <button id="degradation-check-button" type="button" class="ghost" disabled>一键检测降智账号</button>
             <button id="bps-403-toggle" type="button" class="ghost" aria-pressed="true" aria-describedby="bps-403-hint" disabled>403 自动停用：已开启</button>
-            <button id="bps-device-toggle" type="button" class="ghost" aria-pressed="false" aria-describedby="bps-device-hint" disabled>设备收敛：已关闭</button>
           </div>
           <span id="bps-403-hint" class="hint">开启后，账号收到 BPS HTTP 403 时自动停用其 BPS 转发。切换后保存生效；关闭不会恢复已停用账号，恢复需重新勾选并保存。</span>
-          <span id="bps-device-hint" class="hint">默认关闭。开启后，BPS 请求按账号统一设备标识，本插件不合并会话。切换后保存生效；关闭不撤销宿主已有的设备或会话收敛。</span>
           <div id="account-list" class="check-list"></div>
           <span id="account-hint" class="hint">新增账号自动勾选并使用 BPS；取消勾选会记住排除。旧配置保存一次即可启用，之后无需再次打开配置页。</span>
           <span id="account-check-hint" class="hint">正在读取宿主检测能力…</span>
+          <span id="diagnostic-task-status" class="hint" role="status" hidden></span>
           <div id="degradation-result" class="degradation-result" aria-live="polite"></div>
         </fieldset>
 

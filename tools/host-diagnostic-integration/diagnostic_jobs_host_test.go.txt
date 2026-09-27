@@ -1,0 +1,428 @@
+// Added through a test-only Go overlay in the pinned upstream service package.
+// The original host manager, runtime, and host service implementations run here.
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
+	"github.com/stretchr/testify/require"
+)
+
+type bpsDiagnosticRepo struct {
+	PluginRepository
+	installation *PluginInstallation
+	failSave     bool
+}
+
+func (r *bpsDiagnosticRepo) GetByID(context.Context, int64) (*PluginInstallation, error) {
+	copy := *r.installation
+	return &copy, nil
+}
+func (r *bpsDiagnosticRepo) UpdateConfig(_ context.Context, _ int64, encrypted, checksum string) error {
+	if r.failSave {
+		return errors.New("injected persistence failure after ApplyConfig")
+	}
+	if checksum != r.installation.BinarySHA256 {
+		return ErrPluginStateChanged
+	}
+	r.installation.ConfigEncrypted = encrypted
+	return nil
+}
+
+type bpsDiagnosticStore struct {
+	*fakePluginKVStore
+	failureMu sync.Mutex
+	failGet   bool
+	failState string
+}
+
+func (s *bpsDiagnosticStore) Get(ctx context.Context, plugin, namespace, key string) ([]byte, bool, error) {
+	s.failureMu.Lock()
+	fail := s.failGet
+	s.failureMu.Unlock()
+	if fail && namespace == "diagnostic_jobs_v1" {
+		return nil, false, errors.New("injected unavailable KV")
+	}
+	return s.fakePluginKVStore.Get(ctx, plugin, namespace, key)
+}
+func (s *bpsDiagnosticStore) Set(ctx context.Context, plugin, namespace, key string, value []byte, ttl time.Duration) error {
+	var record struct {
+		State string `json:"state"`
+	}
+	_ = json.Unmarshal(value, &record)
+	s.failureMu.Lock()
+	fail := s.failState != "" && record.State == s.failState
+	s.failureMu.Unlock()
+	if fail && namespace == "diagnostic_jobs_v1" {
+		return errors.New("injected unavailable KV")
+	}
+	return s.fakePluginKVStore.Set(ctx, plugin, namespace, key, value, ttl)
+}
+func (s *bpsDiagnosticStore) fail(get bool, state string) {
+	s.failureMu.Lock()
+	defer s.failureMu.Unlock()
+	s.failGet, s.failState = get, state
+}
+
+type bpsDiagnosticDirectory struct{}
+
+func (bpsDiagnosticDirectory) ListPluginAccounts(_ context.Context, scope PluginAccountScope, platform, kind string) ([]PluginAccountInfo, error) {
+	if !scope.Contains("openai", "oauth") || platform != "openai" || kind != "oauth" {
+		return nil, errors.New("incorrect directory scope")
+	}
+	return []PluginAccountInfo{
+		{ID: 7, Name: "synthetic-seven", Platform: "openai", AccountType: "oauth", Status: "active", Schedulable: true},
+		{ID: 9, Name: "synthetic-nine", Platform: "openai", AccountType: "oauth", Status: "active", Schedulable: true},
+		{ID: 11, Name: "synthetic-paused", Platform: "openai", AccountType: "oauth", Status: "active", Schedulable: false},
+	}, nil
+}
+func (bpsDiagnosticDirectory) ResolvePluginOutboundIdentity(_ context.Context, scope PluginAccountScope, id int64) (*PluginOutboundIdentity, error) {
+	if !scope.Contains("openai", "oauth") || (id != 7 && id != 9) {
+		return nil, errors.New("incorrect identity scope")
+	}
+	return &PluginOutboundIdentity{AccountID: id, Platform: "openai", AccountType: "oauth",
+		Token:   fmt.Sprintf("synthetic-token-%d", id),
+		Headers: http.Header{"Chatgpt-Account-Id": {fmt.Sprintf("synthetic-account-%d", id)}}}, nil
+}
+
+type bpsDiagnosticTask struct {
+	ID      string                       `json:"task_id"`
+	State   string                       `json:"state"`
+	Receipt string                       `json:"receipt"`
+	Error   string                       `json:"error"`
+	Result  *pluginv1.TestConfigResponse `json:"result"`
+}
+type bpsDiagnosticStatus struct {
+	AccountIDs []int64  `json:"account_ids"`
+	Models     []string `json:"enabled_models"`
+	Tasks      struct {
+		Owner     string              `json:"owner_id"`
+		Protocol  string              `json:"protocol"`
+		Available bool                `json:"available"`
+		Tasks     []bpsDiagnosticTask `json:"tasks"`
+	} `json:"diagnostic_tasks"`
+}
+type bpsDiagnosticRequest struct{ Account, Model string }
+type bpsDiagnosticHarness struct {
+	t           *testing.T
+	manager     *PluginManager
+	repo        *bpsDiagnosticRepo
+	store       *bpsDiagnosticStore
+	host        pluginv1.HostServiceServer
+	upstream    *httptest.Server
+	requestMu   sync.Mutex
+	requests    []bpsDiagnosticRequest
+	requestGate chan struct{}
+	production  json.RawMessage
+}
+
+func newBPSDiagnosticHarness(t *testing.T) *bpsDiagnosticHarness {
+	t.Helper()
+	binary := os.Getenv("BPS_DIAGNOSTIC_PLUGIN_BINARY")
+	require.NotEmpty(t, binary, "run with tools/host-diagnostic-integration/run.py")
+	data, err := os.ReadFile(binary)
+	require.NoError(t, err)
+	checksum := sha256.Sum256(data)
+	h := &bpsDiagnosticHarness{t: t, store: &bpsDiagnosticStore{fakePluginKVStore: newFakePluginKVStore()}}
+	h.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if json.NewDecoder(r.Body).Decode(&payload) != nil {
+			t.Error("invalid fixture request JSON")
+		}
+		account := r.Header.Get("Chatgpt-Account-Id")
+		expectedToken := map[string]string{"synthetic-account-7": "Bearer synthetic-token-7", "synthetic-account-9": "Bearer synthetic-token-9"}[account]
+		if expectedToken == "" || r.Header.Get("Authorization") != expectedToken {
+			t.Error("fixture identity mismatch")
+		}
+		h.requestMu.Lock()
+		h.requests = append(h.requests, bpsDiagnosticRequest{account, payload.Model})
+		gate := h.requestGate
+		h.requestMu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output_text":"iPhone 17"}`))
+	}))
+	t.Cleanup(h.upstream.Close)
+	installation := &PluginInstallation{ID: 73, PluginKey: os.Getenv("BPS_DIAGNOSTIC_PLUGIN_ID"),
+		Version: os.Getenv("BPS_DIAGNOSTIC_PLUGIN_VERSION"), BinaryPath: binary, BinarySHA256: hex.EncodeToString(checksum[:])}
+	h.repo = &bpsDiagnosticRepo{installation: installation}
+	h.manager = &PluginManager{repo: h.repo, encryptor: pluginTokenEncryptor{}, runtimes: make(map[int64]*pluginRuntime)}
+	h.host = newPluginHostServiceServer(installation.PluginKey, h.store, bpsDiagnosticDirectory{},
+		newPluginAccountScope(pluginAccountScopeEntry{Platform: "openai", AccountType: "oauth"}))
+	h.start()
+	h.production = h.save(map[string]any{"account_ids": []int64{42}, "enabled_models": []string{"gpt-6-astra"},
+		"responses_url": h.upstream.URL, "timeout_seconds": 45})
+	require.Equal(t, "config-job-v1", h.status().Tasks.Protocol)
+	return h
+}
+func (h *bpsDiagnosticHarness) start() {
+	h.t.Helper()
+	installation := *h.repo.installation
+	rt, err := startPluginRuntime(context.Background(), &installation, 15*time.Second, filepath.Join(h.t.TempDir(), "runtime"), h.host)
+	require.NoError(h.t, err)
+	h.manager.runtimes[73] = rt
+	h.t.Cleanup(rt.kill)
+}
+func (h *bpsDiagnosticHarness) save(value any) json.RawMessage {
+	h.t.Helper()
+	raw, err := json.Marshal(value)
+	require.NoError(h.t, err)
+	saved, err := h.manager.SaveConfig(context.Background(), 73, raw)
+	require.NoError(h.t, err)
+	return saved
+}
+func (h *bpsDiagnosticHarness) status() bpsDiagnosticStatus {
+	h.t.Helper()
+	response, err := h.manager.Status(context.Background(), 73)
+	require.NoError(h.t, err)
+	var value bpsDiagnosticStatus
+	require.NoError(h.t, json.Unmarshal([]byte(response.StatusJson), &value))
+	require.Equal(h.t, []int64{42}, value.AccountIDs, "diagnostic changed production account routing")
+	require.Equal(h.t, []string{"gpt-6-astra"}, value.Models, "diagnostic changed production model routing")
+	return value
+}
+func (h *bpsDiagnosticHarness) prepare(id string, ids ...int64) map[string]any {
+	config := map[string]any{"degradation_check": true, "responses_url": h.upstream.URL,
+		"enabled_models": []string{"gpt-5.6-sol"}, "account_ids": []int64{9000}}
+	if len(ids) == 1 {
+		config["degradation_check_account_id"] = ids[0]
+	} else {
+		config["degradation_check_account_ids"] = ids
+	}
+	return map[string]any{"diagnostic_task": map[string]any{"protocol": "config-job-v1", "action": "prepare",
+		"owner_id": h.status().Tasks.Owner, "task_id": id, "config": config}}
+}
+func (h *bpsDiagnosticHarness) task(id string) bpsDiagnosticTask {
+	h.t.Helper()
+	for _, task := range h.status().Tasks.Tasks {
+		if task.ID == id {
+			return task
+		}
+	}
+	h.t.Fatalf("missing task %s", id)
+	return bpsDiagnosticTask{}
+}
+func (h *bpsDiagnosticHarness) commit(id string) map[string]any {
+	return map[string]any{"diagnostic_task": map[string]any{"protocol": "config-job-v1", "action": "commit",
+		"owner_id": h.status().Tasks.Owner, "task_id": id, "receipt": h.task(id).Receipt}}
+}
+func (h *bpsDiagnosticHarness) wait(id, state string) bpsDiagnosticTask {
+	h.t.Helper()
+	require.Eventually(h.t, func() bool { return h.task(id).State == state }, 8*time.Second, 10*time.Millisecond)
+	return h.task(id)
+}
+func (h *bpsDiagnosticHarness) count() int {
+	h.requestMu.Lock()
+	defer h.requestMu.Unlock()
+	return len(h.requests)
+}
+func (h *bpsDiagnosticHarness) unchanged() {
+	h.t.Helper()
+	h.status()
+	persisted, err := h.manager.GetConfig(context.Background(), 73)
+	require.NoError(h.t, err)
+	var config map[string]json.RawMessage
+	require.NoError(h.t, json.Unmarshal(persisted, &config))
+	delete(config, "diagnostic_task")
+	raw, err := json.Marshal(config)
+	require.NoError(h.t, err)
+	require.JSONEq(h.t, string(h.production), string(raw), "task envelope altered saved production configuration")
+}
+func (h *bpsDiagnosticHarness) result(id string, targets []int64) {
+	h.t.Helper()
+	task := h.wait(id, "completed")
+	require.NotNil(h.t, task.Result)
+	require.True(h.t, task.Result.Success, task.Result.Message)
+	var result struct {
+		Check struct {
+			ID        string  `json:"request_id"`
+			Targets   []int64 `json:"target_account_ids"`
+			Completed bool    `json:"completed"`
+		} `json:"degradation_check"`
+	}
+	require.NoError(h.t, json.Unmarshal([]byte(task.Result.StatusJson), &result))
+	require.Equal(h.t, id, result.Check.ID)
+	require.Equal(h.t, targets, result.Check.Targets)
+	require.True(h.t, result.Check.Completed)
+	h.unchanged()
+}
+
+func TestBasispointsUnpatchedHostDiagnostics(t *testing.T) {
+	t.Run("interrupted_running_task_is_not_replayed", func(t *testing.T) {
+		h := newBPSDiagnosticHarness(t)
+		gate := make(chan struct{})
+		defer close(gate)
+		h.requestMu.Lock()
+		h.requestGate = gate
+		h.requestMu.Unlock()
+		h.save(h.prepare("interrupted", 7))
+		commit := h.commit("interrupted")
+		saved := h.save(commit)
+		h.wait("interrupted", "running")
+		require.Eventually(t, func() bool { return h.count() == 1 }, 5*time.Second, 10*time.Millisecond)
+		raw, err := json.Marshal(h.prepare("other-page", 9))
+		require.NoError(t, err)
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.Error(t, err)
+		h.manager.runtimes[73].kill()
+		h.start()
+		require.NoError(t, h.manager.runtimes[73].validateAndApplyConfig(context.Background(), saved))
+		require.Empty(t, h.status().Tasks.Tasks)
+		ordinary, err := h.manager.Test(context.Background(), 73)
+		require.NoError(t, err)
+		require.True(t, ordinary.Success, ordinary.Message)
+		raw, err = json.Marshal(commit)
+		require.NoError(t, err)
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.Error(t, err)
+		require.Equal(t, 1, h.count(), "interrupted task was automatically replayed after restart")
+		h.unchanged()
+	})
+	t.Run("single_duplicate_commit_ordinary_test_and_restart", func(t *testing.T) {
+		h := newBPSDiagnosticHarness(t)
+		h.save(h.prepare("single", 7))
+		require.Equal(t, "prepared", h.task("single").State)
+		for range 3 {
+			h.status()
+		}
+		require.Equal(t, 0, h.count(), "prepare/status must be passive")
+		h.unchanged()
+		commit := h.commit("single")
+		saved := h.save(commit)
+		h.result("single", []int64{7})
+		h.save(commit)
+		ordinary, err := h.manager.Test(context.Background(), 73)
+		require.NoError(t, err)
+		require.NotNil(t, ordinary)
+		require.True(t, ordinary.Success, ordinary.Message)
+		require.Equal(t, 1, h.count(), "ordinary Test re-applies saved envelope but must not replay detection")
+		h.requestMu.Lock()
+		requests := append([]bpsDiagnosticRequest(nil), h.requests...)
+		h.requestMu.Unlock()
+		require.Equal(t, []bpsDiagnosticRequest{{"synthetic-account-7", "gpt-5.6-sol"}}, requests)
+		oldOwner := h.status().Tasks.Owner
+		h.manager.runtimes[73].kill()
+		h.start()
+		require.NoError(t, h.manager.runtimes[73].validateAndApplyConfig(context.Background(), saved))
+		require.NotEqual(t, oldOwner, h.status().Tasks.Owner)
+		require.Empty(t, h.status().Tasks.Tasks)
+		_, err = h.manager.Test(context.Background(), 73)
+		require.NoError(t, err)
+		raw, err := json.Marshal(commit)
+		require.NoError(t, err)
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.Error(t, err)
+		require.Equal(t, 1, h.count(), "restart or old-owner command replayed an upstream request")
+		h.unchanged()
+	})
+	t.Run("independent_pages_and_bulk_snapshot", func(t *testing.T) {
+		h := newBPSDiagnosticHarness(t)
+		h.save(h.prepare("page-a", 7))
+		raw, err := json.Marshal(h.prepare("page-b", 9))
+		require.NoError(t, err)
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.Error(t, err)
+		raw, err = json.Marshal(h.prepare("page-a", 9))
+		require.NoError(t, err)
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.Error(t, err)
+		h.save(h.commit("page-a"))
+		h.result("page-a", []int64{7})
+		h.save(h.prepare("page-b", 9))
+		h.save(h.commit("page-b"))
+		h.result("page-b", []int64{9})
+		h.save(h.prepare("bulk", 7, 9, 11, 999))
+		h.save(h.commit("bulk"))
+		h.result("bulk", []int64{7, 9, 11, 999})
+		require.Equal(t, 4, h.count(), "paused and absent accounts must not be contacted")
+		require.Len(t, h.status().Tasks.Tasks, 3)
+		h.result("page-a", []int64{7})
+		h.result("page-b", []int64{9})
+	})
+	t.Run("failed_commit_save_rolls_back_config_but_queries_started_task", func(t *testing.T) {
+		h := newBPSDiagnosticHarness(t)
+		h.save(h.prepare("failed-save", 7))
+		previous := h.repo.installation.ConfigEncrypted
+		commit := h.commit("failed-save")
+		raw, err := json.Marshal(commit)
+		require.NoError(t, err)
+		h.repo.failSave = true
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.ErrorContains(t, err, "injected persistence failure")
+		h.repo.failSave = false
+		require.Equal(t, previous, h.repo.installation.ConfigEncrypted)
+		h.result("failed-save", []int64{7})
+		_, err = h.manager.Test(context.Background(), 73)
+		require.NoError(t, err)
+		h.save(commit)
+		require.Equal(t, 1, h.count(), "rollback or duplicate commit resent a task")
+		h.unchanged()
+	})
+	t.Run("failed_prepare_save_never_executes_on_ordinary_test", func(t *testing.T) {
+		h := newBPSDiagnosticHarness(t)
+		previous := h.repo.installation.ConfigEncrypted
+		raw, err := json.Marshal(h.prepare("prepare-failed", 7))
+		require.NoError(t, err)
+		h.repo.failSave = true
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.ErrorContains(t, err, "injected persistence failure")
+		h.repo.failSave = false
+		require.Equal(t, previous, h.repo.installation.ConfigEncrypted)
+		require.Equal(t, "prepared", h.task("prepare-failed").State)
+		_, err = h.manager.Test(context.Background(), 73)
+		require.NoError(t, err)
+		require.Equal(t, 0, h.count())
+		h.unchanged()
+	})
+	t.Run("KV_failure_fails_closed_before_consumption", func(t *testing.T) {
+		h := newBPSDiagnosticHarness(t)
+		h.store.fail(true, "")
+		raw, err := json.Marshal(h.prepare("kv-get", 7))
+		require.NoError(t, err)
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.Error(t, err)
+		h.store.fail(false, "prepared")
+		raw, err = json.Marshal(h.prepare("kv-prepare", 7))
+		require.NoError(t, err)
+		_, err = h.manager.SaveConfig(context.Background(), 73, raw)
+		require.Error(t, err)
+		require.Equal(t, 0, h.count())
+		h.store.fail(false, "")
+		h.save(h.prepare("kv-consumption", 7))
+		commit := h.commit("kv-consumption")
+		h.store.fail(false, "running")
+		h.save(commit)
+		h.wait("kv-consumption", "failed")
+		h.store.fail(false, "")
+		h.save(commit)
+		_, err = h.manager.Test(context.Background(), 73)
+		require.NoError(t, err)
+		require.Equal(t, 0, h.count(), "failed durable consumption must not contact upstream or retry")
+		h.unchanged()
+	})
+}

@@ -16,6 +16,10 @@ SOURCE_SUFFIXES = {
     ".go", ".mod", ".sum", ".md", ".json", ".proto", ".css", ".js", ".html",
     ".cjs", ".mjs", ".py", ".ps1", ".sh", ".yml", ".yaml",
 }
+SOURCE_FIXTURES = {
+    "tools/host-diagnostic-integration/diagnostic_jobs_host_test.go.txt",
+    "tools/host-relay-integration/relay_scope_host_test.go.txt",
+}
 EXCLUDED_PARTS = {
     ".git", "build", "dist", "node_modules", "__pycache__", ".codex",
     ".claude", ".workbuddy", ".idea", ".vscode",
@@ -36,6 +40,8 @@ def source_path_allowed(name):
         return path.name in ROOT_FILES
     if path.suffix.lower() == ".patch":
         return path.parts[:2] == ("docs", "host-patches")
+    if path.as_posix() in SOURCE_FIXTURES:
+        return True
     return path.parts[0] in SOURCE_DIRS and (
         path.suffix.lower() in SOURCE_SUFFIXES or path.name == "LICENSE"
     )

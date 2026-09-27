@@ -533,7 +533,10 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 		pending = nil
 		if sent > 0 {
 			failure := map[string]any{"code": code, "message": message}
-			if code == "bps_service_rejected" {
+			// Tool validation belongs to this response. Without a request-scoped
+			// type, the host treats early response.failed as an account outage,
+			// fails over, and replaces this diagnostic with a generic 502.
+			if code == "bps_service_rejected" || code == "invalid_tool_call" {
 				failure["type"] = "invalid_request_error"
 			}
 			if err := sendJSON("response.failed", map[string]any{

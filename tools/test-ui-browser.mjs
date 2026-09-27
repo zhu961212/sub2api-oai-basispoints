@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
+import { runDiagnosticTaskDriver, createDiagnosticTaskHost } from './ui-diagnostic-task-browser-fixtures.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -60,6 +61,7 @@ const driver = String.raw`
   const selected = () => Array.from(document.querySelectorAll('#account-list input:checked')).map((box) => Number(box.value));
   const selectedModels = () => Array.from(document.querySelectorAll('#model-list input:checked')).map((box) => box.value);
   const accounts = ${JSON.stringify(browserAccounts)};
+  if (stage && stage.startsWith('task-')) return runDiagnosticTaskDriver(stage, accounts);
   const accountIDs = accounts.map((account) => account.id);
   const displayNames = accounts.map((account) => account.name.trim() ? account.name : String(account.id));
   const modelIDs = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
@@ -73,18 +75,11 @@ const driver = String.raw`
       throw new Error('403 policy button state is incorrect; expected ' + label);
     return toggle;
   }
-  function assertDeviceConvergence(expected, pending = false) {
-    const toggle = document.getElementById('bps-device-toggle');
-    const label = '设备收敛：' + (expected ? '已开启' : '已关闭') + (pending ? '（待保存）' : '');
-    if (!toggle || toggle.type !== 'button' || toggle.getAttribute('aria-pressed') !== String(expected) || toggle.textContent !== label)
-      throw new Error('Device convergence button state is incorrect; expected ' + label);
-    return toggle;
-  }
   function assertResponsiveLayout() {
     const width = document.documentElement.clientWidth;
     if (document.documentElement.scrollWidth > width + 1 || document.body.scrollWidth > width + 1)
       throw new Error('Page overflows horizontally at ' + width + 'px');
-    for (const element of document.querySelectorAll('.account-name, .account-availability, #degradation-result > span, #bps-403-toggle, #bps-device-toggle')) {
+    for (const element of document.querySelectorAll('.account-name, .account-availability, #degradation-result > span, #bps-403-toggle')) {
       const bounds = element.getBoundingClientRect();
       if (bounds.left < -1 || bounds.right > width + 1 || element.scrollWidth > element.clientWidth + 1)
         throw new Error('Account name, diagnostic result or policy control overflows at ' + width + 'px');
@@ -116,8 +111,8 @@ const driver = String.raw`
       }
       const initial403Policy = stage === 'select' || stage === 'clear';
       if (assert403Policy(initial403Policy).disabled) throw new Error('403 policy control did not become ready');
-      const initialDeviceConvergence = stage === 'all';
-      if (assertDeviceConvergence(initialDeviceConvergence).disabled) throw new Error('Device convergence control did not become ready');
+      if (document.getElementById('bps-device-toggle') || document.getElementById('bps-device-hint'))
+        throw new Error('Retired device convergence controls are still visible');
       assertResponsiveLayout();
       if (document.querySelector('[id^="image-relay"]') || document.querySelector('input:not(#account-list input):not(#model-list input), select, details'))
         throw new Error('Images still require additional configuration controls');
@@ -137,8 +132,7 @@ const driver = String.raw`
       stage === 'reopen-empty' || (stage === 'select' && blocked) ? [] : accountIDs;
     if (!same(selected(), initial)) throw new Error('Reopened selection was ' + JSON.stringify(selected()) + ', expected ' + JSON.stringify(initial));
     send('opened', { selected: selected(), models: selectedModels(), viewportWidth: document.documentElement.clientWidth,
-      autoDisableOn403: document.getElementById('bps-403-toggle')?.getAttribute('aria-pressed'),
-      deviceConvergence: document.getElementById('bps-device-toggle')?.getAttribute('aria-pressed') });
+      autoDisableOn403: document.getElementById('bps-403-toggle')?.getAttribute('aria-pressed') });
     if (scoped) {
       const bulk = document.getElementById('degradation-check-button');
       const save = document.getElementById('save-button');
@@ -151,14 +145,14 @@ const driver = String.raw`
       }
       function assertBusy(before) {
         for (const controlID of ['save-button', 'retry-button', 'select-all-button', 'degradation-check-button',
-          'bps-403-toggle', 'bps-device-toggle', 'account-fields', 'model-fields']) {
+          'bps-403-toggle', 'account-fields', 'model-fields']) {
           if (!document.getElementById(controlID).disabled) throw new Error('Diagnostic did not lock ' + controlID);
         }
         if (Array.from(document.querySelectorAll('.account-check-button')).some((button) => !button.disabled))
           throw new Error('Diagnostic did not lock every individual check');
         // Even synthetic events must not bypass the busy guard or dispatch writes.
         for (const button of [save, bulk, accountButton(accountIDs[0]), document.getElementById('select-all-button'),
-          document.getElementById('bps-403-toggle'), document.getElementById('bps-device-toggle')]) {
+          document.getElementById('bps-403-toggle')]) {
           button.click();
           button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
         }
@@ -168,7 +162,6 @@ const driver = String.raw`
         if (!same(selected(), before) || !same(selectedModels(), subset))
           throw new Error('Busy diagnostic allowed account or model selection changes');
         assert403Policy(false);
-        assertDeviceConvergence(false);
       }
       async function diagnose(button, expectedSelection, expectedHint) {
         const before = selected();
@@ -239,7 +232,7 @@ const driver = String.raw`
         button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
         await until(() => document.getElementById('form-hint').textContent.includes('检测已暂停') &&
           !document.getElementById('save-button').disabled, 'Forced diagnostic event did not fail closed');
-        if (document.getElementById('bps-403-toggle').disabled || document.getElementById('bps-device-toggle').disabled)
+        if (document.getElementById('bps-403-toggle').disabled)
           throw new Error('Paused diagnostics unexpectedly locked policy controls');
         for (let rowIndex = 0; rowIndex < accountIDs.length; rowIndex++) {
           const row = document.querySelector('.account-check-button[value="' + accountIDs[rowIndex] + '"]').closest('.account-row');
@@ -254,7 +247,6 @@ const driver = String.raw`
           throw new Error('Diagnostic names were parsed as HTML');
         if (!same(selected(), []) || !same(selectedModels(), [])) throw new Error('Individual diagnostic changed account/model routing');
         assert403Policy(false);
-        assertDeviceConvergence(false);
         assertResponsiveLayout();
       }
       send('done', { selected: selected(), models: selectedModels(), pausedAccountDiagnostics: accountIDs.length, passiveAccountResults: accountIDs.length });
@@ -279,20 +271,9 @@ const driver = String.raw`
     if (!same(selected(), expected)) throw new Error('Account selection controls did not change the selected accounts');
     const expectedModels = stage === 'select' ? subset : stage === 'all' ? modelIDs : [];
     const expected403Policy = stage === 'all';
-    const expectedDeviceConvergence = stage === 'select';
     if (!blocked) {
       assert403Policy(!expected403Policy).click();
       assert403Policy(expected403Policy, true);
-      const initialDeviceConvergence = stage === 'all';
-      assertDeviceConvergence(initialDeviceConvergence).click();
-      assertDeviceConvergence(!initialDeviceConvergence, true);
-      assertResponsiveLayout();
-      assertDeviceConvergence(!initialDeviceConvergence, true).click();
-      assertDeviceConvergence(initialDeviceConvergence);
-      if (initialDeviceConvergence !== expectedDeviceConvergence) {
-        assertDeviceConvergence(initialDeviceConvergence).click();
-        assertDeviceConvergence(expectedDeviceConvergence, true);
-      }
       assertResponsiveLayout();
       for (const box of document.querySelectorAll('#model-list input')) {
         if (box.checked !== expectedModels.includes(box.value)) box.click();
@@ -307,11 +288,6 @@ const driver = String.raw`
     button.click();
     if (!blocked && !document.getElementById('model-fields').disabled) throw new Error('Model fields were not locked during save');
     if (!blocked && !document.getElementById('bps-403-toggle').disabled) throw new Error('403 policy control was not locked during save');
-    if (!blocked && !document.getElementById('bps-device-toggle').disabled) throw new Error('Device convergence control was not locked during save');
-    if (!blocked) {
-      document.getElementById('bps-device-toggle').click();
-      assertDeviceConvergence(expectedDeviceConvergence, expectedDeviceConvergence !== (stage === 'all'));
-    }
     send('clicked', { selected: selected(), clickCount, submitCount, buttonType: button.type });
     if (blocked) {
       await sleep(800);
@@ -324,7 +300,6 @@ const driver = String.raw`
     if (!same(selected(), expected)) throw new Error('Selection changed after save');
     if (!same(selectedModels(), expectedModels)) throw new Error('Model selection changed after save');
     if (assert403Policy(expected403Policy).disabled) throw new Error('403 policy control did not unlock after save');
-    if (assertDeviceConvergence(expectedDeviceConvergence).disabled) throw new Error('Device convergence control did not unlock after save');
     assertResponsiveLayout();
     send('done', { selected: selected(), models: selectedModels(), hint: document.getElementById('form-hint').textContent });
   } catch (error) { send('failure', { error: error.message }); }
@@ -362,6 +337,7 @@ const host = `
   const events = [];
   const accounts = ${JSON.stringify(browserAccounts)};
   const accountIDs = accounts.map((account) => account.id);
+  const taskFixture = (__TASK_HOST_FUNCTION__)(accounts, reopen, (ok, details) => finish(ok, { ...legacyChecks, ...scopedChecks, scopedSelectionSurvivedReopen: true, ...details }));
   async function finish(ok, details) {
     if (finished) return;
     finished = true;
@@ -391,10 +367,12 @@ const host = `
     document.body.appendChild(frame);
   }
   window.addEventListener('message', function (event) {
+    taskFixture.observeDetached(event);
     if (finished || !frame || event.source !== frame.contentWindow) return;
     const data = event.data;
     if (!data || typeof data !== 'object' || data.bridge_token !== token) return;
     if (event.origin !== 'null') return void finish(false, { error: 'Iframe was not an opaque-origin sandbox: ' + event.origin });
+    if (stage.startsWith('task-')) return taskFixture.handle(data, event.source, token, stage);
     if (data.source === 'bps-ui-browser-test') {
       if (data.stage !== stage) return;
       const { bridge_token, source, ...details } = data;
@@ -427,12 +405,13 @@ const host = `
         if (saveCount !== 4 || scopedTestCount !== 5 || !data.scopedSelectionSurvivedReopen ||
             !same(data.selected, [accountIDs[1], accountIDs[2], accountIDs[3]]))
           return void finish(false, { error: 'Explicit scoped selection did not survive reopening the new host UI' });
-        return void finish(true, { ...legacyChecks, ...scopedChecks, scopedSelectionSurvivedReopen: true });
+        return taskFixture.start();
       }
+      if (Object.hasOwn(config, 'bps_device_convergence'))
+        return void finish(false, { error: 'Saved configuration includes removed device convergence setting' });
       if (stage === 'select') {
         if (saveCount !== 1 || !same(config.account_ids, accountIDs)) return void finish(false, { error: 'Selected accounts were not persisted by the host' });
         if (config.bps_auto_disable_on_403 !== false) return void finish(false, { error: 'Disabled 403 policy was not persisted by the host' });
-        if (config.bps_device_convergence !== true) return void finish(false, { error: 'Enabled device convergence was not persisted by the host' });
         if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, []))
           return void finish(false, { error: 'Legacy unrestricted accounts were not migrated to automatic selection' });
         if (!same(config.enabled_models, subset)) return void finish(false, { error: 'Model subset was not persisted by the host' });
@@ -442,7 +421,6 @@ const host = `
         if (saveCount !== 2 || !same(config.account_ids, accountIDs) || !same(config.enabled_models, models))
           return void finish(false, { error: 'All six models were not persisted or accounts changed' });
         if (config.bps_auto_disable_on_403 !== true) return void finish(false, { error: 'Enabled 403 policy was not persisted by the host' });
-        if (config.bps_device_convergence !== false) return void finish(false, { error: 'Disabled device convergence was not persisted by the host' });
         return reopen('clear');
       }
       if (stage === 'clear') {
@@ -451,7 +429,6 @@ const host = `
         if (config.auto_select_new_accounts !== true || !same(config.excluded_account_ids, accountIDs))
           return void finish(false, { error: 'Cleared accounts were not persisted as explicit exclusions' });
         if (config.bps_auto_disable_on_403 !== false) return void finish(false, { error: '403 policy changed while clearing accounts' });
-        if (config.bps_device_convergence !== false) return void finish(false, { error: 'Device convergence changed while clearing accounts' });
         return reopen('reopen-empty');
       }
       if (testCount !== 0 || saveCount !== 3 || data.pausedAccountDiagnostics !== accountIDs.length || data.passiveAccountResults !== accountIDs.length)
@@ -460,10 +437,7 @@ const host = `
         fullAccountNamesDisplayed: true, duplicateNamesDisambiguatedByIDs: true, namesRenderedAsText: true,
         accountDiagnosticsPausedWithoutSideEffects: true, passiveAccountResultsIsolated: true, default403PolicyEnabled: true, disabled403PolicySurvivedReopen: true,
         enabled403PolicySurvivedReopen: true, wideAndNarrowLayoutsWithoutOverflow: true,
-        defaultDeviceConvergenceDisabled: true, enabledDeviceConvergenceSurvivedReopen: true,
-        disabledDeviceConvergenceSurvivedReopen: true, deviceConvergenceDirtyStateReset: true,
-        deviceConvergenceLockedDuringSave: true,
-        automaticImagesWithoutSettings: true,
+        retiredDeviceConvergenceRemoved: true, automaticImagesWithoutSettings: true,
         defaultModelsSelected: true, modelSubsetSurvivedReopen: true, allSixModelsSurvivedReopen: true,
         emptyModelSelectionSurvivedReopen: true, otherConfigurationPreserved: true };
       config = { ...config, account_ids: [accountIDs[0], accountIDs[1], accountIDs[3]],
@@ -548,7 +522,7 @@ const host = `
     respond({ ok: false, error: 'Unknown bridge request: ' + data.type });
   });
   window.addEventListener('error', (event) => { void finish(false, { error: 'Host harness error: ' + event.message }); });
-  setTimeout(() => { void finish(false, { error: 'Browser regression timed out' }); }, 18000);
+  setTimeout(() => { void finish(false, { error: 'Browser regression timed out' }); }, 30000);
   reopen('select');
 })();`;
 
@@ -583,12 +557,18 @@ const server = createServer(async (request, response) => {
     if (url.pathname === '/') { response.setHeader('Content-Type', 'text/html; charset=utf-8'); response.end(harness); return; }
     if (url.pathname === '/__test/host.js' || url.pathname === '/__test/driver.js') {
       response.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-      response.end(url.pathname.endsWith('host.js') ? host : driver);
+      response.end(url.pathname.endsWith('host.js') ? host.replace('__TASK_HOST_FUNCTION__', createDiagnosticTaskHost.toString()) : runDiagnosticTaskDriver.toString() + '\n' + driver);
+      return;
+    }
+    if (url.pathname === '/__test/task-timers.js') {
+      response.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      response.end("if (new URLSearchParams(location.search).get('stage')?.startsWith('task-')) { const nativeTimeout = window.setTimeout.bind(window); window.setTimeout = (callback, delay, ...args) => nativeTimeout(callback, delay === 90000 ? 180 : delay === 1000 ? 20 : delay, ...args); }");
       return;
     }
     if (url.pathname === '/ui/index.html') {
       response.setHeader('Content-Type', 'text/html; charset=utf-8');
-      response.end(html.replace('</body>', '<script src="/__test/driver.js"></script></body>'));
+      const testHTML = html.replace('<script src="./assets/bridge-v1.js"></script>', '<script src="/__test/task-timers.js"></script><script src="./assets/bridge-v1.js"></script>');
+      response.end(testHTML.replace('</body>', '<script src="/__test/driver.js"></script></body>'));
       return;
     }
     if (url.pathname.startsWith('/ui/assets/')) {
@@ -620,11 +600,11 @@ try {
   child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-12000); });
   child.once('error', resultReject);
   child.once('exit', (code) => { resultReject(new Error(`Browser exited before a result (code ${code})\n${stderr}`)); });
-  timer = setTimeout(() => resultReject(new Error(`Browser did not report within 25 seconds\n${stderr}`)), 25000);
+  timer = setTimeout(() => resultReject(new Error(`Browser did not report within 40 seconds\n${stderr}`)), 40000);
   const result = await resultPromise;
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) throw new Error(result.error || 'Browser regression failed');
-  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: old-host diagnostics stay disabled; scoped single/bulk diagnostics preserve request/account ownership, busy locks and failed selections; only explicit save persists choices; select-all remains clickable and policies/models survive reopening.');
+  console.log(expectBlocked ? 'PASS: reproduced blocked submit with zero config.save requests.' : 'PASS: plugin-only tasks restore single/bulk checks on unpatched hosts; timeout recovery only queries the original task; snapshots, owner/results, busy locks and reopening verified; legacy and scoped regressions also pass.');
 } catch (error) {
   console.error(error.stack || error.message);
   process.exitCode = 1;

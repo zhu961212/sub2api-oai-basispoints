@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"container/list"
 	"encoding/json"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -128,6 +130,16 @@ func (c *protocolCache) put(key string, value any, weight int, replace bool) boo
 // Canonicalize once on admission. Number decoding is exact, unlike a generic
 // json.Unmarshal into map[string]any, which rounds integer metadata to float64.
 func protocolCacheSnapshot(value any) (any, int, bool) {
+	// Requests decoded with UseNumber already have the canonical JSON shape.
+	// Copy and measure those trees directly instead of encoding and decoding.
+	copy := protocolCacheSnapshotBuilder{}
+	if owned, ok := copy.clone(value, 0); ok {
+		return owned, copy.weight, true
+	} else if copy.exceeded {
+		return nil, 0, false
+	}
+	// Keep encoding/json normalization for custom marshalers, typed containers,
+	// invalid UTF-8, and unusually deep trees (including cycle detection).
 	raw, err := json.Marshal(value)
 	if err != nil || len(raw) > protocolCacheEntryBytes {
 		return nil, 0, false
@@ -139,6 +151,119 @@ func protocolCacheSnapshot(value any) (any, int, bool) {
 		return nil, 0, false
 	}
 	return owned, protocolCacheWeight(owned), true
+}
+
+type protocolCacheSnapshotBuilder struct {
+	weight   int
+	encoded  int
+	exceeded bool
+}
+
+func (b *protocolCacheSnapshotBuilder) add(weight, encoded int) bool {
+	if weight > protocolCacheEntryBytes-b.weight || encoded > protocolCacheEntryBytes-b.encoded {
+		b.exceeded = true
+		return false
+	}
+	b.weight += weight
+	b.encoded += encoded
+	return true
+}
+
+func (b *protocolCacheSnapshotBuilder) clone(value any, depth int) (any, bool) {
+	if depth > 64 {
+		return nil, false
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if typed == nil {
+			return nil, b.add(16, 4)
+		}
+		if !b.add(64+80*len(typed), 2+max(0, len(typed)-1)) {
+			return nil, false
+		}
+		copy := make(map[string]any, len(typed))
+		for key, value := range typed {
+			size, valid := protocolCacheJSONStringSize(key)
+			if !valid || !b.add(len(key), size+1) {
+				return nil, false
+			}
+			owned, ok := b.clone(value, depth+1)
+			if !ok {
+				return nil, false
+			}
+			copy[strings.Clone(key)] = owned
+		}
+		return copy, true
+	case []any:
+		if typed == nil {
+			return nil, b.add(16, 4)
+		}
+		if !b.add(24+16*len(typed), 2+max(0, len(typed)-1)) {
+			return nil, false
+		}
+		copy := make([]any, len(typed))
+		for index, value := range typed {
+			owned, ok := b.clone(value, depth+1)
+			if !ok {
+				return nil, false
+			}
+			copy[index] = owned
+		}
+		return copy, true
+	case string:
+		size, valid := protocolCacheJSONStringSize(typed)
+		if !valid || !b.add(16+len(typed), size) {
+			return nil, false
+		}
+		// Detach strings from potentially much larger caller-owned storage.
+		return strings.Clone(typed), true
+	case json.Number:
+		if typed == "" {
+			typed = "0" // encoding/json canonicalizes an empty Number to zero.
+		}
+		if !b.add(16+len(typed), len(typed)) {
+			return nil, false
+		}
+		first, last := typed[0], typed[len(typed)-1]
+		if (first != '-' && (first < '0' || first > '9')) || last < '0' || last > '9' || !json.Valid([]byte(typed)) {
+			return nil, false
+		}
+		return json.Number(strings.Clone(string(typed))), true
+	case nil:
+		return nil, b.add(16, 4)
+	case bool:
+		size := 5
+		if typed {
+			size = 4
+		}
+		return typed, b.add(16, size)
+	default:
+		return nil, false
+	}
+}
+
+// Match json.Marshal string escaping without allocating the encoded bytes.
+// Invalid UTF-8 needs the slower path because Marshal replaces invalid runes.
+func protocolCacheJSONStringSize(value string) (int, bool) {
+	if !utf8.ValidString(value) {
+		return 0, false
+	}
+	size := len(value) + 2
+	for index := 0; index < len(value); index++ {
+		switch value[index] {
+		case '\\', '"', '\b', '\f', '\n', '\r', '\t':
+			size++
+		case '<', '>', '&':
+			size += 5
+		default:
+			if value[index] < 0x20 {
+				size += 5
+			} else if value[index] == 0xe2 && index+2 < len(value) && value[index+1] == 0x80 && (value[index+2] == 0xa8 || value[index+2] == 0xa9) {
+				size += 3
+			}
+		}
+	}
+	return size, true
 }
 
 func protocolCacheWeight(value any) int {

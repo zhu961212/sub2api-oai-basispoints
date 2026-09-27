@@ -34,7 +34,6 @@
     "excluded_account_ids",
     "bps_reenabled_accounts",
     "bps_auto_disable_on_403",
-    "bps_device_convergence",
     "max_response_bytes",
     "auth_mode",
     "tools_version_id",
@@ -45,14 +44,14 @@
   ];
 
   var bridge = bridgeFactory.create({});
-  var accountCheckUnavailableReason = bridge.accountCheckUnavailableReason || "当前宿主 UI Bridge v1 无法原子绑定检测账号；为避免多页面检测错账号，账号检测已暂停。账号状态查询、路由保存和宿主连通性测试仍可使用。";
+  if (typeof bridge.onDiagnosticTask === "function") bridge.onDiagnosticTask(renderDiagnosticTask);
+  var accountCheckUnavailableReason = bridge.accountCheckUnavailableReason || "尚未确认可原子绑定检测账号的插件任务能力，账号检测已暂停。请更新插件并重新打开配置页，无需修改宿主。";
   var loaded = {};
   var selectedIDs = [];
   var selectedIDSet = new Set();
   var excludedIDs = [];
   var autoSelectNewAccounts = false;
   var bpsAutoDisableOn403 = true;
-  var bpsDeviceConvergence = false;
   var accountDirectoryReady = false;
   var knownAccountIDs = [];
   var knownAccountIDSet = new Set();
@@ -65,6 +64,7 @@
   var saving = false;
   var checking = false;
   var checkingAccountID = 0;
+  var pendingAccountCheck = null;
   var configReady = false;
   var loading = false;
   var accountChecks = Object.create(null);
@@ -120,31 +120,46 @@
     id("retry-button").disabled = loading || saving || checking;
     id("bps-403-toggle").disabled = locked;
     renderBps403Toggle();
-    id("bps-device-toggle").disabled = locked;
-    renderBpsDeviceToggle();
     var degradationButton = id("degradation-check-button");
     var supported = supportsAccountChecks();
+    var pendingCheck = hasPendingAccountCheck();
+    var taskInfo = typeof bridge.diagnosticTaskInfo === "function" ? bridge.diagnosticTaskInfo() : null;
+    var unavailableReason = taskInfo && taskInfo.error || accountCheckUnavailableReason;
     if (degradationButton) {
-      degradationButton.disabled = locked || !supported || !accounts.some(canCheckAccount);
-      degradationButton.title = supported ? "检测当前列表账号；疑似降智账号将勾选，保存后生效" : accountCheckUnavailableReason;
-      degradationButton.textContent = checking && !checkingAccountID ? "正在检测列表账号…" : "一键检测降智账号";
+      degradationButton.disabled = locked || (!pendingCheck && (!supported || !accounts.some(canCheckAccount)));
+      degradationButton.title = pendingCheck ? "仅查询上次检测任务，不重复提交检测请求" :
+        (supported ? "检测当前列表账号；疑似降智账号将勾选，保存后生效" : unavailableReason);
+      degradationButton.textContent = checking && !checkingAccountID ? "正在检测列表账号…" :
+        (pendingCheck ? "继续查询上次检测" : "一键检测降智账号");
     }
     accountCheckButtons.forEach(function (entry) {
-      entry.button.disabled = locked || !supported || !canCheckAccount(entry.account);
-      entry.button.title = !supported ? accountCheckUnavailableReason :
+      var pendingTarget = pendingCheck && pendingAccountCheck.accountID === entry.account.id;
+      entry.button.disabled = locked || (pendingCheck ? !pendingTarget : (!supported || !canCheckAccount(entry.account)));
+      entry.button.title = pendingCheck ? "上次检测尚未确认，请先继续查询原任务" : !supported ? unavailableReason :
         (bpsDisabledAccounts.has(entry.account.id) ? "BPS 已停用，请重新勾选并保存后检测" :
           (!entry.account.schedulable ? "账号不可调度，请先恢复账号" : "仅检测此账号，不修改账号选择"));
-      entry.button.textContent = checking && checkingAccountID === entry.account.id ? "检测中…" : "降智检测";
+      entry.button.textContent = checking && checkingAccountID === entry.account.id ? "检测中…" : (pendingTarget ? "继续查询" : "降智检测");
     });
     var checkHint = id("account-check-hint");
-    if (checkHint) checkHint.textContent = supported
-      ? "检测会发送真实请求。单号检测不修改选择；一键检测勾选疑似降智账号后需保存。检测使用当前表单快照，不自动保存配置。"
-      : accountCheckUnavailableReason;
+    if (checkHint) checkHint.textContent = pendingCheck
+      ? "上次检测结果未确认，可能已提交。请继续查询原任务；确认结束或过期前不会创建新检测。"
+      : supported
+        ? "检测会发送真实请求。单号检测不修改选择；一键检测勾选疑似降智账号后需保存。检测使用当前表单快照，不自动保存配置。" +
+          (supportsScopedChecks() ? "" : "兼容模式由当前插件运行实例串行执行，无需修改宿主；提交失败可能仅表示回执未确认。")
+        : unavailableReason;
     updateAccountActions();
   }
 
   function supportsAccountChecks() {
+    return supportsScopedChecks() || (typeof bridge.supportsDiagnosticTasks === "function" && bridge.supportsDiagnosticTasks() === true);
+  }
+
+  function supportsScopedChecks() {
     return typeof bridge.supportsScopedTest === "function" && bridge.supportsScopedTest() === true;
+  }
+
+  function hasPendingAccountCheck() {
+    return !!pendingAccountCheck && typeof bridge.hasPendingDiagnosticTask === "function" && bridge.hasPendingDiagnosticTask();
   }
 
   function canCheckAccount(account) {
@@ -296,27 +311,9 @@
     scheduleResize();
   }
 
-  function renderBpsDeviceToggle() {
-    var button = id("bps-device-toggle");
-    var pending = bpsDeviceConvergence !== (loaded.bps_device_convergence === true);
-    button.textContent = "设备收敛：" + (bpsDeviceConvergence ? "已开启" : "已关闭") + (pending ? "（待保存）" : "");
-    button.setAttribute("aria-pressed", String(bpsDeviceConvergence));
-  }
-
-  function toggleBpsDevice(event) {
-    event.preventDefault();
-    if (!configReady || saving || loading || checking) return;
-    bpsDeviceConvergence = !bpsDeviceConvergence;
-    renderBpsDeviceToggle();
-    scheduleResize();
-  }
-
   function verifyBpsPolicies(config, expected) {
     if ((config.bps_auto_disable_on_403 !== false) !== (expected.bps_auto_disable_on_403 !== false)) {
       throw new Error("宿主返回的 403 自动停用开关与提交内容不一致，请重新保存");
-    }
-    if ((config.bps_device_convergence === true) !== (expected.bps_device_convergence === true)) {
-      throw new Error("宿主返回的设备收敛开关与提交内容不一致，请重新保存");
     }
   }
 
@@ -340,6 +337,17 @@
       return result && (result.status === "ok" || result.status === "degraded") &&
         typeof result.answer === "string" && result.answer.trim() !== "";
     }).length;
+  }
+
+  function renderDiagnosticTask(task) {
+    var line = id("diagnostic-task-status");
+    if (!line || disposed || !task || !task.task_id) return;
+    var states = { preparing: "准备中", prepared: "已准备", committing: "提交中",
+      queued: "排队中", running: "检测中", completed: "已完成",
+      failed: "已失败", expired: "已过期", unknown: "结果未确认，仅继续查询" };
+    line.hidden = false;
+    line.textContent = "检测任务 " + task.task_id + " · " + (states[task.state] || states.unknown);
+    scheduleResize();
   }
 
   function renderDegradationResult(check) {
@@ -625,7 +633,6 @@
     });
     config.account_ids = selectedIDs.length ? selectedIDs.slice() : [];
     config.bps_auto_disable_on_403 = bpsAutoDisableOn403;
-    config.bps_device_convergence = bpsDeviceConvergence;
     // 旧非空白名单必须先拿到有效目录，才能保留已知未勾选账号的透传行为。
     if (autoSelectNewAccounts || accountDirectoryReady) {
       config.auto_select_new_accounts = true;
@@ -649,6 +656,7 @@
     }
     delete config.degradation_check_account_id;
     delete config.degradation_check_account_ids;
+    delete config.diagnostic_task;
     return mergeBpsAccountPolicy(config, includePendingRestores === true);
   }
 
@@ -713,8 +721,6 @@
     autoSelectNewAccounts = loaded.auto_select_new_accounts === true || selectedIDs.length === 0;
     bpsAutoDisableOn403 = loaded.bps_auto_disable_on_403 !== false;
     renderBps403Toggle();
-    bpsDeviceConvergence = loaded.bps_device_convergence === true;
-    renderBpsDeviceToggle();
     // A diagnostic save preserves confirmed acknowledgements only. Keep a
     // user's still-unsaved restore choice local until an ordinary save.
     var pendingRestores = new Set();
@@ -886,7 +892,7 @@
         if (!sameModels(normalized, submitted.enabled_models)) {
           throw new Error("宿主返回的模型选择与提交内容不一致");
         }
-        if (normalized.degradation_check === true || normalized.degradation_check_account_id || normalized.degradation_check_account_ids) {
+        if (normalized.degradation_check === true || normalized.degradation_check_account_id || normalized.degradation_check_account_ids || normalized.diagnostic_task) {
           throw new Error("宿主未清除降智检测标记，请重新保存配置");
         }
         writeAcknowledged = true;
@@ -901,7 +907,7 @@
         if (!sameModels(persisted, submitted.enabled_models)) {
           throw new Error("重新读取的模型选择与提交内容不一致，请重试或检查宿主日志");
         }
-        if (persisted.degradation_check === true || persisted.degradation_check_account_id || persisted.degradation_check_account_ids) {
+        if (persisted.degradation_check === true || persisted.degradation_check_account_id || persisted.degradation_check_account_ids || persisted.diagnostic_task) {
           throw new Error("重新读取的配置仍有降智检测标记，请重新保存配置");
         }
         applyConfig(persisted);
@@ -919,33 +925,41 @@
       });
   }
 
-  // Never persist diagnostic commands. The host passes this request-local
-  // snapshot directly to TestConfig and identifies it in gRPC metadata.
+  // The scoped host endpoint and plugin-owned tasks both bind the snapshot
+  // to this request. Neither path saves the form or invokes legacy config.test.
   function handleDegradationCheck(event, accountID) {
     if (event) event.preventDefault();
-    if (!supportsAccountChecks()) {
+    var resuming = hasPendingAccountCheck();
+    if (!resuming && !supportsAccountChecks()) {
       setHint(accountCheckUnavailableReason, "error");
       return;
     }
     if (!configReady || saving || loading || checking || disposed) return;
+    if (resuming) accountID = pendingAccountCheck.accountID;
     var single = Number.isSafeInteger(accountID) && accountID > 0;
     var target = single && accounts.find(function (account) { return account.id === accountID; });
-    if (single ? !canCheckAccount(target) : !accounts.some(canCheckAccount)) return;
-    var targets = single ? [accountID] : accounts.filter(isSelectableAccount).map(function (account) { return account.id; });
-    var snapshot = readForm(false);
-    snapshot.degradation_check = true;
-    if (single) snapshot.degradation_check_account_id = accountID;
-    else snapshot.degradation_check_account_ids = targets.slice();
-    var previousCheck = lastDegradationCheck;
+    if (!resuming && (single ? !canCheckAccount(target) : !accounts.some(canCheckAccount))) return;
+    var targets = resuming ? pendingAccountCheck.targets.slice() :
+      (single ? [accountID] : accounts.filter(isSelectableAccount).map(function (account) { return account.id; }));
+    var snapshot = resuming ? pendingAccountCheck.snapshot : readForm(false);
+    if (!resuming) {
+      snapshot.degradation_check = true;
+      if (single) snapshot.degradation_check_account_id = accountID;
+      else snapshot.degradation_check_account_ids = targets.slice();
+    }
+    var previousCheck = resuming ? pendingAccountCheck.previousCheck : lastDegradationCheck;
+    var compatible = resuming || !supportsScopedChecks();
+    if (compatible && !resuming) pendingAccountCheck = { accountID: single ? accountID : 0, targets: targets.slice(), snapshot: snapshot, previousCheck: previousCheck };
     checking = true;
     checkingAccountID = single ? accountID : 0;
     // Invalidate passive replies started before this diagnostic.
     statusAppliedID = ++statusRequestID;
     updateControls();
     renderDegradationResult({ state: "running" });
-    setHint(single ? "正在检测账号 #" + accountID + "…" : "正在检测当前列表账号…");
+    setHint(resuming ? "正在查询上次检测任务，不会重复提交…" : single ? "正在检测账号 #" + accountID + "…" : "正在检测当前列表账号…");
     scheduleResize();
-    return bridge.testScoped(snapshot).then(function (result) {
+    var operation = resuming ? bridge.resumeDiagnosticTask() : compatible ? bridge.testDiagnosticTask(snapshot) : bridge.testScoped(snapshot);
+    return operation.then(function (result) {
       if (disposed) return;
       var details = result && typeof result.status_json === "string" ? JSON.parse(result.status_json) : null;
       var check = details && details.degradation_check;
@@ -965,6 +979,7 @@
       rememberAccountChecks(check);
       // A canceled scan may still include useful per-account failure details.
       check.state = "done";
+      renderDiagnosticTask({ task_id: check.request_id, state: check.completed === true ? "completed" : "unknown" });
       renderDegradationResult(check);
       var degraded = confirmedDegradedIDs(check);
       if (!single && check.completed === true && degraded.length) {
@@ -983,10 +998,15 @@
       }
       renderAccountList();
       renderAccountHint();
+      pendingAccountCheck = null;
     }).catch(function (error) {
       if (disposed) return;
       renderDegradationResult(previousCheck);
-      setHint("检测失败：" + error.message + "。账号选择未自动保存；本次结果可能未确认，再次点击会重新发送检测请求。", "error");
+      var pending = hasPendingAccountCheck();
+      if (!pending) pendingAccountCheck = null;
+      setHint("检测失败：" + error.message + (pending
+        ? "。账号选择未自动保存；请继续查询上次检测，不会重复提交。"
+        : "。账号选择未自动保存。"), "error");
     }).then(function () {
       checking = false;
       checkingAccountID = 0;
@@ -1005,7 +1025,6 @@
     id("save-button").addEventListener("click", handleSave);
     id("select-all-button").addEventListener("click", selectAllAccounts);
     id("bps-403-toggle").addEventListener("click", toggleBps403);
-    id("bps-device-toggle").addEventListener("click", toggleBpsDevice);
     var degradationButton = id("degradation-check-button");
     if (degradationButton) {
       degradationButton.addEventListener("click", handleDegradationCheck);

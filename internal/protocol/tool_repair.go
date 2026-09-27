@@ -58,6 +58,16 @@ func truncatedRelayCanRegenerate(native, source map[string]any) bool {
 		return false
 	}
 	raw = strings.TrimSpace(raw)
+	// Match code recovery's four JSON layers, but unwrap only complete
+	// strings. The inner partial tree is classification data, never a call.
+	for depth := 0; depth < 3 && len(raw) > 0 && raw[0] == '"'; depth++ {
+		value, _, valid := relayJSONValue(raw, true)
+		quoted, ok := value.(string)
+		if !valid || !ok {
+			return false
+		}
+		raw = strings.TrimSpace(quoted)
+	}
 	if !strings.HasPrefix(raw, "{") {
 		return false
 	}

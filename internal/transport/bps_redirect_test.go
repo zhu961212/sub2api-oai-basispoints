@@ -30,8 +30,9 @@ func TestBPSForwardDoesNotFollowRedirects(t *testing.T) {
 			defer upstream.Close()
 			tr := New()
 			defer tr.Shutdown()
-			applyConfig(t, tr, map[string]any{"responses_url": upstream.URL, "bps_device_convergence": true})
-			result := runForward(t, tr, requestFrames(t, "https://unused.invalid/responses", token(t, "acct-redirect"), deviceIntegrationHeaders("client", "session"), protocol.JSONBytes(map[string]any{"model": protocol.DefaultModelID, "input": "private user content"})))
+			applyConfig(t, tr, map[string]any{"responses_url": upstream.URL})
+			headers := map[string]string{"X-Codex-Installation-ID": "client-installation", "X-Codex-Session-ID": "client-session"}
+			result := runForward(t, tr, requestFrames(t, "https://unused.invalid/responses", token(t, "acct-redirect"), headers, protocol.JSONBytes(map[string]any{"model": protocol.DefaultModelID, "input": "private user content"})))
 			if redirected.Load() != 0 {
 				t.Fatal("BPS request followed redirect with account identity or body")
 			}

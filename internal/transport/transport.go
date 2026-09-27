@@ -38,6 +38,7 @@ type Transport struct {
 	hostConn       *grpc.ClientConn
 	accounts       accountCache
 	bpsAccounts    bpsAccountState
+	diagnosticJobs *diagnosticJobStore
 	attachments    *attachments.Uploader
 	imageAdmission imageRequestAdmission
 	// proxyClients 按账号代理 URL 复用独立的 Transport。此前每个请求都会
@@ -59,23 +60,20 @@ type cachedProxyClient struct {
 
 // accountSummary 是账号目录中对配置页可见的最小字段集合。
 type accountSummary struct {
-	// Derived from trusted host metadata; never exposed in Health/config UI.
-	deviceInstallationID string
-	ID                   int64  `json:"id"`
-	Name                 string `json:"name"`
-	Status               string `json:"status"`
-	Schedulable          bool   `json:"schedulable"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Schedulable bool   `json:"schedulable"`
 }
 
 // accountCache 缓存宿主返回的账号目录。Health 可能被宿主健康检查和配置页轮询
 // 同时调用，缓存可以避免每次探测都查一次账号表；失败时保留上一次成功结果，避免
 // 面板因瞬时故障闪空。
 type accountCache struct {
-	mu        sync.Mutex
-	expires   time.Time
-	items     []accountSummary
-	deviceIDs map[int64]string
-	refresh   *accountRefresh
+	mu      sync.Mutex
+	expires time.Time
+	items   []accountSummary
+	refresh *accountRefresh
 }
 
 type accountRefresh struct {
@@ -95,7 +93,7 @@ var errTransportStopped = errors.New("plugin is stopped")
 
 func New() *Transport {
 	cfg := protocol.DefaultConfig()
-	return &Transport{cfg: cfg, client: newClient(cfg), attachments: attachments.New(), proxyClients: make(map[string]cachedProxyClient)}
+	return &Transport{cfg: cfg, client: newClient(cfg), attachments: attachments.New(), proxyClients: make(map[string]cachedProxyClient), diagnosticJobs: newDiagnosticJobStore()}
 }
 
 func (t *Transport) Shutdown() {
@@ -112,6 +110,7 @@ func (t *Transport) Shutdown() {
 	t.accounts.invalidate()
 	proxyClients := t.detachProxyClients()
 	t.mu.Unlock()
+	t.diagnosticJobs.stop()
 	closeCachedProxyClients(proxyClients)
 	if client != nil {
 		if tr, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
@@ -288,7 +287,8 @@ func (t *Transport) Health(ctx context.Context, _ *pluginv1.HealthRequest) (*plu
 	// 账号目录是只读查询：不应用配置、不访问上游，满足 status_json 的无副作用要求。
 	accounts := t.accountDirectory(ctx)
 	healthy, message := !closed, healthMessage(closed)
-	return &pluginv1.HealthResponse{Healthy: healthy, Message: message, StatusJson: t.bpsAccountStatusJSON(healthStatusJSON(cfg, accounts), cfg)}, nil
+	status := t.bpsAccountStatusJSON(healthStatusJSON(cfg, accounts), cfg)
+	return &pluginv1.HealthResponse{Healthy: healthy, Message: message, StatusJson: t.diagnosticStatusJSON(status)}, nil
 }
 
 // healthStatusJSON 生成无副作用的只读状态快照：不应用配置、不访问上游。
@@ -313,7 +313,6 @@ func healthStatusJSON(c protocol.Config, accounts []accountSummary) string {
 		"auth_mode":                c.AuthMode,
 		"timeout_seconds":          c.TimeoutSeconds,
 		"rewrite_tools":            c.RewriteTools,
-		"bps_device_convergence":   c.BPSDeviceConvergence,
 		"transform_responses":      c.TransformResponses,
 		"reasoning_efforts":        protocol.SupportedReasoningEfforts(),
 		"image_input":              "automatic_attachments",
@@ -372,51 +371,16 @@ func (t *Transport) accountDirectory(ctx context.Context) []accountSummary {
 	}
 }
 
-// accountDeviceID avoids copying/scanning the full account directory on the
-// request hot path. Cold/stale lookups share the existing bounded refresh.
-func (t *Transport) accountDeviceID(ctx context.Context, accountID int64) string {
-	if accountID <= 0 || ctx.Err() != nil {
-		return ""
-	}
-	t.mu.RLock()
-	if t.closed || t.host == nil {
-		t.mu.RUnlock()
-		return ""
-	}
-	t.accounts.mu.Lock()
-	id, fresh := t.accounts.deviceIDs[accountID], time.Now().Before(t.accounts.expires)
-	t.accounts.mu.Unlock()
-	t.mu.RUnlock()
-	if fresh {
-		return id
-	}
-	t.accountDirectory(ctx)
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if t.closed || t.host == nil || ctx.Err() != nil {
-		return ""
-	}
-	t.accounts.mu.Lock()
-	defer t.accounts.mu.Unlock()
-	return t.accounts.deviceIDs[accountID]
-}
-
 func (t *Transport) refreshAccountDirectory(ctx context.Context, host pluginv1.HostServiceClient, refresh *accountRefresh) {
 	defer refresh.cancel()
 	response, err := host.ListAccounts(ctx, &pluginv1.ListAccountsRequest{Platform: "openai", AccountType: "oauth"})
 	items := make([]accountSummary, 0, len(response.GetAccounts()))
-	deviceIDs := make(map[int64]string, len(response.GetAccounts()))
 	for _, account := range response.GetAccounts() {
-		deviceID := bpsAccountDeviceID(account.GetMetadataJson())
-		if _, exists := deviceIDs[account.GetId()]; !exists {
-			deviceIDs[account.GetId()] = deviceID
-		}
 		items = append(items, accountSummary{
-			ID:                   account.GetId(),
-			Name:                 account.GetName(),
-			Status:               account.GetStatus(),
-			Schedulable:          account.GetSchedulable(),
-			deviceInstallationID: deviceID,
+			ID:          account.GetId(),
+			Name:        account.GetName(),
+			Status:      account.GetStatus(),
+			Schedulable: account.GetSchedulable(),
 		})
 	}
 	t.accounts.mu.Lock()
@@ -426,7 +390,6 @@ func (t *Transport) refreshAccountDirectory(ctx context.Context, host pluginv1.H
 	}
 	if err == nil {
 		t.accounts.items = items
-		t.accounts.deviceIDs = deviceIDs
 		t.accounts.expires = time.Now().Add(accountCacheTTL)
 	} else {
 		// Keep the last successful snapshot and suppress sequential failures.
@@ -447,7 +410,6 @@ func (cache *accountCache) invalidate() {
 		cache.refresh = nil
 	}
 	cache.items = nil
-	cache.deviceIDs = nil
 	cache.expires = time.Time{}
 }
 
@@ -463,6 +425,12 @@ func (t *Transport) ValidateConfig(_ context.Context, r *pluginv1.ValidateConfig
 	if r != nil {
 		raw = r.GetConfigJson()
 	}
+	if normalized, handled, err := t.normalizeDiagnosticCommand(raw); handled {
+		if err != nil {
+			return &pluginv1.ValidateConfigResponse{Valid: false, Message: safeError(err)}, nil
+		}
+		return &pluginv1.ValidateConfigResponse{Valid: true, Message: "diagnostic command valid", NormalizedConfigJson: normalized}, nil
+	}
 	c, err := protocol.ParseConfig(raw)
 	if err != nil {
 		return &pluginv1.ValidateConfigResponse{Valid: false, Message: safeError(err)}, nil
@@ -470,10 +438,27 @@ func (t *Transport) ValidateConfig(_ context.Context, r *pluginv1.ValidateConfig
 	return &pluginv1.ValidateConfigResponse{Valid: true, Message: "configuration valid", NormalizedConfigJson: protocol.JSONBytes(c)}, nil
 }
 
-func (t *Transport) ApplyConfig(_ context.Context, r *pluginv1.ApplyConfigRequest) (*pluginv1.ApplyConfigResponse, error) {
+func (t *Transport) ApplyConfig(ctx context.Context, r *pluginv1.ApplyConfigRequest) (*pluginv1.ApplyConfigResponse, error) {
 	var raw []byte
 	if r != nil {
 		raw = r.GetConfigJson()
+	}
+	if clean, command, handled, err := t.parseDiagnosticEnvelope(raw); handled {
+		if err != nil {
+			return &pluginv1.ApplyConfigResponse{Applied: false, Message: safeError(err)}, nil
+		}
+		if command != nil {
+			if err := t.applyDiagnosticCommand(ctx, command); err != nil {
+				return &pluginv1.ApplyConfigResponse{Applied: false, Message: safeError(err)}, nil
+			}
+			if !command.replay {
+				return &pluginv1.ApplyConfigResponse{Applied: true, Message: "diagnostic command accepted; query task status to confirm"}, nil
+			}
+			// A signed envelope contains the production config captured by
+			// Validate. Restoring it is required when the host rolls back a
+			// later failed ordinary save; the diagnostic itself stays consumed.
+		}
+		raw = clean
 	}
 	c, err := protocol.ParseConfig(raw)
 	if err != nil {
@@ -510,6 +495,19 @@ func (t *Transport) TestConfig(ctx context.Context, r *pluginv1.TestConfigReques
 	var raw []byte
 	if r != nil {
 		raw = r.GetConfigJson()
+	}
+	// The unpatched host passes its original saved config to TestConfig, even
+	// after applying the normalized production config. A saved task envelope
+	// therefore remains valid input for ordinary connectivity testing. Decode
+	// it without applying or committing the diagnostic command.
+	if clean, command, handled, err := t.parseDiagnosticEnvelope(raw); handled {
+		if err != nil {
+			return &pluginv1.TestConfigResponse{Success: false, Message: safeError(err)}, nil
+		}
+		if command != nil && !command.replay {
+			return &pluginv1.TestConfigResponse{Success: false, Message: "diagnostic commands require explicit configuration submission; ordinary testing cannot execute them"}, nil
+		}
+		raw = clean
 	}
 	c, err := protocol.ParseConfig(raw)
 	if err != nil {
@@ -624,7 +622,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		t.disableBPSAccount(stream.Context(), start.GetAccountId())
 	})
 
-	requestHeaders, proxyURL, err := t.prepareBPSHeaders(stream.Context(), start, host, cfg)
+	requestHeaders, proxyURL, err := prepareHeaders(stream.Context(), start, host, cfg.AuthMode)
 	if err != nil {
 		// 固定账号解析失败这类错误换账号也不会变好，必须上报为"已发出"，
 		// 否则宿主会拿池子里每个账号各试一遍，最后把一个跟真实原因无关的
@@ -703,13 +701,9 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 				return sendRequestValidationError(stream, err)
 			}
 		}
-		deviceRewritten := false
-		if cfg.BPSDeviceConvergence {
-			deviceRewritten = applyBPSDeviceBody(prepared, requestHeaders.Get("X-Codex-Installation-Id"))
-		}
 		if cfg.RewriteTools {
 			requestBody = protocol.JSONBytes(prepared)
-		} else if imagesRewritten || deviceRewritten {
+		} else if imagesRewritten {
 			// Local session markers are never part of the upstream wire body.
 			// Keep them in source for response translation/replay.
 			wireSource := make(map[string]any, len(source))

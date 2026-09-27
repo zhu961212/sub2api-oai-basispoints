@@ -245,7 +245,7 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	}
 	observeBPSStatus := newBasisPointsStatusObserver(func() { t.disableBPSAccount(ctx, accountID) })
 	start := &pluginv1.ForwardRequestStart{AccountId: accountID}
-	headers, proxyURL, err := t.prepareBPSHeaders(ctx, start, host, c)
+	headers, proxyURL, err := prepareHeaders(ctx, start, host, c.AuthMode)
 	if err != nil {
 		return "error", "", err
 	}
@@ -254,6 +254,10 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 		return "error", "", err
 	}
 	requestClient = withoutBPSRedirects(requestClient)
+	// This request owns the client copy. A production save can replace the
+	// shared client between prepare and commit, but must not replace the
+	// diagnostic snapshot's timeout. The account/scan contexts still cap it.
+	requestClient.Timeout = time.Duration(c.TimeoutSeconds) * time.Second
 	// Match real forwarding: Basis Points expects normalized input, explicit
 	// model selection and streamed Responses output.
 	upstreamBody, err := protocol.PrepareResponsesBody(map[string]any{
@@ -263,9 +267,6 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	}, c)
 	if err != nil {
 		return "error", "", fmt.Errorf("cannot prepare check request")
-	}
-	if c.BPSDeviceConvergence {
-		applyBPSDeviceBody(upstreamBody, headers.Get("X-Codex-Installation-Id"))
 	}
 	body := protocol.JSONBytes(upstreamBody)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ResponsesURL, bytes.NewReader(body))
