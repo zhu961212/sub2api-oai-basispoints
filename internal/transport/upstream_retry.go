@@ -16,6 +16,19 @@ func doBasisPointsRequest(client *http.Client, request *http.Request) (*http.Res
 	current := request
 	for attempt := 0; ; attempt++ {
 		response, err := client.Do(current)
+		if err == nil {
+			probeTimeout := time.Duration(0)
+			if attempt+1 < basisPointsHTTPAttempts && request.GetBody != nil {
+				if delay, retry := basisPointsRetryDelay(response, attempt, time.Now()); retry {
+					if deadline, ok := request.Context().Deadline(); !ok || time.Until(deadline) > delay+httpToolFailureProbeTimeout {
+						probeTimeout = httpToolFailureProbeTimeout
+					}
+				}
+			}
+			if captureBasisPointsHTTPToolFailureWithin(response, probeTimeout) {
+				return response, nil
+			}
+		}
 		if err != nil || attempt+1 >= basisPointsHTTPAttempts || request.GetBody == nil {
 			return response, err
 		}

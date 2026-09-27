@@ -745,8 +745,24 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	// The host also derives account health from quota headers and errors
 	// inside HTTP 200 streams. Isolate only the BPS response before any
 	// image conversion or optional response transformation can expose it.
+	httpToolFailure, capturedToolFailure := resp.Body.(*basisPointsHTTPToolFailureBody)
 	if err := prepareBasisPointsResponse(resp, cfg.MaxResponseBytes, observeBPSStatus); err != nil {
 		return sendError(stream, errorCode(err), safeError(err), true)
+	}
+	if capturedToolFailure {
+		// HTTP success describes the transport only: the Responses object stays
+		// failed. This bypasses the host's generic HTTP-error/failover branch.
+		// Choose the original client's format even when transformation is off.
+		resp.StatusCode = http.StatusOK
+		resp.Status = "200 OK"
+		responseBody := protocol.JSONBytes(httpToolFailure.response)
+		contentType := "application/json"
+		if wantsStream(source) {
+			responseBody = relayRecord("response.failed", map[string]any{"type": "response.failed", "sequence_number": 0, "response": httpToolFailure.response})
+			responseBody = append(responseBody, []byte("data: [DONE]\n\n")...)
+			contentType = "text/event-stream"
+		}
+		return sendHTTPResponse(stream, resp, responseBody, contentType)
 	}
 	if imagesRewritten && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
 		return sendImageUpstreamError(stream, resp, cfg.MaxResponseBytes)

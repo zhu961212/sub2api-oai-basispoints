@@ -1,0 +1,122 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+const replay40874Message = "Basis Points returned a malformed or ambiguous client tool relay envelope"
+const replay40874Payload = `{"response":{"error":{"code":"invalid_tool_call","message":"Basis Points returned a malformed or ambiguous client tool relay envelope"},"output":[],"status":"failed"},"sequence_number":2,"type":"response.failed"}`
+
+func TestSigned40874HostReplay(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	binary := os.Getenv("BPS_REPLAY_BINARY")
+	raw, err := os.ReadFile(binary)
+	require.NoError(t, err)
+	checksum := sha256.Sum256(raw)
+	for _, scenario := range []struct {
+		status int
+		sse    bool
+	}{{200, true}, {502, true}, {502, false}} {
+		status, sse := scenario.status, scenario.sse
+		for _, transform := range []bool{false, true} {
+			for _, reader := range []string{"native", "passthrough"} {
+				t.Run(fmt.Sprintf("http_%d/sse_%t/transform_%t/%s", status, sse, transform, reader), func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+					defer cancel()
+					installation := &PluginInstallation{ID: 75, PluginKey: "local.oai-basispoints", Version: os.Getenv("BPS_REPLAY_VERSION"), BinaryPath: binary, BinarySHA256: hex.EncodeToString(checksum[:])}
+					scope := newPluginAccountScope(pluginAccountScopeEntry{Platform: PlatformOpenAI, AccountType: AccountTypeOAuth})
+					host := newPluginHostServiceServer(installation.PluginKey, newFakePluginKVStore(), bpsDiagnosticDirectory{}, scope)
+					plugin, err := startPluginRuntime(ctx, installation, 15*time.Second, filepath.Join(t.TempDir(), "runtime"), host)
+					require.NoError(t, err)
+					defer plugin.kill()
+					var calls atomic.Int32
+					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						calls.Add(1)
+						_, _ = io.Copy(io.Discard, r.Body)
+						contentType := "application/json"
+						if sse {
+							contentType = "text/event-stream"
+						}
+						w.Header().Set("Content-Type", contentType)
+						w.Header().Set("X-Should-Retry", "false")
+						w.WriteHeader(status)
+						if sse {
+							fmt.Fprintf(w, "event: response.failed\ndata: %s\n\n", replay40874Payload)
+						} else {
+							io.WriteString(w, replay40874Payload)
+						}
+					}))
+					defer upstream.Close()
+					cfg, _ := json.Marshal(map[string]any{"responses_url": upstream.URL, "transform_responses": transform})
+					_, err = plugin.validateAndApplyNormalizedConfig(ctx, cfg)
+					require.NoError(t, err)
+					body := []byte(`{"model":"gpt-6-astra","stream":true,"input":[{"role":"user","content":"Write a hello world C program"}],"tools":[{"type":"custom","name":"functions.exec","format":{"type":"text"}}]}`)
+					request, err := http.NewRequestWithContext(ctx, "POST", "https://host.invalid/v1/responses", bytes.NewReader(body))
+					require.NoError(t, err)
+					request.Header.Set("Content-Type", "application/json")
+					request.Header.Set("Authorization", "Bearer synthetic-token-7")
+					request.Header.Set("Chatgpt-Account-Id", "synthetic-account-7")
+					account := &Account{ID: 7, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1}
+					require.True(t, plugin.beginRequest())
+					response, err := plugin.roundTrip(ctx, request, "", account)
+					if err != nil {
+						plugin.finishRequest()
+					}
+					require.NoError(t, err)
+					defer response.Body.Close()
+					received, err := io.ReadAll(response.Body)
+					require.NoError(t, err)
+					require.NoError(t, response.Body.Close())
+					require.EqualValues(t, 1, calls.Load())
+					require.Zero(t, plugin.inFlight.Load())
+					require.Contains(t, string(received), replay40874Message)
+					response.Body = io.NopCloser(bytes.NewReader(received))
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+					svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}}
+					if response.StatusCode >= 400 {
+						if shouldFailoverOpenAIPassthroughResponse(account, response.StatusCode, received) {
+							t.Fatalf("HTTP response still triggers host failover: status=%d, body=%s", response.StatusCode, received)
+						}
+						writeSanitizedOpenAIPassthroughError(c, response.StatusCode, response.Header)
+						require.NotContains(t, recorder.Body.String(), "Upstream service temporarily unavailable", "HTTP dispatch bypasses typed terminal classification")
+						return
+					}
+					if reader == "native" {
+						_, err = svc.handleStreamingResponse(ctx, response, c, account, time.Now(), "gpt-6-astra", "gpt-6-astra")
+					} else {
+						_, err = svc.handleStreamingResponsePassthrough(ctx, response, c, account, time.Now(), "gpt-6-astra", "gpt-6-astra")
+					}
+					require.Error(t, err)
+					var failover *UpstreamFailoverError
+					require.False(t, errors.As(err, &failover), "failed tool call must stay request scoped: %v", err)
+					require.Contains(t, recorder.Body.String(), replay40874Message)
+					require.Contains(t, recorder.Body.String(), "invalid_request_error")
+					require.NotContains(t, recorder.Body.String(), "Upstream service temporarily unavailable")
+					require.Equal(t, 1, strings.Count(recorder.Body.String(), `"type":"response.failed"`))
+					t.Logf("signed package -> original host: one request, one failed terminal, original diagnostic, no failover; SHA256=%x", checksum)
+				})
+			}
+		}
+	}
+}

@@ -19,6 +19,7 @@ SOURCE_SUFFIXES = {
 SOURCE_FIXTURES = {
     "tools/host-diagnostic-integration/diagnostic_jobs_host_test.go.txt",
     "tools/host-relay-integration/relay_scope_host_test.go.txt",
+    "tools/host-relay-integration/signed_package_host_test.go.txt",
 }
 EXCLUDED_PARTS = {
     ".git", "build", "dist", "node_modules", "__pycache__", ".codex",
