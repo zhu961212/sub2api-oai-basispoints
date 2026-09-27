@@ -49,13 +49,20 @@ func completeToolHistory(items []any) bool {
 }
 
 func truncatedRelayCanRegenerate(native, source map[string]any) bool {
+	eligible, _ := malformedRelayRepairTarget(native, source)
+	return eligible
+}
+
+// A nonempty target pins the known custom tool for complete code-string
+// syntax repairs. Older unknown-name and truncated repairs keep their rules.
+func malformedRelayRepairTarget(native, source map[string]any) (bool, toolSpec) {
 	if stringValue(native["type"]) != "function_call" || !isTransportName(stringValue(native["name"])) {
-		return false
+		return false, toolSpec{}
 	}
 	arguments := parseTransportArguments(native["arguments"])
 	raw, ok := arguments["code"].(string)
 	if !ok || len(raw) > maxRecoveredEnvelopeBytes {
-		return false
+		return false, toolSpec{}
 	}
 	raw = strings.TrimSpace(raw)
 	// Match code recovery's four JSON layers, but unwrap only complete
@@ -64,29 +71,35 @@ func truncatedRelayCanRegenerate(native, source map[string]any) bool {
 		value, _, valid := relayJSONValue(raw, true)
 		quoted, ok := value.(string)
 		if !valid || !ok {
-			return false
+			return false, toolSpec{}
 		}
 		raw = strings.TrimSpace(quoted)
 	}
 	if !strings.HasPrefix(raw, "{") {
-		return false
+		return false, toolSpec{}
 	}
 	value, _, err := strictRelayJSONValue(raw, true)
 	var syntax *json.SyntaxError
 	truncated := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &syntax) && syntax.Error() == "unexpected end of JSON input"
 	if !truncated {
-		return false
+		// Complete but underescaped custom code is also eligible for the
+		// existing one-shot correction, never for local quote guessing.
+		if !errors.As(err, &syntax) {
+			return false, toolSpec{}
+		}
+		target, eligible := customTextRelayTarget(raw, source)
+		return eligible, target
 	}
 	envelope := unambiguousEnvelope(objectValue(value))
 	if envelope == nil {
-		return false
+		return false, toolSpec{}
 	}
 	name := recoveryEnvelopeName(envelope)
 	if isTransportName(name) {
-		return false
+		return false, toolSpec{}
 	}
 	_, exists := resolveClientTool(clientToolSpecs(source), name)
-	return exists
+	return exists, toolSpec{}
 }
 
 // Regenerate only the final unexecuted relay. Explicit prior tool history must
@@ -145,7 +158,7 @@ func PrepareToolRepairBody(prepared, source, response map[string]any) (map[strin
 	call := objectValue(output[len(output)-1])
 	feedback := "The proxy rejected the preceding relay because its inner tool name is absent from the active client catalog. No client tool was executed. A helper documented inside an executor is callable only from that executor's raw input. Regenerate exactly one tool call using an explicitly declared client tool. Do not repeat commentary or change the task, model, account, scope, or input."
 	if transportEnvelope(call) == nil {
-		feedback = "The proxy rejected the preceding relay because its code contains incomplete JSON. No client tool was executed. Regenerate exactly one complete relay for the declared client tool. Serialize the entire inner object as the code string, preserving quotes and backslashes. Do not guess missing arguments, repeat commentary, or change the task, model, account, scope, or input."
+		feedback = "The proxy rejected the preceding relay because its code contains incomplete JSON or invalid JSON string quoting. No client tool was executed. Regenerate exactly one complete relay for the declared client tool. Serialize the entire inner object as the code string, preserving quotes and backslashes. Use a JSON serializer for source code and patches; do not manually interpolate them into the envelope. Do not guess missing arguments, repeat commentary, or change the task, model, account, scope, or input."
 	}
 	added := append([]any{}, cloneJSONValue(output).([]any)...)
 	added = append(added, map[string]any{"type": "function_call_output", "call_id": call["call_id"], "output": feedback}, messageItem("developer", feedback+" "+clientToolProtocolReminder(source)))
@@ -164,6 +177,8 @@ func MergeToolRepairResponse(source, original, repaired map[string]any) (map[str
 		return nil, fail(502, "invalid_tool_call", unknownClientToolMessage)
 	}
 	output, _ := repaired["output"].([]any)
+	originalOutput := original["output"].([]any)
+	_, expected := malformedRelayRepairTarget(objectValue(originalOutput[len(originalOutput)-1]), source)
 	tools := 0
 	for _, value := range output {
 		item := objectValue(value)
@@ -171,8 +186,12 @@ func MergeToolRepairResponse(source, original, repaired map[string]any) (map[str
 			continue
 		}
 		tools++
-		if _, reason := decodeNativeClientToolCallFromItem(item, source, false); reason != "" {
+		call, reason := decodeNativeClientToolCallFromItem(item, source, false)
+		if reason != "" {
 			return nil, fail(502, "invalid_tool_call", reason)
+		}
+		if expected.Key != "" && (clientToolKey(call) != expected.Key || stringValue(call["type"]) != "custom_tool_call") {
+			return nil, fail(502, "invalid_tool_call", "Basis Points code string correction changed the declared client tool")
 		}
 	}
 	if tools != 1 {

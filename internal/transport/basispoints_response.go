@@ -170,7 +170,7 @@ func isolateBasisPointsFailureObject(object map[string]any, event string, observ
 		reportBasisPointsStatus(http.StatusForbidden, observers)
 	}
 	if status == 0 {
-		return false
+		return protocol.NormalizeClientToolFailure(object, event)
 	}
 	safeError := func() map[string]any {
 		// Host stream handling requires a request-scoped terminal type: generic

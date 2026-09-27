@@ -111,9 +111,19 @@ func ResponseTerminalError(terminal ResponseTerminal, payload map[string]any) er
 		return nil
 	}
 	response := objectValue(payload["response"])
-	for _, failure := range []map[string]any{objectValue(response["error"]), objectValue(payload["error"])} {
+	failures := []map[string]any{objectValue(response["error"]), objectValue(payload["error"])}
+	for _, failure := range failures {
 		if stringValue(failure["code"]) == "bps_service_rejected" {
 			return fail(502, "bps_service_rejected", stringValue(failure["message"]))
+		}
+	}
+	for _, failure := range failures {
+		if stringValue(failure["code"]) == "invalid_tool_call" {
+			message := stringValue(failure["message"])
+			if message != malformedClientToolMessage && message != unknownClientToolMessage {
+				message = "Basis Points returned an invalid client tool call"
+			}
+			return fail(502, "invalid_tool_call", message)
 		}
 		if stringValue(failure["code"]) == "upstream_cancelled" {
 			terminal = TerminalCancelled
@@ -129,6 +139,35 @@ func ResponseTerminalError(terminal ResponseTerminal, payload map[string]any) er
 	default:
 		return fail(502, "upstream_failed", "Basis Points returned a failed response")
 	}
+}
+
+// NormalizeClientToolFailure marks an existing tool protocol failure as scoped
+// to the current request. Only failure envelope fields are inspected; code or
+// marker-looking text in normal output and tool arguments remains untouched.
+func NormalizeClientToolFailure(payload map[string]any, event string) bool {
+	if !ClassifyResponseTerminal(event, payload).Failed() {
+		return false
+	}
+	changed := false
+	for _, object := range []map[string]any{payload, objectValue(payload["response"])} {
+		if object == nil {
+			continue
+		}
+		failure := objectValue(object["error"])
+		if failure == nil && object["error"] == nil && stringValue(object["code"]) == "invalid_tool_call" {
+			failure = map[string]any{"code": "invalid_tool_call"}
+			if message := stringValue(object["message"]); message != "" {
+				failure["message"] = message
+			}
+			object["error"] = failure
+			changed = true
+		}
+		if stringValue(failure["code"]) == "invalid_tool_call" && stringValue(failure["type"]) != "invalid_request_error" {
+			failure["type"] = "invalid_request_error"
+			changed = true
+		}
+	}
+	return changed
 }
 
 // NormalizeResponseFailure produces a terminal recognized by Responses
@@ -154,6 +193,10 @@ func NormalizeResponseFailure(payload map[string]any, terminal ResponseTerminal)
 			if value := stringValue(upstream[field]); value != "" {
 				failure[field] = value
 			} else if value := stringValue(payload[field]); value != "" {
+				// An SSE lifecycle type describes the envelope, not its error.
+				if field == "type" && (strings.HasPrefix(value, "response.") || terminalKind(value) != TerminalNone) {
+					continue
+				}
 				failure[field] = value
 			}
 		}
@@ -185,6 +228,9 @@ func NormalizeResponseFailure(payload map[string]any, terminal ResponseTerminal)
 		if terminal == TerminalCancelled {
 			failure["message"] = "Basis Points canceled the response before completion"
 		}
+	}
+	if stringValue(failure["code"]) == "invalid_tool_call" {
+		failure["type"] = "invalid_request_error"
 	}
 	response["error"] = failure
 	return "response.failed"

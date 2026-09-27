@@ -1265,7 +1265,15 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 	terminal := ClassifyResponseTerminal("", response)
 	if status := stringValue(response["status"]); terminal.Failed() || status != "" && status != "completed" {
 		if terminal.Failed() {
-			NormalizeResponseFailure(map[string]any{"response": response}, terminal)
+			envelope := map[string]any{"response": response}
+			if nested := objectValue(response["response"]); nested != nil {
+				// A JSON response may contain the same envelope as an SSE
+				// terminal. Normalize before unwrapping so neither error
+				// layer is lost and failed tool output remains withheld.
+				envelope, response = response, nested
+				output, _ = response["output"].([]any)
+			}
+			NormalizeResponseFailure(envelope, terminal)
 		}
 		filtered := make([]any, 0, len(output))
 		for _, value := range output {

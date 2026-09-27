@@ -816,6 +816,12 @@ func (t *Transport) passthrough(stream pluginv1.TransportPlugin_ForwardServer, s
 	if err != nil {
 		return sendError(stream, "invalid_request", "cannot build the passthrough request", false)
 	}
+	// Host is separate from URL and headers in both net/http and the plugin
+	// protocol. Preserve the host's virtual authority even when the connection
+	// URL points at a custom gateway; an empty authority keeps the URL default.
+	if start.GetHost() != "" {
+		req.Host = start.GetHost()
+	}
 	for key, values := range start.GetHeaders() {
 		if !passthroughRequestHeader(key) {
 			continue

@@ -4,9 +4,9 @@
 
 [GitHub 仓库](https://github.com/zhu961212/sub2api-oai-basispoints) · [发布下载](https://github.com/zhu961212/sub2api-oai-basispoints/releases)
 
-当前版本：**0.6.2** · 插件 ID：**local.oai-basispoints**
+当前版本：**0.6.3** · 插件 ID：**local.oai-basispoints**
 
-**0.6.2 发行内容**：工具 relay 封装修复、误换号修复、原版宿主账号检测与设备功能移除。按卸载旧插件后全新安装发布，不兼容旧版配置；详见 [发行记录](docs/release-0.6.2-2026-09-27.md)。0.6.1 保持撤回。
+**0.6.3 发行内容**：空模型透传保留宿主 Host、C 源码工具封装的受限纠正，以及上游已有工具失败事件的错误分类修复。按卸载旧插件后全新安装发布，不兼容旧版配置；详见 [发行记录](docs/release-0.6.3-2026-09-27.md)。0.6.1 保持撤回。
 
 **0.6.2 插件兼容方案**：恢复原界面的逐账号“降智检测”和“一键检测降智账号”。通过现有 UI Bridge v1 提交并确认插件后台任务，固定本次账号、模型和参数，页面按任务编号查询结果。只更新插件即可使用，不要求修改或重建 Sub2API。详见 [检测任务协议](docs/PLUGIN-DIAGNOSTIC-TASKS.md)。
 
@@ -19,6 +19,12 @@
 0.5.26 纳入的修复：[宿主适配、工具封装错误与性能优化记录](docs/HOST-OPTIMIZATION-2026-09-26.md)。覆盖工具调用截断纠正、BPS 账号状态隔离、响应处理和账号界面性能；本地验证与生产部署状态分别列明。
 
 0.5.26 新增：[一次 BPS 403 自动取消勾选并停用该账号的 BPS](docs/BPS-403-ACCOUNT-DISABLE.md)。配置页可开启或关闭，默认开启；不要求错误码或连续次数。宿主账号保留，可明确重新勾选并保存恢复。
+
+## 0.6.3 更新
+
+- 未选模型和排除账号继续走宿主原上游，保留协议中的 Host，避免自定义地址与虚拟主机不一致；空模型选择仍可保存。
+- 对已知单个 custom 工具的可判定字符串语法损坏，最多请求上游重新生成一次；不猜测或执行损坏的 C 代码，正常源码保持原始字节。
+- 补齐上游已有 invalid_tool_call 失败事件的请求级分类，避免误换号后变成通用 502；普通网络和服务端错误保持原有策略。
 
 ## 0.6.2 更新
 
@@ -207,12 +213,12 @@ Linux：
 bash ./build.sh -signing-key ../basispoints-private/publisher.private -key-id my-publisher-v1
 ~~~
 
-构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.2.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
+构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.3.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
 
 显式传入配套公钥进行独立验包：
 
 ~~~powershell
-python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.2.s2plugin --public-key ../basispoints-private/publisher.public
+python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.3.s2plugin --public-key ../basispoints-private/publisher.public
 ~~~
 
 校验器检查包内容、文件哈希及 manifest 原始字节的 Ed25519 签名。签名构建必须具备 Python 和与私钥同名的 .public 配套公钥；两种构建脚本均对实际输出执行强制验签，并核对 key_id。也可用上面的显式验签命令单独复查。
@@ -226,7 +232,7 @@ plugins:
     my-publisher-v1: BASE64_ED25519_PUBLIC_KEY
 ~~~
 
-在 Sub2API 插件管理页安装 0.6.2，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
+在 Sub2API 插件管理页安装 0.6.3，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
 
 ## 配置页与全选
 
