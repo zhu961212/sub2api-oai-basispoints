@@ -17,6 +17,8 @@ SOURCE_SUFFIXES = {
     ".cjs", ".mjs", ".py", ".ps1", ".sh", ".yml", ".yaml",
 }
 SOURCE_FIXTURES = {
+    "internal/attachments/testdata/sample.pdf",
+    "internal/attachments/testdata/sample.docx",
     "tools/host-diagnostic-integration/diagnostic_jobs_host_test.go.txt",
     "tools/host-relay-integration/relay_scope_host_test.go.txt",
     "tools/host-relay-integration/signed_package_host_test.go.txt",

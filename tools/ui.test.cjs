@@ -1491,6 +1491,66 @@ test("bulk snapshot selects confirmed degraded accounts locally and preserves fa
   assert.ok(!page.store.config.degradation_check_account_ids);
 });
 
+test("diagnostic controls explain probe scope, request cost, and both bulk selection changes", async () => {
+  const page = createPage({ scoped: true });
+  await flush();
+  const hint = page.ids["account-check-hint"].textContent;
+  assert.match(hint, /真实请求.*消耗额度/);
+  assert.match(hint, /本次探针/);
+  assert.match(hint, /取消.*符合规则/);
+  assert.match(hint, /403.*已保存/);
+  assert.match(page.ids["degradation-check-button"].title, /取消.*符合规则/);
+  assert.match(page.accountRow(1).button.title, /探针结果/);
+  assert.match(htmlSource, /PDF.*Word/);
+  assert.match(htmlSource, /客户端.*工具/);
+});
+
+test("diagnostic 403 protection reports deselection without claiming unchanged choices", async t => {
+  for (const single of [true, false]) {
+    await t.test(single ? "single" : "bulk", async () => {
+      const status = bpsStatus([]);
+      const page = createPage({ scoped: true, status, testScoped: config => {
+        const result = scopedResult(config, { 1: { status: "error", answer: "", error: "HTTP 403" } });
+        const blocked = JSON.parse(bpsStatus([[1, bpsBlockA]]).status_json);
+        const details = { ...blocked, ...JSON.parse(result.status_json) };
+        status.status_json = JSON.stringify(blocked);
+        return Promise.resolve({ ...result, status_json: JSON.stringify(details) });
+      } });
+      await flush();
+      page.toggle403(); // The local edit is deliberately not yet saved.
+      if (single) page.checkAccount(1);
+      else page.degradationCheck();
+      await flush();
+      assert.deepEqual(page.selected(), [2, 3]);
+      assert.equal(page.calls.save.length, 0);
+      assert.equal(page.calls.scoped[0].bps_auto_disable_on_403, false);
+      assert.match(page.ids["form-hint"].textContent, /403.*自动停用.*1.*取消勾选/);
+      assert.doesNotMatch(page.ids["form-hint"].textContent, /账号选择未改变|保留原账号选择/);
+      const summary = page.ids["degradation-result"].children[0].textContent;
+      assert.doesNotMatch(summary, /保留原账号选择/);
+    });
+  }
+});
+
+test("partial diagnostics label answered results incomplete and preserve choices", async () => {
+  const page = createPage({ scoped: true, store: { config: { account_ids: [1] } }, testScoped: config => {
+    const result = scopedResult(config, { 2: { status: "degraded", answer: "苹果16" } });
+    const details = JSON.parse(result.status_json);
+    details.degradation_check.completed = false;
+    result.status_json = JSON.stringify(details);
+    return Promise.resolve(result);
+  } });
+  await flush();
+  page.degradationCheck();
+  await flush();
+  assert.deepEqual(page.selected(), [1]);
+  assert.equal(page.calls.save.length, 0);
+  const summary = page.ids["degradation-result"].children[0].textContent;
+  assert.match(summary, /检测未全部完成/);
+  assert.doesNotMatch(summary, /^检测完成/);
+  assert.match(summary, /本次探针/);
+});
+
 test("diagnostic errors and mismatched targets preserve choices and unlock controls", async t => {
   for (const mode of ["network", "wrong-target", "duplicate", "empty", "no-degraded", "incomplete"]) {
     await t.test(mode, async () => {

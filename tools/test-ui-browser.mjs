@@ -118,6 +118,9 @@ const driver = String.raw`
         throw new Error('Images still require additional configuration controls');
       if (!document.body.textContent.includes('支持直接发送图片和截图，无需额外配置'))
         throw new Error('Automatic image support is not described');
+      if (!document.body.textContent.includes('PDF 和 Word（DOC/DOCX）附件转发') ||
+          !document.body.textContent.includes('由客户端可用工具执行'))
+        throw new Error('Document relay support or client-side Word tool responsibility is not described');
       if (!same(Array.from(document.querySelectorAll('#model-list input')).map((box) => box.value), modelIDs))
         throw new Error('The model picker does not group GPT-6 before GPT-5.6');
       const initialModels = stage === 'select' ? defaultModels : stage === 'all' || scoped ? subset : stage === 'clear' ? modelIDs : [];
@@ -175,11 +178,15 @@ const driver = String.raw`
         assertResponsiveLayout();
       }
       assertReady();
+      const checkHelp = document.getElementById('account-check-hint').textContent;
+      if (!checkHelp.includes('真实请求并消耗额度') || !checkHelp.includes('本次探针') ||
+          !checkHelp.includes('取消符合规则账号的勾选') || !checkHelp.includes('403 自动停用仍按已保存开关执行'))
+        throw new Error('Diagnostic controls do not explain probe scope, cost, and actual selection behavior');
       if (stage === 'scoped-reopen') {
         send('done', { selected: selected(), models: selectedModels(), scopedSelectionSurvivedReopen: true });
         return;
       }
-      await diagnose(accountButton(accountIDs[1]), initial, '账号选择未改变');
+      await diagnose(accountButton(accountIDs[1]), initial, '未按探针结果调整账号选择');
       const checkedRow = accountButton(accountIDs[1]).closest('.account-row');
       const sameNameRow = accountButton(accountIDs[0]).closest('.account-row');
       if (!checkedRow.querySelector('.account-check-result.result-degraded') || sameNameRow.querySelector('.account-check-result.result-degraded'))
@@ -203,6 +210,8 @@ const driver = String.raw`
       }
       await diagnose(bulk, filtered, '检测失败');
       await diagnose(bulk, filtered, '检测未全部完成');
+      if (!document.querySelector('#degradation-result .result-summary').textContent.startsWith('检测未全部完成：'))
+        throw new Error('An incomplete diagnostic report was shown as completed');
       send('before-scoped-save', { selected: selected(), models: selectedModels() });
       save.click();
       await until(() => !save.disabled && hint().includes('已保存'), 'Scoped local selection did not save on explicit click');

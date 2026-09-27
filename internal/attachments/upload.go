@@ -23,6 +23,10 @@ func attachmentURL(responsesURL string) (string, error) {
 }
 
 func (u *Uploader) upload(ctx context.Context, client *http.Client, endpoint string, headers http.Header, img *inlineImage) (string, error) {
+	return u.uploadAttachment(ctx, client, endpoint, headers, "image."+strings.TrimPrefix(img.mime, "image/"), img.mime, img.payload, img.size)
+}
+
+func (u *Uploader) uploadAttachment(ctx context.Context, client *http.Client, endpoint string, headers http.Header, filename, mime, payload string, size int64) (string, error) {
 	select {
 	case u.uploads <- struct{}{}:
 		defer func() { <-u.uploads }()
@@ -33,26 +37,29 @@ func (u *Uploader) upload(ctx context.Context, client *http.Client, endpoint str
 	}
 	var framing bytes.Buffer
 	writer := multipart.NewWriter(&framing)
-	filename := "image." + strings.TrimPrefix(img.mime, "image/")
 	partHeaders := make(textproto.MIMEHeader)
-	partHeaders.Set("Content-Disposition", fmt.Sprintf("form-data; name=%q; filename=%q", "file", filename))
-	partHeaders.Set("Content-Type", img.mime)
+	// MIME quoted strings only escape quote/backslash. Go %q additionally
+	// emits \uXXXX for valid Unicode filename characters such as NBSP; MIME
+	// readers do not decode those escapes and would change the filename.
+	quotedName := strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(filename)
+	partHeaders.Set("Content-Disposition", "form-data; name=\"file\"; filename=\""+quotedName+"\"")
+	partHeaders.Set("Content-Type", mime)
 	if _, err := writer.CreatePart(partHeaders); err != nil {
-		return "", fail(500, "attachment_encoding", "Cannot encode image attachment")
+		return "", fail(500, "attachment_encoding", "Cannot encode attachment")
 	}
 	separator := framing.Len()
 	if writer.Close() != nil {
-		return "", fail(500, "attachment_encoding", "Cannot finish image attachment")
+		return "", fail(500, "attachment_encoding", "Cannot finish attachment")
 	}
 	prefix, suffix := framing.Bytes()[:separator], framing.Bytes()[separator:]
 	// Only small multipart framing is buffered. Decode directly into the HTTP
 	// transport without an image-sized copy, disk file, or writer goroutine.
-	body := io.MultiReader(bytes.NewReader(prefix), base64.NewDecoder(base64.StdEncoding.Strict(), strings.NewReader(img.payload)), bytes.NewReader(suffix))
+	body := io.MultiReader(bytes.NewReader(prefix), base64.NewDecoder(base64.StdEncoding.Strict(), strings.NewReader(payload)), bytes.NewReader(suffix))
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		return "", fail(500, "attachment_config", "Cannot construct native attachment request")
 	}
-	request.ContentLength = int64(len(prefix)+len(suffix)) + img.size
+	request.ContentLength = int64(len(prefix)+len(suffix)) + size
 	request.Header = headers.Clone()
 	if request.Header == nil {
 		request.Header = make(http.Header)

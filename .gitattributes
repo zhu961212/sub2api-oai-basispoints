@@ -13,3 +13,7 @@ docs/host-patches/*.patch -text -whitespace
 # 插件包与二进制产物不入库。
 dist/*.s2plugin binary
 build/ binary
+
+# Synthetic document fixtures must preserve their exact container bytes.
+internal/attachments/testdata/sample.pdf binary
+internal/attachments/testdata/sample.docx binary

@@ -643,7 +643,8 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	requestBody := body
 	var source map[string]any
 	imagesRewritten := false
-	{ // Image preparation is independent of tool and response conversion toggles.
+	attachmentDiagnostics := false
+	{ // Attachment preparation is independent of tool/response conversion toggles.
 		source, err = protocol.RawObject(body)
 		if err != nil {
 			return sendRequestValidationError(stream, err)
@@ -663,24 +664,33 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 			source["__bps_context_cache_disabled"] = true
 		}
 		inlineImages := hasInlineImages(source)
-		validate := cfg.RewriteTools || cfg.TransformResponses || inlineImages
+		inputFiles := hasInputFiles(source)
+		originalImages := protocol.HasOriginalImageDetail(source)
+		prepareAttachments := inlineImages || inputFiles || originalImages
+		validate := cfg.RewriteTools || cfg.TransformResponses || prepareAttachments
 		if validate {
 			if err := protocol.ValidateImageUploadCapabilities(source); err != nil {
 				return sendRequestValidationError(stream, err)
 			}
 		}
-		if inlineImages {
+		if inlineImages || inputFiles {
 			release, err = t.imageAdmission.acquire(int64(len(body)))
 			if err != nil {
 				return sendImageRelayError(stream, err)
 			}
 		}
+		if inlineImages && inputFiles {
+			// Validate the combined batch before either uploader can send bytes.
+			if err := attachments.ValidateMixedInputs(stream.Context(), source); err != nil {
+				return sendImageRelayError(stream, err)
+			}
+		}
 		prepared := source
 		if cfg.RewriteTools {
-			// Derive conversation identity from original images, not ephemeral
+			// Derive conversation identity from original attachments, not ephemeral
 			// uploaded file IDs; retries must keep the same turn and task.
-			if inlineImages {
-				prepared, err = protocol.PrepareResponsesBodyForImageUpload(source, cfg)
+			if prepareAttachments {
+				prepared, err = protocol.PrepareResponsesBodyForAttachmentUpload(source, cfg)
 			} else {
 				prepared, err = protocol.PrepareResponsesBody(source, cfg)
 			}
@@ -689,6 +699,11 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 			}
 		}
 		imagesRewritten, err = uploader.Rewrite(stream.Context(), requestClient, cfg.ResponsesURL, requestHeaders, prepared, relayScope(start))
+		if err == nil && inputFiles {
+			var filesRewritten bool
+			filesRewritten, err = uploader.RewriteFiles(stream.Context(), requestClient, cfg.ResponsesURL, requestHeaders, prepared, relayScope(start))
+			imagesRewritten = imagesRewritten || filesRewritten
+		}
 		if err != nil {
 			var upstreamStatus interface{ StatusCode() int }
 			if errors.As(err, &upstreamStatus) {
@@ -699,6 +714,10 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 			}
 			return sendImageRelayError(stream, err, observeBPSStatus)
 		}
+		detailsNormalized := protocol.NormalizeImageDetails(prepared)
+		imagesRewritten = imagesRewritten || detailsNormalized
+		// Existing document IDs need safe error handling even without uploads.
+		attachmentDiagnostics = inputFiles || imagesRewritten
 		if validate {
 			if err := protocol.ValidateRequestCapabilities(prepared); err != nil {
 				return sendRequestValidationError(stream, err)
@@ -770,11 +789,11 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		}
 		return sendHTTPResponse(stream, resp, responseBody, contentType)
 	}
-	if imagesRewritten && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+	if attachmentDiagnostics && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
 		return sendImageUpstreamError(stream, resp, cfg.MaxResponseBytes)
 	}
 	if !cfg.TransformResponses || source == nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if imagesRewritten {
+		if attachmentDiagnostics {
 			return sendImageSafeHTTPResponse(stream, resp, cfg.MaxResponseBytes)
 		}
 		return sendHTTPResponseStream(stream, resp, cfg.MaxResponseBytes)
@@ -794,7 +813,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	if err != nil {
 		return sendError(stream, errorCode(err), safeError(err), true)
 	}
-	if imagesRewritten {
+	if attachmentDiagnostics {
 		respBody, _ = redactImageFailureJSON(respBody, "")
 	}
 	responseBody, responseContentType, transformErr := transformResponse(respBody, resp.Header, source)
@@ -813,7 +832,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	if transformErr != nil {
 		return sendError(stream, errorCode(transformErr), safeError(transformErr), true)
 	}
-	if imagesRewritten {
+	if attachmentDiagnostics {
 		responseBody, _ = redactImageFailureJSON(responseBody, "")
 	}
 	return sendHTTPResponse(stream, resp, responseBody, responseContentType)

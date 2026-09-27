@@ -345,10 +345,22 @@ func degradationAnswer(body []byte, contentType string) (string, error) {
 			}
 		}
 	}
-	if choices, ok := object["choices"].([]any); ok && len(choices) > 0 {
-		if choice, ok := choices[0].(map[string]any); ok {
+	if choices, ok := object["choices"].([]any); ok {
+		for _, value := range choices {
+			choice, ok := value.(map[string]any)
+			if !ok {
+				return "", fmt.Errorf("invalid upstream response choice")
+			}
+			if err := degradationResponseError(choice); err != nil {
+				return "", err
+			}
 			if reason, ok := choice["finish_reason"].(string); ok && reason != "" && reason != "stop" {
 				return "", fmt.Errorf("upstream response did not complete")
+			}
+			if message, ok := choice["message"].(map[string]any); ok {
+				if err := degradationResponseError(message); err != nil {
+					return "", err
+				}
 			}
 		}
 	}
@@ -390,8 +402,21 @@ func degradationFailureKind(kind string) bool {
 }
 
 func responsesOutputText(object map[string]any) string {
+	// A convenience summary or second completion can contradict the main
+	// output. Include all explicit answers for the ambiguity classifier, and
+	// deduplicate equivalent copies without changing the displayed answer.
+	var answers []string
+	seen := make(map[string]bool)
+	add := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" || seen[text] {
+			return
+		}
+		seen[text] = true
+		answers = append(answers, text)
+	}
 	if text, ok := object["output_text"].(string); ok {
-		return text
+		add(text)
 	}
 	if output, ok := object["output"].([]any); ok {
 		var texts []string
@@ -405,27 +430,37 @@ func responsesOutputText(object map[string]any) string {
 			}
 		}
 		if len(texts) > 0 {
-			return strings.Join(texts, "\n")
+			add(strings.Join(texts, "\n"))
 		}
 	}
-	if choices, ok := object["choices"].([]any); ok && len(choices) > 0 {
-		if choice, ok := choices[0].(map[string]any); ok {
+	if choices, ok := object["choices"].([]any); ok {
+		for _, value := range choices {
+			choice, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
 			if message, ok := choice["message"].(map[string]any); ok {
-				if text := contentText(message["content"]); text != "" {
-					return text
+				if role := protocol.StringValue(message["role"]); role == "" || role == "assistant" {
+					add(contentText(message["content"]))
 				}
 			}
 			if text, ok := choice["text"].(string); ok {
-				return text
+				add(text)
 			}
 		}
 	}
-	return ""
+	return strings.Join(answers, "\n")
 }
 
 func outputItemText(item map[string]any) string {
+	if role := protocol.StringValue(item["role"]); role != "" && role != "assistant" {
+		return ""
+	}
 	if text, ok := item["text"].(string); ok && item["type"] == "output_text" {
 		return text
+	}
+	if kind := protocol.StringValue(item["type"]); kind != "" && kind != "message" {
+		return ""
 	}
 	content, ok := item["content"].([]any)
 	if !ok {
@@ -456,6 +491,9 @@ func contentText(value any) string {
 	for _, item := range items {
 		part, ok := item.(map[string]any)
 		if !ok {
+			continue
+		}
+		if kind := protocol.StringValue(part["type"]); kind != "" && kind != "text" && kind != "output_text" {
 			continue
 		}
 		if text, ok := part["text"].(string); ok {

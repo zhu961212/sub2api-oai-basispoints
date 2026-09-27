@@ -128,7 +128,7 @@
     if (degradationButton) {
       degradationButton.disabled = locked || (!pendingCheck && (!supported || !accounts.some(canCheckAccount)));
       degradationButton.title = pendingCheck ? "仅查询上次检测任务，不重复提交检测请求" :
-        (supported ? "检测当前列表账号；疑似降智账号将勾选，保存后生效" : unavailableReason);
+        (supported ? "检测当前列表账号；发现疑似账号时勾选它们，并取消符合规则账号的勾选，保存后生效" : unavailableReason);
       degradationButton.textContent = checking && !checkingAccountID ? "正在检测列表账号…" :
         (pendingCheck ? "继续查询上次检测" : "一键检测降智账号");
     }
@@ -137,14 +137,14 @@
       entry.button.disabled = locked || (pendingCheck ? !pendingTarget : (!supported || !canCheckAccount(entry.account)));
       entry.button.title = pendingCheck ? "上次检测尚未确认，请先继续查询原任务" : !supported ? unavailableReason :
         (bpsDisabledAccounts.has(entry.account.id) ? "BPS 已停用，请重新勾选并保存后检测" :
-          (!entry.account.schedulable ? "账号不可调度，请先恢复账号" : "仅检测此账号，不修改账号选择"));
+          (!entry.account.schedulable ? "账号不可调度，请先恢复账号" : "仅检测此账号，不按探针结果改选；403 自动停用仍会生效"));
       entry.button.textContent = checking && checkingAccountID === entry.account.id ? "检测中…" : (pendingTarget ? "继续查询" : "降智检测");
     });
     var checkHint = id("account-check-hint");
     if (checkHint) checkHint.textContent = pendingCheck
       ? "上次检测结果未确认，可能已提交。请继续查询原任务；确认结束或过期前不会创建新检测。"
       : supported
-        ? "检测会发送真实请求。单号检测不修改选择；一键检测勾选疑似降智账号后需保存。检测使用当前表单快照，不自动保存配置。" +
+        ? "检测会发送真实请求并消耗额度，仅反映本次探针。单号不按探针结果改选；一键检测发现疑似账号时会勾选它们并取消符合规则账号的勾选，失败或跳过保持原选择，改选需保存。检测使用当前表单快照，不自动保存配置；403 自动停用仍按已保存开关执行，可立即取消相关账号勾选。" +
           (supportsScopedChecks() ? "" : "兼容模式由当前插件运行实例串行执行，无需修改宿主；提交失败可能仅表示回执未确认。")
         : unavailableReason;
     updateAccountActions();
@@ -385,9 +385,10 @@
     }
     var summary = document.createElement("span");
     summary.className = "result-summary";
-    summary.textContent = answeredDegradationCount(check) > 0
-      ? "检测完成：" + degraded.length + " 个疑似降智账号（按自定义“苹果17”规则，不代表可靠智力测评）"
-      : "检测结束：未获得有效回答，保留原账号选择。失败或跳过不等于降智。";
+    summary.textContent = (check.completed === true ? "检测完成：" : "检测未全部完成：") +
+      (answeredDegradationCount(check) > 0
+        ? degraded.length + " 个疑似降智账号（仅本次探针的自定义“苹果17”规则结果，不代表全面模型能力或可靠智力测评）"
+        : "未获得有效回答。失败或跳过不等于降智。");
     container.appendChild(summary);
     results.forEach(function (result, index) {
       if (!result || typeof result !== "object") {
@@ -974,8 +975,14 @@
           results.some(function (row) { return !row || !expected.has(row.account_id); })) {
         throw new Error("检测结果与本次账号快照不匹配，保留原账号选择");
       }
+      var selectedBeforeBps = selectedIDs.slice();
       updateBpsDisabledAccounts(details);
       syncAutomaticAccounts();
+      var bpsDeselected = selectedBeforeBps.filter(function (accountID) {
+        return bpsDisabledAccounts.has(accountID) && !isSelected(accountID);
+      });
+      var bpsNotice = bpsDeselected.length
+        ? " HTTP 403 自动停用已将 " + bpsDeselected.length + " 个账号取消勾选，无需再次保存。" : "";
       rememberAccountChecks(check);
       // A canceled scan may still include useful per-account failure details.
       check.state = "done";
@@ -990,11 +997,11 @@
             setAccountSelected(row.account_id, selected.has(row.account_id));
           }
         });
-        setHint("检测完成，已勾选 " + degraded.length + " 个疑似降智账号；点击保存后生效。失败或跳过的账号保留原选择。", "ok");
+        setHint("检测完成，已勾选 " + degraded.length + " 个疑似降智账号，并取消符合规则账号的勾选；点击保存后生效。失败或跳过的账号保留原选择（403 自动停用除外）。" + bpsNotice, "ok");
       } else {
-        setHint(check.completed === true
-          ? "检测结束，账号选择未改变。"
-          : "检测未全部完成，保留原账号选择：" + (result.message || "请查看逐账号结果"), check.completed === true ? "ok" : "error");
+        setHint((check.completed === true
+          ? "检测结束，未按探针结果调整账号选择。"
+          : "检测未全部完成，未按探针结果调整账号选择：" + (result.message || "请查看逐账号结果")) + bpsNotice, check.completed === true ? "ok" : "error");
       }
       renderAccountList();
       renderAccountHint();

@@ -6,10 +6,16 @@ func PrepareResponsesBody(source map[string]any, cfg Config) (map[string]any, er
 	return prepareResponsesBody(source, cfg)
 }
 
-// PrepareResponsesBodyForImageUpload freezes turn/task metadata from original
-// image content before upload assigns short-lived file IDs. The returned body
-// is an intermediate form: upload its images and validate it before forwarding.
+// PrepareResponsesBodyForImageUpload is retained for existing callers.
 func PrepareResponsesBodyForImageUpload(source map[string]any, cfg Config) (map[string]any, error) {
+	return PrepareResponsesBodyForAttachmentUpload(source, cfg)
+}
+
+// PrepareResponsesBodyForAttachmentUpload freezes turn/task metadata from the
+// original files/images before uploads assign short-lived file IDs. This is an
+// intermediate body: upload attachments, normalize image details, and validate
+// before forwarding. The original source remains intact for tool replay.
+func PrepareResponsesBodyForAttachmentUpload(source map[string]any, cfg Config) (map[string]any, error) {
 	body, err := prepareResponsesBodyWithImages(source, cfg, true)
 	if err != nil {
 		return nil, err

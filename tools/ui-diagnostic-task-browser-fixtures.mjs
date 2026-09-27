@@ -102,7 +102,7 @@ export async function runDiagnosticTaskDriver(stage, accounts) {
       for (const box of document.querySelectorAll('#account-list input')) if (!base.includes(Number(box.value))) box.click();
       Array.from(document.querySelectorAll('#model-list input')).find(box => box.value === 'gpt-6-astra').click();
       get('bps-403-toggle').click();
-      await diagnose(button(ids[1]), '账号选择未改变', base, editedModels);
+      await diagnose(button(ids[1]), '未按探针结果调整账号选择', base, editedModels);
       selection(base, editedModels); ready();
       assert(button(ids[1]).closest('.account-row').querySelector('.result-degraded'), 'Single task result missing');
       assert(!button(ids[0]).closest('.account-row').querySelector('.result-degraded'), 'Single result leaked across duplicate account names');
@@ -122,7 +122,7 @@ export async function runDiagnosticTaskDriver(stage, accounts) {
       ready(); selection(); send('done'); return;
     }
     if (stage === 'task-commit-timeout') {
-      await diagnose(button(ids[0]), '账号选择未改变'); ready(); selection(); send('done'); return;
+      await diagnose(button(ids[0]), '未按探针结果调整账号选择'); ready(); selection(); send('done'); return;
     }
     if (stage === 'task-unknown') {
       await diagnose(button(ids[0]), '状态未知'); pending();
@@ -134,14 +134,14 @@ export async function runDiagnosticTaskDriver(stage, accounts) {
       for (let attempt = 0; attempt < 2; attempt++) {
         await diagnose(bulk(), '状态未知', changed, editedModels); pending(changed, editedModels);
       }
-      await control('complete'); await diagnose(bulk(), '账号选择未改变', changed, editedModels);
+      await control('complete'); await diagnose(bulk(), '未按探针结果调整账号选择', changed, editedModels);
       ready(); selection(changed, editedModels); send('done'); return;
     }
     if (stage === 'task-identity') {
       await diagnose(button(ids[0]), '不匹配'); pending();
       await control('wrong-target'); await diagnose(bulk(), '不匹配'); pending();
       await control('wrong-owner'); await diagnose(bulk(), '实例已改变'); pending();
-      await control('complete'); await diagnose(bulk(), '账号选择未改变');
+      await control('complete'); await diagnose(bulk(), '未按探针结果调整账号选择');
       ready(); selection(); send('done'); return;
     }
     throw new Error('Unexpected task stage: ' + stage);

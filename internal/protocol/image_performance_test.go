@@ -9,10 +9,10 @@ func TestInlineImageSchemeValidationPreservesPayload(t *testing.T) {
 	for _, scheme := range []string{"data:", "DATA:", "DaTa:"} {
 		raw := scheme + "image/png;base64,AbCdEF+/=="
 		part := map[string]any{"type": "input_image", "image_url": raw}
-		if err := validateCapabilityImage(part, true); err != nil {
+		if err := validateCapabilityImage(part, true, false); err != nil {
 			t.Fatalf("inline scheme rejected: %v", err)
 		}
-		if err := validateCapabilityImage(part, false); err == nil {
+		if err := validateCapabilityImage(part, false, false); err == nil {
 			t.Fatal("inline scheme accepted with relay disabled")
 		}
 		if part["image_url"] != raw {
@@ -28,7 +28,7 @@ func BenchmarkInlineImageCapabilityValidation(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := validateCapabilityImage(part, true); err != nil {
+		if err := validateCapabilityImage(part, true, false); err != nil {
 			b.Fatal(err)
 		}
 	}

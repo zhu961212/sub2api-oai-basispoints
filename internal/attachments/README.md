@@ -1,9 +1,11 @@
-# Native Basis Points image attachments
+# Native Basis Points image and document attachments
 
 This package validates inline images and uploads user-message attachments using
 the selected request account and the caller's HTTP transport/proxy. Tool-result
 screenshots retain their original data URLs. There is no public image host,
 port, storage directory, third-party image service, or attachment setting.
+Inline PDF, DOC, and DOCX input_file blocks use the same native attachment
+transport and become file_id references in message and typed tool-result arrays.
 
 ## Protocol evidence
 
@@ -11,6 +13,29 @@ On September 26, 2026, the official Excel manifest located the frontend below:
 
 - https://bps.openai.com/basispoints/api/office/manifest.xml
 - https://bps.openai.com/basispoints/extension/360590d7-f8f9-4d88-bf75-0edfe0a4b9f3/assets/x-square-DUrhLSGN.js
+
+The manifest and this bundle were checked again on September 27, 2026. The
+manifest also advertises the Word Document host. The bundle provides these
+document-specific protocol anchors (minified function names are build-specific):
+
+- dOt creates FormData, calls append("file", e.file, e.file.name), and POSTs to
+  path "attachments" with the normal authentication configuration. No purpose
+  field is added. fOt reads response.openai_file_id, filename, and content_type.
+- Nme emits {type:"input_file",file_id:a} for ordinary non-image attachments.
+  Its alternate k$r path is used when a non-image file is larger than 32 MiB or
+  reported aggregate input tokens reach modelAutoCompactTokenLimit. That path
+  uses uploadedFileIds; d$r places their JSON array in attachment_file_ids and
+  removes inline file attachments. The bounded local adapter uses the ordinary
+  file-ID path and does not claim to implement the token-based fallback.
+- The accepted MIME and extension maps include application/pdf (.pdf),
+  application/msword (.doc), and
+  application/vnd.openxmlformats-officedocument.wordprocessingml.document
+  (.docx). The RDe validation path checks file headers, including PDF and ZIP
+  signatures, before uploading. These public bundle anchors confirm the native
+  upload/file-ID representation; they do not verify a live authenticated turn.
+
+The bundle does not contain file_data. Inline Responses file_data is therefore
+decoded and uploaded by this adapter, never blindly forwarded upstream.
 
 Its Nme path constructs user-message images with file_id. Its lge / Eqr paths
 construct tool-result images with image_url data URLs and use nullish defaults
@@ -84,3 +109,37 @@ and malformed upload responses. Actual run results are recorded in
 docs/release-0.5.23-2026-09-26.md. Local tests do not prove real upstream image
 recognition or deployment. A generic 422 alone does not establish the unique
 cause of the production rejection.
+
+## Document implementation boundaries
+
+RewriteFiles accepts base64 data URLs with one of the three document MIME types,
+or raw base64 plus a matching .pdf/.doc/.docx filename. A data URL without a
+filename gets attachment.pdf, attachment.doc, or attachment.docx. Names may
+contain Unicode, but must be valid UTF-8, at most 255 bytes, and contain no path
+separators or control characters. MIME, extension, and file signature must
+agree. The signatures checked are %PDF-, OLE Compound File for .doc, and the
+ZIP local-file header for .docx; this is not a full PDF, OLE, or OOXML parser.
+
+Document limits are 20 MiB decoded per file and 20 inline file occurrences per
+request; images retain their independent 20-occurrence limit. Images and files
+share one 32 MiB decoded request budget. Repeated attachments and conversation/
+tool history count toward these limits. ValidateMixedInputs checks every inline
+image and document before either upload path runs, without network, cache, or
+source mutation, so an invalid PDF cannot trigger an earlier image upload.
+Existing native file IDs are preserved. Remote
+file_url input is rejected; this adapter does not fetch arbitrary document URLs.
+
+All documents validate before upload, and inline file_data/filename fields are
+replaced only after all document uploads succeed. Streaming multipart preserves
+the exact original bytes, MIME, and safe filename. The shared bounded cache and
+upload limits apply; document digests additionally include a separate document
+namespace and filename, preserving same-content/different-name semantics.
+File contents, filenames, and unredacted upstream bodies are never placed in
+error messages or retained in the persistent cache. No local file is created.
+
+Document regressions cover PDF/DOC/DOCX multipart bytes and headers, native ID
+preservation, message/function/custom-tool content, MIME and filename mismatch,
+invalid base64 and signatures, request limits, cache identity and filename
+isolation, cancellation, redirects, atomic source preservation on failure, and
+mixed image/document preflight and shared byte limits.
+No paid upstream request or authenticated PDF/Word acceptance test is claimed.

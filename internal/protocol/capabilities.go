@@ -85,11 +85,11 @@ func validateRequestCapabilities(source map[string]any, allowInline bool) error 
 			// The official BPS client returns tool screenshots as data URLs.
 			// The attachment layer still validates their bytes and resource
 			// limits, but must not convert them into user attachment IDs.
-			if err := validateCapabilityContent(item["output"], fmt.Sprintf("input[%d].output", index), true); err != nil {
+			if err := validateCapabilityContent(item["output"], fmt.Sprintf("input[%d].output", index), true, allowInline); err != nil {
 				return err
 			}
 		}
-		if err := validateCapabilityContent(item["content"], fmt.Sprintf("input[%d].content", index), allowInline); err != nil {
+		if err := validateCapabilityContent(item["content"], fmt.Sprintf("input[%d].content", index), allowInline, allowInline); err != nil {
 			return err
 		}
 	}
@@ -160,7 +160,7 @@ func RequestCapabilityInstructions(source map[string]any) string {
 	return "Hosted tools unavailable through Basis Points: " + strings.Join(names, ", ") + ". These declarations were omitted. Do not claim to have used them. Use a suitable declared client tool, or explain the limitation."
 }
 
-func validateCapabilityContent(value any, path string, allowInline bool) error {
+func validateCapabilityContent(value any, path string, allowInline, prepareAttachments bool) error {
 	parts, _ := value.([]any)
 	for index, raw := range parts {
 		part := objectValue(raw)
@@ -169,25 +169,29 @@ func validateCapabilityContent(value any, path string, allowInline bool) error {
 			if part["type"] != "input_image" {
 				return capabilityError(fmt.Sprintf("image type must be input_image (path=%s[%d])", path, index))
 			}
-			if err := validateCapabilityImage(part, allowInline); err != nil {
+			if err := validateCapabilityImage(part, allowInline, prepareAttachments); err != nil {
 				return capabilityError(fmt.Sprintf("%s (path=%s[%d]; type=input_image)", err.Error(), path, index))
 			}
-		case "input_file", "input_audio", "input_video":
+		case "input_file":
+			if err := validateCapabilityFile(part, prepareAttachments); err != nil {
+				return capabilityError(fmt.Sprintf("%s (path=%s[%d]; type=input_file)", err.Error(), path, index))
+			}
+		case "input_audio", "input_video":
 			// Only fixed protocol type names reach this branch. Never echo URLs,
 			// file IDs, inline bytes, or arbitrary client-controlled type names.
-			return capabilityError(fmt.Sprintf("Basis Points accepts text and input_image content only (path=%s[%d]; type=%s)", path, index, stringValue(part["type"])))
+			return capabilityError(fmt.Sprintf("Basis Points accepts text, input_image and document input_file content only (path=%s[%d]; type=%s)", path, index, strings.ToLower(stringValue(part["type"]))))
 		}
 	}
 	return nil
 }
 
-func validateCapabilityImage(part map[string]any, allowInline bool) error {
+func validateCapabilityImage(part map[string]any, allowInline, prepareAttachments bool) error {
 	if fileID, exists := part["file_id"]; exists && fileID != nil && fileID != "" {
 		value, ok := fileID.(string)
 		if !ok || len(value) > 512 || strings.TrimSpace(value) != value || strings.IndexFunc(value, func(r rune) bool { return r <= ' ' || r == 127 || strings.ContainsRune("/?#", r) }) >= 0 || (part["image_url"] != nil && part["image_url"] != "") {
 			return capabilityError("Basis Points input_image requires either a valid file_id or image_url, not both")
 		}
-		return validateImageDetail(part)
+		return validateImageDetail(part, prepareAttachments)
 	}
 	raw, ok := part["image_url"].(string)
 	if !ok || raw == "" {
@@ -209,11 +213,16 @@ func validateCapabilityImage(part map[string]any, allowInline bool) error {
 			return capabilityError("Basis Points input_image requires an absolute HTTPS URL without embedded credentials")
 		}
 	}
-	return validateImageDetail(part)
+	return validateImageDetail(part, prepareAttachments)
 }
 
-func validateImageDetail(part map[string]any) error {
+func validateImageDetail(part map[string]any, prepareAttachments bool) error {
 	if detail, exists := part["detail"]; exists && detail != nil {
+		// Client document renderers use original. Normalize it to the native
+		// high setting before forwarding, without changing any image bytes.
+		if prepareAttachments && detail == "original" {
+			return nil
+		}
 		switch stringValue(detail) {
 		case "auto", "low", "high":
 		default:
