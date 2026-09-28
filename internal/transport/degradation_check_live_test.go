@@ -21,6 +21,7 @@ func TestLiveDegradationRunner(t *testing.T) {
 		t.Skip("native Codex probe requires BASISPOINTS_LIVE_NATIVE_DEGRADATION=1")
 	}
 	accessToken, accountID, proxyURL := liveCredentials(t)
+	t.Logf("native probe model=%s reasoning=%s", nativeDegradationModel, nativeDegradationReasoningEffort)
 	transport := New()
 	defer transport.Shutdown()
 	transport.mu.Lock()
@@ -34,13 +35,14 @@ func TestLiveDegradationRunner(t *testing.T) {
 		},
 	}
 	transport.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	started := time.Now()
 	cfg := protocol.DefaultConfig()
 	cfg.DegradationCheck = true
 	cfg.DegradationCheckAccountID = 1
-	check, err := transport.runDegradationCheck(ctx, cfg)
+	executionBudget, _ := backgroundDegradationBudgets(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), executionBudget)
+	defer cancel()
+	check, err := transport.runBackgroundDegradationCheck(ctx, cfg)
 	if err != nil || !check.Completed || len(check.Results) != 1 {
 		t.Fatalf("degradation runner completed=%t result_count=%d error=%v", check.Completed, len(check.Results), err)
 	}

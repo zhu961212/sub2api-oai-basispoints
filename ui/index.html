@@ -28,7 +28,7 @@
             <label class="field" for="auto-degradation-interval">常规检测间隔（分钟）
               <input id="auto-degradation-interval" type="number" min="5" max="1440" step="1" value="30" inputmode="numeric" />
             </label>
-            <span id="degradation-fixed-model" class="hint">原生检测固定使用 gpt-6-astra，不随业务模型选择变化。</span>
+            <span id="degradation-fixed-model" class="hint">原生检测固定使用 gpt-6-astra，思考程度固定为 XHigh（xhigh），不随业务模型选择变化。</span>
           </div>
           <span id="auto-degradation-hint" class="hint">手动和自动检测均请求 OpenAI 原生 Codex。开关保存后生效；默认关闭，常规间隔默认 30 分钟（5–1440）。疑似降智或恢复时 5 分钟后复测，连续两次一致才切换：降智启用 BPS，恢复取消 BPS。失败或未检测保留当前路由；关闭自动停止定时检测并保留最后有效路由。检测发送真实请求并消耗额度。</span>
           <span id="auto-degradation-status" class="hint" role="status">自动检测已关闭</span>

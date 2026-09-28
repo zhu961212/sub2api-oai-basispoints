@@ -15,6 +15,8 @@
   // 写入与主动测试会触发宿主的二次验证（step-up），因此单独给更长的超时。
   var DEFAULT_TIMEOUT_MS = 12000;
   var STEP_UP_TIMEOUT_MS = 90000;
+  var DIAGNOSTIC_MAX_EXECUTION_MS = 1805000;
+  var DIAGNOSTIC_POLL_GRACE_MS = 10000;
 
   function readBridgeToken() {
     var hash = String((global.location && global.location.hash) || "");
@@ -51,8 +53,8 @@
     var diagnosticTask = null;
     var diagnosticOperation = null;
     var diagnosticWaiters = new Map();
-    var diagnosticPollMs = settings.diagnosticPollMs || 1000;
-    var diagnosticMaxPolls = settings.diagnosticMaxPolls || 150;
+    var diagnosticPollMs = Number.isSafeInteger(settings.diagnosticPollMs) && settings.diagnosticPollMs > 0 && settings.diagnosticPollMs <= 10000 ? settings.diagnosticPollMs : 1000;
+    var diagnosticMaxPolls = Number.isSafeInteger(settings.diagnosticMaxPolls) && settings.diagnosticMaxPolls > 0 ? settings.diagnosticMaxPolls : null;
 
     function onMessage(event) {
       if (disposed) {
@@ -216,8 +218,22 @@
       return result;
     }
 
+    function diagnosticPollWindow(task, entry) {
+      var execution = entry.execution_timeout_ms;
+      if (!Number.isSafeInteger(execution) || execution <= 0 || execution > DIAGNOSTIC_MAX_EXECUTION_MS) {
+        var seconds = task.config && task.config.timeout_seconds;
+        if (!Number.isSafeInteger(seconds) || seconds < 10 || seconds > 1800) seconds = 300;
+        execution = seconds * 1000;
+      }
+      return execution + DIAGNOSTIC_POLL_GRACE_MS;
+    }
+
     function followDiagnosticTask(task, entry, polls) {
-      if (polls === 0) task.pollDeadline = Date.now() + 150000;
+      if (polls === 0) {
+        var windowMs = diagnosticPollWindow(task, entry);
+        task.pollDeadline = Date.now() + windowMs;
+        task.maxPolls = diagnosticMaxPolls || Math.ceil(windowMs / diagnosticPollMs);
+      }
       if (entry.state === "completed" || entry.state === "failed") {
         if (entry.result) return verifiedDiagnosticResult(task, entry);
         if (entry.state === "failed") {
@@ -235,7 +251,7 @@
           ? "检测提交未确认，任务仍处于准备状态；仅继续查询，等待任务过期后再试"
           : "检测任务状态未知，可能已提交；仅可继续查询，不能重复发起");
       }
-      if (polls >= diagnosticMaxPolls || Date.now() >= task.pollDeadline) throw pendingDiagnosticError("检测仍在执行或排队，当前轮询已结束；点击继续查询，不会重复提交");
+      if (polls >= task.maxPolls || Date.now() >= task.pollDeadline) throw pendingDiagnosticError("检测仍在执行或排队，当前轮询已结束；点击继续查询，不会重复提交");
       return diagnosticDelay().then(function () { return queryDiagnosticTask(task); })
         .then(function (next) { return followDiagnosticTask(task, next, polls + 1); });
     }

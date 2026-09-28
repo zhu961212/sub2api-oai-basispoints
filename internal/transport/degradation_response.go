@@ -17,10 +17,11 @@ import (
 func readDegradationResponse(ctx context.Context, body io.Reader, contentType string, max int) ([]byte, string, error) {
 	var buffered bytes.Buffer
 	var decoder sseRelayDecoder
+	var completedOutput degradationCompletedOutput
 	var terminal []byte
 	finished := errors.New("degradation response finished")
 	emit := func(event sseRelayEvent) error {
-		if degradationFailureKind(event.event) {
+		if protocol.ClassifyResponseTerminal(event.event, nil).Failed() {
 			return fmt.Errorf("upstream response did not complete")
 		}
 		data := strings.TrimSpace(event.data)
@@ -38,6 +39,9 @@ func readDegradationResponse(ctx context.Context, body io.Reader, contentType st
 		if state.Failed() {
 			return fmt.Errorf("upstream response did not complete")
 		}
+		if err := completedOutput.consume(event.event, payload); err != nil {
+			return err
+		}
 		if state == protocol.TerminalCompleted {
 			if err := degradationResponseError(payload); err != nil {
 				return err
@@ -46,6 +50,7 @@ func readDegradationResponse(ctx context.Context, body io.Reader, contentType st
 			if !ok {
 				return fmt.Errorf("invalid upstream completed response")
 			}
+			completedOutput.fill(response)
 			terminal = protocol.JSONBytes(response)
 			return finished
 		}

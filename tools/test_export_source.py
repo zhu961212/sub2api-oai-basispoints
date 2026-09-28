@@ -20,6 +20,7 @@ class SourceExportBoundaryTests(unittest.TestCase):
                      "tools/host-diagnostic-integration/diagnostic_jobs_host_test.go.txt",
                      "tools/host-relay-integration/relay_scope_host_test.go.txt",
                      "tools/host-relay-integration/signed_package_host_test.go.txt",
+                     "tools/host-relay-integration/signed_release_host_test.go.txt",
                      "internal/attachments/testdata/sample.pdf",
                      "internal/attachments/testdata/sample.docx",
                      "tools/test_export_source.py", "ui/index.html"):
@@ -35,12 +36,13 @@ class SourceExportBoundaryTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(exporter.source_path_allowed(name))
 
-    def test_source_archive_keeps_only_the_three_fixed_text_fixtures(self):
+    def test_source_archive_keeps_only_declared_fixed_text_fixtures(self):
         required = ("README.md", "go.mod", "manifest.source.json")
         fixtures = (
             "tools/host-diagnostic-integration/diagnostic_jobs_host_test.go.txt",
             "tools/host-relay-integration/relay_scope_host_test.go.txt",
             "tools/host-relay-integration/signed_package_host_test.go.txt",
+            "tools/host-relay-integration/signed_release_host_test.go.txt",
         )
         rejected = (
             "tools/notes.txt", "docs/notes.txt", "ui/credentials.txt",

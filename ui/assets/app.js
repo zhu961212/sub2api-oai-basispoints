@@ -160,13 +160,19 @@
       ? "上次检测结果未确认，可能已提交。请继续查询原任务；确认结束或过期前不会创建新检测。"
       : supported
         ? "手动检测请求 OpenAI 原生 Codex，会消耗额度，仅反映本次探针。单号不改选；自动模式下批量也不改选。手动模式批量发现疑似账号时勾选它们并取消符合规则账号的勾选，失败或跳过保持原选择，改选需保存。检测使用当前表单快照，不自动保存配置。BPS 403 保护不阻止原生检测，原生错误不会触发 BPS 停用。" +
-          (supportsScopedChecks() ? "" : "兼容模式由当前插件运行实例串行执行，无需修改宿主；提交失败可能仅表示回执未确认。")
+          (hasDiagnosticTaskCapability() ? "后台检测任务依次执行，同一任务内最多 8 个账号并发，各用自己的凭据与绑定代理；按检测预算等待，无需修改宿主。提交失败可能仅表示回执未确认。" : "")
         : unavailableReason;
     updateAccountActions();
   }
 
   function supportsAccountChecks() {
-    return supportsScopedChecks() || (typeof bridge.supportsDiagnosticTasks === "function" && bridge.supportsDiagnosticTasks() === true);
+    return hasDiagnosticTaskCapability()
+      ? typeof bridge.supportsDiagnosticTasks === "function" && bridge.supportsDiagnosticTasks() === true
+      : supportsScopedChecks();
+  }
+
+  function hasDiagnosticTaskCapability() {
+    return typeof bridge.diagnosticTaskInfo === "function" && !!bridge.diagnosticTaskInfo();
   }
 
   function supportsScopedChecks() {
@@ -859,8 +865,8 @@
     return normalized;
   }
 
-  function sameAccountIDs(config, expected) {
-    var actual = configAccountIDs(config);
+  function sameAccountIDs(config, expected, key) {
+    var actual = configAccountIDs(config, key);
     var actualSet = new Set(actual);
     return actual.length === expected.length && expected.every(function (value) {
       return actualSet.has(value);
@@ -886,10 +892,7 @@
   function sameAccountPolicy(config, expected) {
     if (!sameAccountIDs(config, configAccountIDs(expected))) return false;
     if ((config.auto_select_new_accounts === true) !== (expected.auto_select_new_accounts === true)) return false;
-    var actual = configAccountIDs(config, "excluded_account_ids");
-    var excluded = configAccountIDs(expected, "excluded_account_ids");
-    var actualSet = new Set(actual);
-    if (actual.length !== excluded.length || !excluded.every(function (value) { return actualSet.has(value); })) return false;
+    if (!sameAccountIDs(config, configAccountIDs(expected, "excluded_account_ids"), "excluded_account_ids")) return false;
     var actualAcks = configBpsAcknowledgements(config);
     var expectedAcks = configBpsAcknowledgements(expected);
     var keys = Object.keys(expectedAcks);
@@ -1072,6 +1075,23 @@
       });
   }
 
+  function verifySavedConfig(config, expected, readBack) {
+    verifyBpsPolicies(config, expected);
+    verifyAutoDegradation(config, expected);
+    verifyNativeTimezonePolicy(config, expected);
+    var prefix = readBack ? "重新读取的" : "宿主返回的";
+    var suffix = readBack ? "，请重试或检查宿主日志" : "";
+    if (!sameAccountPolicy(config, expected)) {
+      throw new Error(prefix + "账号选择、自动接入模式或排除名单与提交内容不一致" + suffix);
+    }
+    if (!sameModels(config, expected.enabled_models)) {
+      throw new Error(prefix + "模型选择与提交内容不一致" + suffix);
+    }
+    if (config.degradation_check === true || config.degradation_check_account_id || config.degradation_check_account_ids || config.diagnostic_task) {
+      throw new Error(readBack ? "重新读取的配置仍有降智检测标记，请重新保存配置" : "宿主未清除降智检测标记，请重新保存配置");
+    }
+  }
+
   function handleSave(event) {
     event.preventDefault();
     if (saving || loading || checking || !configReady) {
@@ -1087,35 +1107,13 @@
     bridge
       .saveConfig(submitted)
       .then(function (normalized) {
-        verifyBpsPolicies(normalized, submitted);
-        verifyAutoDegradation(normalized, submitted);
-        verifyNativeTimezonePolicy(normalized, submitted);
-        if (!sameAccountPolicy(normalized, submitted)) {
-          throw new Error("宿主返回的账号选择、自动接入模式或排除名单与提交内容不一致");
-        }
-        if (!sameModels(normalized, submitted.enabled_models)) {
-          throw new Error("宿主返回的模型选择与提交内容不一致");
-        }
-        if (normalized.degradation_check === true || normalized.degradation_check_account_id || normalized.degradation_check_account_ids || normalized.diagnostic_task) {
-          throw new Error("宿主未清除降智检测标记，请重新保存配置");
-        }
+        verifySavedConfig(normalized, submitted, false);
         writeAcknowledged = true;
         setHint("正在重新读取配置，确认保存结果…");
         return bridge.loadConfig();
       })
       .then(function (persisted) {
-        verifyBpsPolicies(persisted, submitted);
-        verifyAutoDegradation(persisted, submitted);
-        verifyNativeTimezonePolicy(persisted, submitted);
-        if (!sameAccountPolicy(persisted, submitted)) {
-          throw new Error("重新读取的账号选择、自动接入模式或排除名单与提交内容不一致，请重试或检查宿主日志");
-        }
-        if (!sameModels(persisted, submitted.enabled_models)) {
-          throw new Error("重新读取的模型选择与提交内容不一致，请重试或检查宿主日志");
-        }
-        if (persisted.degradation_check === true || persisted.degradation_check_account_id || persisted.degradation_check_account_ids || persisted.diagnostic_task) {
-          throw new Error("重新读取的配置仍有降智检测标记，请重新保存配置");
-        }
+        verifySavedConfig(persisted, submitted, true);
         applyConfig(persisted);
         setHint("已保存，并已重新读取确认。", "ok");
         return refreshStatus(true);
@@ -1156,8 +1154,8 @@
       else snapshot.degradation_check_account_ids = targets.slice();
     }
     var previousCheck = resuming ? pendingAccountCheck.previousCheck : lastDegradationCheck;
-    var compatible = resuming || !supportsScopedChecks();
-    if (compatible && !resuming) pendingAccountCheck = { accountID: single ? accountID : 0, targets: targets.slice(), snapshot: snapshot, previousCheck: previousCheck };
+    var background = resuming || hasDiagnosticTaskCapability();
+    if (background && !resuming) pendingAccountCheck = { accountID: single ? accountID : 0, targets: targets.slice(), snapshot: snapshot, previousCheck: previousCheck };
     checking = true;
     checkingAccountID = single ? accountID : 0;
     // Invalidate passive replies started before this diagnostic.
@@ -1166,7 +1164,7 @@
     renderDegradationResult({ state: "running" });
     setHint(resuming ? "正在查询上次检测任务，不会重复提交…" : single ? "正在检测账号 #" + accountID + "…" : "正在检测当前列表账号…");
     scheduleResize();
-    var operation = resuming ? bridge.resumeDiagnosticTask() : compatible ? bridge.testDiagnosticTask(snapshot) : bridge.testScoped(snapshot);
+    var operation = resuming ? bridge.resumeDiagnosticTask() : background ? bridge.testDiagnosticTask(snapshot) : bridge.testScoped(snapshot);
     return operation.then(function (result) {
       if (disposed) return;
       var details = result && typeof result.status_json === "string" ? JSON.parse(result.status_json) : null;
@@ -1219,7 +1217,7 @@
       renderDegradationResult(previousCheck);
       var pending = hasPendingAccountCheck();
       if (!pending) pendingAccountCheck = null;
-      setHint("检测失败：" + error.message + (pending
+      setHint((pending ? "检测结果未确认：" : "检测失败：") + error.message + (pending
         ? "。账号选择未自动保存；请继续查询上次检测，不会重复提交。"
         : "。账号选择未自动保存。"), "error");
     }).then(function () {

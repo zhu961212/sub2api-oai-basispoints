@@ -18,9 +18,13 @@ import (
 const nativeDegradationResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 
 const nativeDegradationModel = config.DefaultDegradationCheckModel
+const nativeDegradationReasoningEffort = "xhigh"
 
-// Matches the supported host's canonical native OAuth probe identity.
-const nativeDegradationUserAgent = "codex-tui/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
+// The synthetic probe owns its client identity. The old host's 0.146.0
+// identity is rejected for the fixed model. This version matches the locally
+// installed Codex client verified with a real native probe on 2026-09-27.
+const nativeDegradationClientVersion = "0.158.0-alpha.2.1"
+const nativeDegradationUserAgent = "codex-tui/" + nativeDegradationClientVersion + " (Ubuntu 22.4.0; x86_64) xterm-256color"
 
 // The legacy model argument cannot override the fixed probe, including when
 // a previously prepared job or persisted state supplies an older value.
@@ -41,10 +45,11 @@ func prepareNativeDegradationRequest(ctx context.Context, host pluginv1.HostServ
 		return nil, "", fmt.Errorf("host returned an incompatible native OAuth identity")
 	}
 	headers := make(http.Header)
-	// Only native account/client identity may be carried from the host.
+	// Carry native account identity, but do not inherit the old host's
+	// client-version defaults into this plugin-owned synthetic request.
 	for key, values := range identity.GetHeaders() {
 		switch strings.ToLower(key) {
-		case "chatgpt-account-id", "x-openai-account-id", "x-openai-fedramp", "user-agent", "originator", "version", "x-codex-installation-id", "x-codex-turn-metadata":
+		case "chatgpt-account-id", "x-openai-account-id", "x-openai-fedramp", "x-codex-installation-id", "x-codex-turn-metadata":
 			for _, value := range values.GetValues() {
 				headers.Add(key, value)
 			}
@@ -60,21 +65,15 @@ func prepareNativeDegradationRequest(ctx context.Context, host pluginv1.HostServ
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Accept", "text/event-stream")
 	headers.Set("OpenAI-Beta", "responses=experimental")
-	if headers.Get("User-Agent") == "" {
-		headers.Set("User-Agent", nativeDegradationUserAgent)
-	}
-	if headers.Get("Originator") == "" {
-		headers.Set("Originator", "codex-tui")
-	}
-	if headers.Get("Version") == "" {
-		headers.Set("Version", "0.146.0")
-	}
+	headers.Set("User-Agent", nativeDegradationUserAgent)
+	headers.Set("Originator", "codex-tui")
+	headers.Set("Version", nativeDegradationClientVersion)
 	body := protocol.JSONBytes(map[string]any{
 		"model":        nativeDegradationModel,
 		"input":        []map[string]any{{"role": "user", "content": []map[string]any{{"type": "input_text", "text": degradationCheckPrompt}}}},
 		"instructions": "Answer the user's question directly and accurately.",
 		"stream":       true, "store": false,
-		"reasoning": map[string]any{"effort": "low"},
+		"reasoning": map[string]any{"effort": nativeDegradationReasoningEffort},
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, nativeDegradationResponsesURL, bytes.NewReader(body))
 	if err != nil {

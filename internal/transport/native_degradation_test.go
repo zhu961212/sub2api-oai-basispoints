@@ -18,10 +18,13 @@ func TestNativeDegradationRequestIgnoresBPSRoutingAndPayloadSettings(t *testing.
 	host := &degradationTestHost{fakeHost: &fakeHost{
 		token: token(t, "jwt-child"),
 		headers: map[string]*pluginv1.HeaderValues{
-			"ChatGPT-Account-ID":                           {Values: []string{"host-parent"}},
-			"X-OpenAI-FedRAMP":                             {Values: []string{"true"}},
-			"Authorization":                                {Values: []string{"Bearer wrong-header-token"}},
-			"X-Basispoints-Auth-Mode":                      {Values: []string{"chatgpt"}},
+			"User-Agent":              {Values: []string{"codex_cli_rs/0.146.0 (Linux)"}},
+			"Originator":              {Values: []string{"codex_cli_rs"}},
+			"Version":                 {Values: []string{"0.146.0"}},
+			"ChatGPT-Account-ID":      {Values: []string{"host-parent"}},
+			"X-OpenAI-FedRAMP":        {Values: []string{"true"}},
+			"Authorization":           {Values: []string{"Bearer wrong-header-token"}},
+			"X-Basispoints-Auth-Mode": {Values: []string{"chatgpt"}},
 			"X-OpenAI-Internal-Basispoints-Client-Product": {Values: []string{"basispoints-excel-plugin"}},
 			"Origin":              {Values: []string{"https://bps.openai.com"}},
 			"Proxy-Authorization": {Values: []string{"must-not-forward"}},
@@ -49,6 +52,9 @@ func TestNativeDegradationRequestIgnoresBPSRoutingAndPayloadSettings(t *testing.
 		if r.Header.Get("OpenAI-Beta") != "responses=experimental" || r.Header.Get("Accept") != "text/event-stream" {
 			t.Fatal("native protocol headers missing")
 		}
+		if r.Header.Get("User-Agent") != nativeDegradationUserAgent || r.Header.Get("Version") != nativeDegradationClientVersion || r.Header.Get("Originator") != "codex-tui" {
+			t.Fatal("host legacy client identity overrode the compatible native probe")
+		}
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
@@ -60,7 +66,7 @@ func TestNativeDegradationRequestIgnoresBPSRoutingAndPayloadSettings(t *testing.
 			t.Fatal("native probe contains BPS-only payload fields")
 		}
 		reasoning, _ := body["reasoning"].(map[string]any)
-		if reasoning["effort"] != "low" || !strings.Contains(string(protocol.JSONBytes(body["input"])), degradationCheckPrompt) {
+		if reasoning["effort"] != "xhigh" || !strings.Contains(string(protocol.JSONBytes(body["input"])), degradationCheckPrompt) {
 			t.Fatal("native probe prompt or reasoning changed")
 		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(protocol.JSONBytes(map[string]any{"output_text": "iPhone 17"}))))}, nil

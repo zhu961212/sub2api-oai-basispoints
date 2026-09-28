@@ -419,12 +419,12 @@ func (t *Transport) runDiagnosticJob(job *diagnosticJob, host pluginv1.HostServi
 	currentHost, closed := t.host, t.closed
 	t.mu.RUnlock()
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+	ctx, cancel := context.WithCancel(s.ctx)
 	var response *pluginv1.TestConfigResponse
 	if closed || currentHost != host {
 		response = &pluginv1.TestConfigResponse{Success: false, Message: "plugin runtime changed before diagnostic execution"}
 	} else {
-		check, err := t.runDegradationCheck(ctx, cfg)
+		check, err := t.runBackgroundDegradationCheck(ctx, cfg)
 		check.RequestID = job.TaskID
 		message := "account degradation check completed"
 		if err != nil {
@@ -486,7 +486,8 @@ func (t *Transport) diagnosticStatusJSON(statusJSON string) string {
 		if state == "prepared" && now.After(job.ExpiresAt) {
 			state = "expired"
 		}
-		item := map[string]any{"task_id": id, "state": state}
+		executionBudget, _ := backgroundDegradationBudgets(job.Snapshot)
+		item := map[string]any{"task_id": id, "state": state, "execution_timeout_ms": executionBudget.Milliseconds()}
 		if state == "prepared" {
 			item["receipt"] = job.Receipt
 		}

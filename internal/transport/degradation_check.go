@@ -55,8 +55,12 @@ func (t *Transport) runDegradationCheck(ctx context.Context, c protocol.Config) 
 }
 
 func (t *Transport) runDegradationCheckWithBudget(ctx context.Context, c protocol.Config, budget time.Duration) (degradationCheckResult, error) {
-	// Bound the complete scan, including queued batches and account enumeration,
-	// so the host can return results before its 30-second TestConfig deadline.
+	return t.runDegradationCheckWithBudgets(ctx, c, budget, degradationCheckTimeout)
+}
+
+func (t *Transport) runDegradationCheckWithBudgets(ctx context.Context, c protocol.Config, budget, accountBudget time.Duration) (degradationCheckResult, error) {
+	// Bound enumeration and all queued waves independently of the per-account
+	// timeout. Synchronous and background callers supply different budgets.
 	scanCtx, cancelScan := context.WithTimeout(ctx, budget)
 	defer cancelScan()
 	result := degradationCheckResult{
@@ -174,7 +178,7 @@ func (t *Transport) runDegradationCheckWithBudget(ctx context.Context, c protoco
 					return
 				}
 				account := accounts[index]
-				checkCtx, cancel := context.WithTimeout(scanCtx, degradationCheckTimeout)
+				checkCtx, cancel := context.WithTimeout(scanCtx, accountBudget)
 				status, answer, checkErr := t.checkDegradationAccount(checkCtx, c, host, base, account.id, model)
 				cancel()
 				result.Results[index].Status = status
@@ -333,31 +337,13 @@ func degradationAnswer(body []byte, contentType string) (string, error) {
 // gateways keep partial output inside a failed envelope without copying the
 // error or terminal status into the nested response.
 func degradationResponseError(object map[string]any) error {
-	if err := degradationExplicitFailure(object); err != nil {
-		return err
+	if terminal := protocol.ClassifyResponseTerminal("", object); terminal.Failed() {
+		return protocol.ResponseTerminalError(terminal, object)
 	}
 	if status, ok := object["status"].(string); ok && status != "" && status != "completed" {
 		return fmt.Errorf("upstream response did not complete")
 	}
 	return nil
-}
-
-// Progress events may have an in_progress status. Explicit failure evidence is
-// rejected immediately without treating ordinary progress as terminal.
-func degradationExplicitFailure(object map[string]any) error {
-	if terminal := protocol.ClassifyResponseTerminal("", object); terminal.Failed() {
-		return protocol.ResponseTerminalError(terminal, object)
-	}
-	return nil
-}
-
-func degradationFailureKind(kind string) bool {
-	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "error", "failed", "incomplete", "cancelled", "canceled", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
-		return true
-	default:
-		return false
-	}
 }
 
 func responsesOutputText(object map[string]any) string {

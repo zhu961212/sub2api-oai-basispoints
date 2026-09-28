@@ -2003,7 +2003,8 @@ function createBridgeHarness(options = {}) {
     setTimeout(callback, delay) { const id = ++nextID; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
   };
-  vm.runInNewContext(bridgeSource, { window, console }, { filename: "ui/assets/bridge-v1.js" });
+  const Clock = options.clock ? class extends Date { static now() { return options.clock.now; } } : Date;
+  vm.runInNewContext(bridgeSource, { window, console, Date: Clock }, { filename: "ui/assets/bridge-v1.js" });
   const bridge = window.Sub2APIPluginBridge.create(options.settings || {});
   return {
     bridge, sent, timers, parent,
@@ -2024,6 +2025,8 @@ function createBridgeHarness(options = {}) {
 function createTaskServer(options = {}) {
   const server = {
     store: options.store || { config: { account_ids: [1] } }, ownerID: "instance-a",
+    scoped: options.scoped === true, advertiseTasks: options.advertiseTasks !== false, available: options.available !== false,
+    executionTimeoutMs: options.executionTimeoutMs,
     tasks: new Map(), commands: [], diagnostics: 0, ordinarySaves: [], legacyTests: 0,
     prepareMode: options.prepareMode, commitMode: options.commitMode, statusError: false,
     verdicts: options.verdicts || {}, statusDetails: options.statusDetails || {},
@@ -2036,18 +2039,18 @@ function createTaskServer(options = {}) {
       task.result = result;
     },
     handle(request) {
-      if (request.type === "config.load") return { config: clone(server.store.config) };
+      if (request.type === "config.load") return { config: clone(server.store.config), capabilities: server.scoped ? ["config.testScoped"] : [] };
       if (request.type === "plugin.status") {
         if (server.statusError) return { ok: false, error: "status unavailable" };
         const busy = [...server.tasks.values()].some(task => ["prepared", "queued", "running", "unknown"].includes(task.state));
         return { result: { healthy: true, status_json: JSON.stringify({
           accounts: [1, 2, 3].map(id => ({ id, name: "Account " + id, schedulable: true })),
           ...server.statusDetails,
-          diagnostic_tasks: { protocol: "config-job-v1", owner_id: server.ownerID, available: true,
+          diagnostic_tasks: server.advertiseTasks ? { protocol: "config-job-v1", owner_id: server.ownerID, available: server.available,
             error: busy ? "另一个检测任务正在执行或等待确认" : undefined,
             tasks: [...server.tasks.values()].map(task => ({ task_id: task.task_id, state: task.state,
               receipt: task.state === "prepared" && server.prepareMode !== "missing-receipt" ? task.receipt : undefined,
-              result: task.result, error: task.error })) },
+              result: task.result, error: task.error, execution_timeout_ms: server.executionTimeoutMs })) } : undefined,
         }) } };
       }
       if (request.type === "config.test" || request.type === "config.testScoped") {
@@ -2093,6 +2096,171 @@ function createTaskServer(options = {}) {
 function taskHost(server, options = {}) {
   return createBridgeHarness({ onRequest: request => server.handle(request), ...options });
 }
+
+test("background diagnostics take priority when the host also advertises scoped tests", async () => {
+  const server = createTaskServer({ scoped: true });
+  const host = taskHost(server);
+  const page = createPage({ bridge: host.bridge });
+  await flush();
+  assert.equal(host.bridge.supportsScopedTest(), true);
+  assert.equal(host.bridge.supportsDiagnosticTasks(), true);
+  assert.match(page.ids["account-check-hint"].textContent, /后台检测/);
+  page.checkAccount(2);
+  await flush();
+  assert.deepEqual(server.commands.map(command => command.action), ["prepare", "commit"]);
+  assert.equal(server.diagnostics, 1);
+  assert.equal(server.legacyTests, 0);
+  assert.equal(server.ordinarySaves.length, 0);
+  assert.match(page.accountRow(2).result.textContent, /符合检测规则/);
+});
+
+test("scoped diagnostics remain a fallback when background tasks are not advertised", async () => {
+  const server = createTaskServer({ scoped: true, advertiseTasks: false });
+  let scopedCalls = 0;
+  const host = taskHost(server, { onRequest(request) {
+    if (request.type !== "config.testScoped") return server.handle(request);
+    scopedCalls++;
+    const result = scopedResult(request.config);
+    const details = JSON.parse(result.status_json);
+    details.degradation_check.request_id = request.request_id;
+    result.status_json = JSON.stringify(details);
+    return { result };
+  } });
+  const page = createPage({ bridge: host.bridge });
+  await flush();
+  assert.equal(host.bridge.diagnosticTaskInfo(), null);
+  page.checkAccount(2);
+  await flush();
+  assert.equal(scopedCalls, 1);
+  assert.equal(server.commands.length, 0);
+  assert.equal(server.ordinarySaves.length, 0);
+  assert.match(page.accountRow(2).result.textContent, /符合检测规则/);
+});
+
+test("advertised but unavailable or busy background tasks never fall back to scoped requests", async t => {
+  for (const state of ["unavailable", "prepared", "queued", "running"]) {
+    await t.test(state, async () => {
+      const server = createTaskServer({ scoped: true, available: state !== "unavailable" });
+      if (state !== "unavailable") server.tasks.set("other-task", { task_id: "other-task", state });
+      const host = taskHost(server);
+      const page = createPage({ bridge: host.bridge });
+      await flush();
+      assert.equal(host.bridge.supportsScopedTest(), true);
+      assert.equal(page.accountRow(1).button.disabled, true);
+      assert.equal(page.ids["degradation-check-button"].disabled, true);
+      page.accountRow(1).button.emit("click");
+      page.ids["degradation-check-button"].emit("click");
+      await flush();
+      assert.equal(server.commands.length, 0);
+      assert.equal(server.legacyTests, 0);
+      assert.equal(server.diagnostics, 0);
+      assert.equal(server.ordinarySaves.length, 0);
+    });
+  }
+});
+
+test("default background polling continues after 150 seconds and 150 queries", async () => {
+  const clock = { now: 0 };
+  const server = createTaskServer({ commitMode: "running", executionTimeoutMs: 305000 });
+  const host = taskHost(server, { clock });
+  const page = createPage({ bridge: host.bridge });
+  await flush();
+  page.checkAccount(1);
+  await flush();
+  for (let second = 1; second <= 151; second++) {
+    clock.now = second * 1000;
+    host.expire();
+    await flush();
+  }
+  assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+  assert.equal(host.timers.size, 1);
+  assert.equal(page.accountRow(1).button.textContent, "检测中…");
+  assert.doesNotMatch(page.ids["form-hint"].textContent, /轮询已结束|检测失败/);
+  assert.equal(server.commands.length, 2);
+  server.complete([...server.tasks.values()][0]);
+  host.expire();
+  await flush();
+  assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+  assert.match(page.accountRow(1).result.textContent, /符合检测规则/);
+});
+
+test("background polling uses bounded server budgets and compatible configured fallbacks", async t => {
+  const fixtures = [
+    { name: "advertised default", execution: 305000, window: 315000 },
+    { name: "advertised explicit", execution: 128000, seconds: 123, window: 138000 },
+    { name: "advertised maximum scan", execution: 1805000, seconds: 10, window: 1815000 },
+    { name: "legacy default", window: 310000 },
+    { name: "legacy explicit", seconds: 123, window: 133000 },
+    { name: "legacy minimum", seconds: 10, window: 20000 },
+    { name: "legacy maximum", seconds: 1800, window: 1810000 },
+    ...[0, -1, 1.5, 1805001, "305000", null].map(execution => ({ name: "invalid server " + JSON.stringify(execution), execution, seconds: 123, window: 133000 })),
+    ...[0, -1, 9, 1801, 300.5, "600", null].map(seconds => ({ name: "invalid configured " + JSON.stringify(seconds), seconds, window: 310000 })),
+  ];
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const clock = { now: 1000000 };
+      const server = createTaskServer({ commitMode: "running", executionTimeoutMs: fixture.execution,
+        store: { config: { account_ids: [1], timeout_seconds: fixture.seconds } } });
+      const host = taskHost(server, { clock });
+      const page = createPage({ bridge: host.bridge });
+      await flush();
+      page.checkAccount(1);
+      await flush();
+      assert.equal(server.commands.length, 2);
+      clock.now += fixture.window - 1;
+      host.expire();
+      await flush();
+      assert.equal(host.timers.size, 1, "Poll must stay active before the budget and grace period end");
+      assert.equal(page.accountRow(1).button.textContent, "检测中…");
+      clock.now++;
+      host.expire();
+      await flush();
+      assert.equal(host.timers.size, 0);
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+      assert.match(page.ids["form-hint"].textContent, /检测结果未确认.*仍在执行.*轮询已结束/);
+      assert.doesNotMatch(page.ids["form-hint"].textContent, /检测失败/);
+      assert.equal(page.accountRow(1).button.textContent, "继续查询");
+      page.degradationCheck();
+      await flush();
+      assert.equal(host.timers.size, 1);
+      assert.equal(server.commands.length, 2, "Resume must only query the original task");
+      assert.equal(server.diagnostics, 1);
+      server.complete([...server.tasks.values()][0]);
+      host.expire();
+      await flush();
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), false);
+      assert.equal(server.commands.length, 2);
+      assert.match(page.accountRow(1).result.textContent, /符合检测规则/);
+    });
+  }
+});
+
+test("default query count follows the budget and polling interval while explicit caps still apply", async t => {
+  for (const cap of [undefined, 2]) {
+    await t.test(cap === undefined ? "derived" : "explicit", async () => {
+      const clock = { now: 0 };
+      const server = createTaskServer({ commitMode: "running", executionTimeoutMs: 15000 });
+      const host = taskHost(server, { clock, settings: { diagnosticPollMs: 2000, diagnosticMaxPolls: cap } });
+      const page = createPage({ bridge: host.bridge });
+      await flush();
+      page.checkAccount(1);
+      await flush();
+      const expectedPolls = cap || 13; // ceil((15000 + 10000) / 2000)
+      for (let polls = 1; polls < expectedPolls; polls++) {
+        assert.equal([...host.timers.values()][0].delay, 2000);
+        host.expire();
+        await flush();
+        assert.equal(host.timers.size, 1);
+      }
+      host.expire();
+      await flush();
+      assert.equal(host.timers.size, 0);
+      assert.equal(host.bridge.hasPendingDiagnosticTask(), true);
+      assert.match(page.ids["form-hint"].textContent, /轮询已结束/);
+      page.unload();
+    });
+  }
+});
 
 test("unpatched hosts run a single diagnostic through command-only saves without replacing the form", async () => {
   const server = createTaskServer();

@@ -32,6 +32,7 @@ type autoDegradationRecord struct {
 	AccountID          int64     `json:"account_id"`
 	SelectionBase      string    `json:"selection_base"`
 	Model              string    `json:"model"`
+	ReasoningEffort    string    `json:"reasoning_effort"`
 	BPSEnabled         bool      `json:"bps_enabled"`
 	Decided            bool      `json:"decided"`
 	Status             string    `json:"status"`
@@ -154,6 +155,7 @@ func nextAutoDegradationRecord(c protocol.Config, old autoDegradationRecord, res
 	current := autoRecordSelection(c, old, base)
 	record := old
 	record.AccountID, record.SelectionBase, record.Model = result.AccountID, base, degradationModel(c)
+	record.ReasoningEffort = nativeDegradationReasoningEffort
 	record.NativeTimezoneByIP = c.NativeTimezoneByIP
 	record.BPSEnabled = current
 	record.Decided = old.Decided && old.SelectionBase == base
@@ -174,6 +176,7 @@ func nextAutoDegradationRecord(c protocol.Config, old autoDegradationRecord, res
 	}
 	record.PendingStatus, record.Consecutive = result.Status, 1
 	if old.SelectionBase == base && old.Model == degradationModel(c) &&
+		old.ReasoningEffort == nativeDegradationReasoningEffort &&
 		old.NativeTimezoneByIP == c.NativeTimezoneByIP && old.PendingStatus == result.Status &&
 		!old.CheckedAt.IsZero() && now.Sub(old.CheckedAt) <= 2*autoDegradationRetry {
 		record.Consecutive = min(old.Consecutive+1, 2)
@@ -403,6 +406,7 @@ func (t *Transport) runAutoDegradation(ctx context.Context, host pluginv1.HostSe
 			r, exists := s.records[id]
 			due := r.NextCheckAt
 			if !exists || due.IsZero() || r.Model != degradationModel(cfg) ||
+				r.ReasoningEffort != nativeDegradationReasoningEffort ||
 				r.NativeTimezoneByIP != cfg.NativeTimezoneByIP || r.SelectionBase != base {
 				due = s.firstDue[id]
 				if due.IsZero() {
@@ -539,16 +543,19 @@ func (t *Transport) runAutomaticBatch(parent context.Context, host pluginv1.Host
 		s.mu.Unlock()
 	}()
 	started := []int64{}
+	base := autoSelectionBase(cfg)
 	for _, id := range ids {
 		lease := before[id]
-		if lease.SelectionBase != autoSelectionBase(cfg) {
+		if lease.SelectionBase != base {
 			lease.BPSEnabled, lease.Decided = cfg.HandlesAccount(id), false
 		}
-		if lease.SelectionBase != autoSelectionBase(cfg) || lease.Model != degradationModel(cfg) ||
+		if lease.SelectionBase != base || lease.Model != degradationModel(cfg) ||
+			lease.ReasoningEffort != nativeDegradationReasoningEffort ||
 			lease.NativeTimezoneByIP != cfg.NativeTimezoneByIP {
 			lease.PendingStatus, lease.Consecutive = "", 0
 		}
-		lease.SelectionBase, lease.Model, lease.InFlight = autoSelectionBase(cfg), degradationModel(cfg), true
+		lease.SelectionBase, lease.Model, lease.InFlight = base, degradationModel(cfg), true
+		lease.ReasoningEffort = nativeDegradationReasoningEffort
 		lease.NativeTimezoneByIP = cfg.NativeTimezoneByIP
 		lease.NextCheckAt = time.Now().Add(time.Duration(cfg.AutoDegradationIntervalMinutes) * time.Minute)
 		if err := t.persistAutoDegradationRecord(ctx, host, generation, revision, lease); err != nil {
@@ -563,7 +570,7 @@ func (t *Transport) runAutomaticBatch(parent context.Context, host pluginv1.Host
 		return
 	}
 	cfg.DegradationCheck, cfg.DegradationCheckAccountID, cfg.DegradationCheckAccountIDs = true, 0, started
-	check, _ := t.runDegradationCheckWithBudget(ctx, cfg, degradationCheckBudget)
+	check, _ := t.runBackgroundDegradationCheck(ctx, cfg)
 	for _, result := range check.Results {
 		old, exists := before[result.AccountID]
 		if !exists || ctx.Err() != nil {

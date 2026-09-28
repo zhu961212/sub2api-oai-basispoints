@@ -34,8 +34,15 @@ func TestNativeDegradationFixedModelAcrossEntryPoints(t *testing.T) {
 				if body["model"] != "gpt-6-astra" || body["model_selection"] != nil {
 					t.Errorf("legacy config changed native probe body: %#v", body)
 				}
+				reasoning, _ := body["reasoning"].(map[string]any)
+				if reasoning["effort"] != "xhigh" {
+					t.Error("native entrypoint did not use xhigh reasoning")
+				}
 				if r.Header.Get("ChatGPT-Account-ID") == "" || r.Header.Get("Authorization") == "" {
 					t.Error("native probe lost account identity")
+				}
+				if r.Header.Get("User-Agent") != nativeDegradationUserAgent || r.Header.Get("Version") != nativeDegradationClientVersion || r.Header.Get("Originator") != "codex-tui" {
+					t.Error("native entrypoint lost the compatible diagnostic client identity")
 				}
 				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"output_text":"iPhone 16"}`))}, nil
 			})}

@@ -1,0 +1,433 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
+	"github.com/stretchr/testify/require"
+)
+
+// Signed package acceptance overlay: official host files remain untouched.
+// All HTTP fixtures are local; native account diagnostics are deliberately not executed.
+func TestBasisPointsSignedReleaseOfficialHostInstall(t *testing.T) {
+	packagePath := os.Getenv("BPS_HOST_TEST_PACKAGE")
+	publicKeyPath := os.Getenv("BPS_HOST_TEST_PUBLIC_KEY")
+	expectedVersion := os.Getenv("BPS_HOST_TEST_VERSION")
+	hostVersion := os.Getenv("BPS_HOST_TEST_HOST_VERSION")
+	require.NotEmpty(t, packagePath)
+	require.NotEmpty(t, publicKeyPath)
+	require.NotEmpty(t, expectedVersion)
+	require.Contains(t, []string{"0.2.8", "0.2.9"}, hostVersion)
+	publicKey, err := os.ReadFile(publicKeyPath)
+	require.NoError(t, err)
+	packageFile, err := os.Open(packagePath)
+	require.NoError(t, err)
+	defer packageFile.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	cfg := testPluginConfig(root, false)
+	cfg.Plugins.TrustedPublishers["oai-basispoints-v1"] = strings.TrimSpace(string(publicKey))
+	installer := NewPluginPackageInstaller(cfg, PluginHostInfo{Version: hostVersion, BuildType: "release"})
+	installed, err := installer.Install(ctx, packageFile, nil)
+	require.NoError(t, err)
+	require.Equal(t, "local.oai-basispoints", installed.PluginKey)
+	require.Equal(t, expectedVersion, installed.Version)
+	require.Equal(t, PluginSignatureTrusted, installed.SignatureStatus)
+	require.True(t, installed.Compatibility.Compatible)
+	require.True(t, installed.Compatibility.Tested)
+	require.Equal(t, hostVersion, installed.Compatibility.CurrentSub2API)
+	for _, testedHost := range []string{"0.2.8", "0.2.9"} {
+		compatibility := EvaluatePluginCompatibility(installed.Manifest, PluginHostInfo{Version: testedHost, BuildType: "release"})
+		require.True(t, compatibility.Compatible)
+		require.True(t, compatibility.Tested)
+		require.Equal(t, "compatible", compatibility.Status)
+	}
+	for _, unsupportedHost := range []string{"0.2.7", "0.3.0"} {
+		compatibility := EvaluatePluginCompatibility(installed.Manifest, PluginHostInfo{Version: unsupportedHost, BuildType: "release"})
+		require.False(t, compatibility.Compatible)
+		require.Equal(t, "incompatible", compatibility.Status)
+	}
+	t.Logf("official host %s: trusted signature; installer accepted; both declared versions tested; out-of-range versions rejected", hostVersion)
+	require.Equal(t, PluginStateDisabled, installed.State)
+	require.FileExists(t, installed.BinaryPath)
+	require.FileExists(t, filepath.Join(installed.InstallPath, installed.Manifest.UI.Entrypoint))
+	for path := range installed.Manifest.Files {
+		require.FileExists(t, filepath.Join(installed.InstallPath, filepath.FromSlash(path)))
+	}
+	socketDir := filepath.Join(root, "runtime")
+	require.NoError(t, os.MkdirAll(socketDir, 0700))
+	store := newFakePluginKVStore()
+	directory := &bpsReleaseAccountDirectory{}
+	scope := newPluginAccountScope(pluginAccountScopeEntry{Platform: PlatformOpenAI, AccountType: AccountTypeOAuth})
+	host := newPluginHostServiceServer(installed.PluginKey, store, directory, scope)
+	plugin, err := startPluginRuntime(ctx, installed, 15*time.Second, socketDir, host)
+	require.NoError(t, err)
+	defer plugin.kill()
+	normalized, err := plugin.validateAndApplyNormalizedConfig(ctx, []byte("{\"enabled_models\":[]}"))
+	require.NoError(t, err)
+	require.NotEmpty(t, normalized)
+	require.NoError(t, plugin.checkHealth(ctx))
+	status, err := plugin.status(ctx)
+	require.NoError(t, err)
+	require.True(t, status.GetHealthy())
+	require.Contains(t, status.GetStatusJson(), expectedVersion)
+	expectedBody := bytes.Repeat([]byte("verified-by-official-host-"), 5000)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, readErr := io.ReadAll(r.Body)
+		require.NoError(t, readErr)
+		require.Equal(t, "official-host-request", string(body))
+		require.Equal(t, "Bearer synthetic-host-token", r.Header.Get("Authorization"))
+		w.Header().Set("X-Release-Verification", "official-host")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(expectedBody)
+	}))
+	defer upstream.Close()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream.URL, strings.NewReader("official-host-request"))
+	require.NoError(t, err)
+	request.Header.Set("Authorization", "Bearer synthetic-host-token")
+	account := &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1}
+	require.True(t, plugin.beginRequest())
+	response, err := plugin.roundTrip(ctx, request, "", account)
+	if err != nil {
+		plugin.finishRequest()
+	}
+	require.NoError(t, err)
+	defer response.Body.Close()
+	actualBody, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, response.StatusCode)
+	require.Equal(t, "official-host", response.Header.Get("X-Release-Verification"))
+	require.Equal(t, expectedBody, actualBody)
+	require.NoError(t, response.Body.Close())
+	require.Zero(t, plugin.inFlight.Load())
+	testBasisPointsSignedHostAccountIsolation(t, ctx, installed, socketDir, plugin, store, directory, scope)
+}
+
+// This directory contains only synthetic local identities. It exercises the
+// reverse host-service RPC used by the signed child process, including Extra.
+type bpsReleaseAccountDirectory struct {
+	mu       sync.Mutex
+	resolved []int64
+}
+
+func (d *bpsReleaseAccountDirectory) ListPluginAccounts(_ context.Context, scope PluginAccountScope, platform, accountType string) ([]PluginAccountInfo, error) {
+	if !scope.Contains(PlatformOpenAI, AccountTypeOAuth) || (platform != "" && platform != PlatformOpenAI) || (accountType != "" && accountType != AccountTypeOAuth) {
+		return nil, nil
+	}
+	accounts := make([]PluginAccountInfo, 0, 2)
+	for _, id := range []int64{42, 43} {
+		metadata, err := json.Marshal(map[string]any{"Extra": map[string]any{"openai_device_id": fmt.Sprintf("host-owned-device-%d", id)}})
+		if err != nil {
+			return nil, err
+		}
+		accounts = append(accounts, PluginAccountInfo{ID: id, Platform: PlatformOpenAI, AccountType: AccountTypeOAuth, Name: "signed-host-same-name", Status: "active", Schedulable: true, MetadataJSON: metadata})
+	}
+	return accounts, nil
+}
+
+func (d *bpsReleaseAccountDirectory) ResolvePluginOutboundIdentity(_ context.Context, scope PluginAccountScope, accountID int64) (*PluginOutboundIdentity, error) {
+	if !scope.Contains(PlatformOpenAI, AccountTypeOAuth) || (accountID != 42 && accountID != 43) {
+		return nil, nil
+	}
+	d.mu.Lock()
+	d.resolved = append(d.resolved, accountID)
+	d.mu.Unlock()
+	headers := make(http.Header)
+	headers.Set("ChatGPT-Account-ID", fmt.Sprintf("synthetic-chatgpt-%d", accountID))
+	return &PluginOutboundIdentity{AccountID: accountID, Platform: PlatformOpenAI, AccountType: AccountTypeOAuth, Token: fmt.Sprintf("synthetic-host-token-%d", accountID), Headers: headers}, nil
+}
+
+func (d *bpsReleaseAccountDirectory) takeResolved() []int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	result := append([]int64(nil), d.resolved...)
+	d.resolved = nil
+	return result
+}
+
+type bpsReleaseCapturedRequest struct {
+	Path    string
+	Headers http.Header
+	Body    map[string]any
+}
+
+func testBasisPointsSignedHostAccountIsolation(t *testing.T, ctx context.Context, installed *PluginInstallation, socketDir string, plugin *pluginRuntime, store *fakePluginKVStore, directory *bpsReleaseAccountDirectory, scope PluginAccountScope) {
+	t.Helper()
+	captures := make(chan bpsReleaseCapturedRequest, 32)
+	var upstreamStatus atomic.Int64
+	upstreamStatus.Store(http.StatusOK)
+	successBody, err := json.Marshal(map[string]any{"id": "resp-signed-host", "object": "response", "status": "completed", "output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "iPhone 17"}}}}})
+	require.NoError(t, err)
+	bps := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if decodeErr := json.NewDecoder(r.Body).Decode(&body); decodeErr != nil {
+			t.Errorf("decode signed-plugin mock request: %v", decodeErr)
+			http.Error(w, "invalid local request", http.StatusBadRequest)
+			return
+		}
+		captures <- bpsReleaseCapturedRequest{Path: r.URL.Path, Headers: r.Header.Clone(), Body: body}
+		w.Header().Set("Content-Type", "application/json")
+		code := http.StatusOK
+		if r.URL.Path == "/basispoints/api/responses" {
+			code = int(upstreamStatus.Load())
+		}
+		if code != http.StatusOK {
+			w.Header().Set("Retry-After", "999")
+			w.Header().Set("X-Codex-Primary-Used-Percent", "99")
+			w.Header().Set("X-Codex-Primary-Reset-After-Seconds", "999")
+			w.Header().Set("WWW-Authenticate", "Bearer synthetic-upstream-secret")
+			w.Header().Set("X-Upstream-Secret", "do-not-forward")
+			w.WriteHeader(code)
+			_, _ = io.WriteString(w, "synthetic-upstream-secret-do-not-forward")
+			return
+		}
+		_, _ = w.Write(successBody)
+	}))
+	defer bps.Close()
+	nextCapture := func() bpsReleaseCapturedRequest {
+		t.Helper()
+		select {
+		case captured := <-captures:
+			return captured
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for local BPS capture")
+			return bpsReleaseCapturedRequest{}
+		}
+	}
+	assertNoExtraCapture := func() {
+		t.Helper()
+		select {
+		case extra := <-captures:
+			t.Fatalf("unexpected extra upstream request: %s", extra.Path)
+		default:
+		}
+	}
+	config := map[string]any{"enabled_models": []string{"gpt-6-astra"}, "responses_url": bps.URL + "/basispoints/api/responses", "rewrite_tools": false, "transform_responses": false}
+	configJSON := func() []byte {
+		t.Helper()
+		raw, marshalErr := json.Marshal(config)
+		require.NoError(t, marshalErr)
+		return raw
+	}
+	applyConfig := func() map[string]any {
+		t.Helper()
+		raw, applyErr := plugin.validateAndApplyNormalizedConfig(ctx, configJSON())
+		require.NoError(t, applyErr)
+		var normalized map[string]any
+		require.NoError(t, json.Unmarshal(raw, &normalized))
+		return normalized
+	}
+	forward := func(accountID int64, clientDevice string) (*http.Response, []byte, error) {
+		t.Helper()
+		body, marshalErr := json.Marshal(map[string]any{"model": "gpt-6-astra", "input": "local host audit", "metadata": map[string]any{"device_id": clientDevice, "session_id": "body-session-" + clientDevice}, "prompt_cache_key": "cache-" + clientDevice})
+		require.NoError(t, marshalErr)
+		request, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, bps.URL+"/v1/responses", bytes.NewReader(body))
+		require.NoError(t, requestErr)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Codex-Installation-Id", clientDevice)
+		request.Header.Set("X-Codex-Session-Id", "header-session-"+clientDevice)
+		account := &Account{ID: accountID, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1}
+		require.True(t, plugin.beginRequest())
+		response, forwardErr := plugin.roundTrip(ctx, request, "", account)
+		if forwardErr != nil {
+			plugin.finishRequest()
+			require.Zero(t, plugin.inFlight.Load())
+			return response, nil, forwardErr
+		}
+		body, readErr := io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		require.NoError(t, readErr)
+		require.NoError(t, closeErr)
+		require.Zero(t, plugin.inFlight.Load())
+		return response, body, nil
+	}
+	assertIdentityHeaders := func(captured bpsReleaseCapturedRequest, accountID int64, device string) {
+		t.Helper()
+		require.Equal(t, "/basispoints/api/responses", captured.Path)
+		require.Equal(t, fmt.Sprintf("Bearer synthetic-host-token-%d", accountID), captured.Headers.Get("Authorization"))
+		require.Equal(t, fmt.Sprintf("synthetic-chatgpt-%d", accountID), captured.Headers.Get("ChatGPT-Account-ID"))
+		require.Equal(t, device, captured.Headers.Get("X-Codex-Installation-Id"))
+	}
+	assertIdentity := func(captured bpsReleaseCapturedRequest, accountID int64, device string) {
+		t.Helper()
+		assertIdentityHeaders(captured, accountID, device)
+		metadata, ok := captured.Body["metadata"].(map[string]any)
+		require.True(t, ok, "request must retain device metadata")
+		require.Equal(t, device, metadata["device_id"])
+	}
+	assertSentError := func(accountID int64, code string) {
+		t.Helper()
+		response, _, forwardErr := forward(accountID, "error-client")
+		require.Nil(t, response, "BPS status must not expose HTTP headers to the host")
+		var transportErr *PluginTransportError
+		require.ErrorAs(t, forwardErr, &transportErr)
+		require.Equal(t, code, transportErr.Code)
+		require.True(t, transportErr.RequestSent, "the host must not replay a sent BPS request")
+		require.NotContains(t, transportErr.Message, "synthetic-upstream-secret")
+		require.NotContains(t, transportErr.Message, "do-not-forward")
+	}
+	assertBlockedOnly42 := func() {
+		t.Helper()
+		status, statusErr := plugin.status(ctx)
+		require.NoError(t, statusErr)
+		var result struct {
+			Disabled []int64 `json:"bps_disabled_account_ids"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(status.GetStatusJson()), &result))
+		require.Equal(t, []int64{42}, result.Disabled)
+		require.NotContains(t, status.GetStatusJson(), "synthetic-host-token")
+	}
+
+	// Client identity metadata survives unchanged; the removed option is absent.
+	normalized := applyConfig()
+	require.NotContains(t, normalized, "bps_device_convergence")
+	response, _, forwardErr := forward(42, "client-default-off")
+	require.NoError(t, forwardErr)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	assertIdentity(nextCapture(), 42, "client-default-off")
+
+	// Different clients retain their identity while tokens stay account-scoped.
+	for _, item := range []struct {
+		id     int64
+		client string
+	}{{42, "client-a"}, {42, "client-b"}, {43, "client-c"}} {
+		response, _, forwardErr = forward(item.id, item.client)
+		require.NoError(t, forwardErr)
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		captured := nextCapture()
+		assertIdentity(captured, item.id, item.client)
+		require.Equal(t, "header-session-"+item.client, captured.Headers.Get("X-Codex-Session-Id"))
+		require.Equal(t, "cache-"+item.client, captured.Body["prompt_cache_key"])
+		require.Equal(t, "body-session-"+item.client, captured.Body["metadata"].(map[string]any)["session_id"])
+	}
+
+	// Bridge v1 cannot atomically bind an account. Single and batch snapshots,
+	// save replays and concurrent tests must fail without credential resolution
+	// or dispatching a charged upstream HTTP request.
+	for _, id := range []int64{42, 43, 0} {
+		directory.takeResolved()
+		config["degradation_check"] = true
+		config["degradation_check_account_id"] = id
+		for replay := 0; replay < 2; replay++ {
+			applyConfig()
+		}
+		snapshot := configJSON()
+		type checkedResult struct {
+			response *pluginv1.TestConfigResponse
+			err      error
+		}
+		results := make(chan checkedResult, 2)
+		for page := 0; page < 2; page++ {
+			go func() {
+				checked, checkErr := plugin.api.TestConfig(ctx, &pluginv1.TestConfigRequest{ConfigJson: snapshot})
+				results <- checkedResult{checked, checkErr}
+			}()
+		}
+		for page := 0; page < 2; page++ {
+			checked := <-results
+			require.NoError(t, checked.err)
+			require.False(t, checked.response.GetSuccess())
+			require.Contains(t, checked.response.GetMessage(), "cannot atomically bind")
+			require.Empty(t, checked.response.GetStatusJson(), "legacy rejection must not return a completed account report")
+		}
+		require.Empty(t, directory.takeResolved(), "legacy commands must not resolve credentials")
+		assertNoExtraCapture()
+	}
+	delete(config, "degradation_check")
+	delete(config, "degradation_check_account_id")
+	applyConfig()
+	checked, checkErr := plugin.api.TestConfig(ctx, &pluginv1.TestConfigRequest{ConfigJson: configJSON()})
+	require.NoError(t, checkErr)
+	require.True(t, checked.GetSuccess(), checked.GetMessage())
+	require.Contains(t, checked.GetStatusJson(), "accounts")
+	require.Empty(t, directory.takeResolved(), "ordinary connectivity must not resolve credentials")
+	assertNoExtraCapture()
+
+	// The signed release keeps a fixed native diagnostic endpoint. Never call
+	// scoped or background diagnostics with synthetic identities here.
+
+	upstreamStatus.Store(http.StatusTooManyRequests)
+	assertSentError(42, "PLUGIN_RATE_LIMITED")
+	assertIdentity(nextCapture(), 42, "error-client")
+	keys, err := store.List(ctx, installed.PluginKey, "bps_account_block_v1", "account-", 100)
+	require.NoError(t, err)
+	require.Empty(t, keys, "429 must not disable an account")
+
+	// Turning 403 auto-disable off leaves the account eligible for another call.
+	config["bps_auto_disable_on_403"] = false
+	applyConfig()
+	upstreamStatus.Store(http.StatusForbidden)
+	assertSentError(42, "PLUGIN_UPSTREAM_REJECTED")
+	assertIdentity(nextCapture(), 42, "error-client")
+	keys, err = store.List(ctx, installed.PluginKey, "bps_account_block_v1", "account-", 100)
+	require.NoError(t, err)
+	require.Empty(t, keys)
+	upstreamStatus.Store(http.StatusOK)
+	_, _, forwardErr = forward(42, "after-disabled-switch")
+	require.NoError(t, forwardErr)
+	assertIdentity(nextCapture(), 42, "after-disabled-switch")
+
+	config["bps_auto_disable_on_403"] = true
+	applyConfig()
+	upstreamStatus.Store(http.StatusForbidden)
+	assertSentError(42, "PLUGIN_UPSTREAM_REJECTED")
+	assertIdentity(nextCapture(), 42, "error-client")
+	require.Eventually(t, func() bool {
+		value, found, getErr := store.Get(ctx, installed.PluginKey, "bps_account_block_v1", "account-42")
+		return getErr == nil && found && bytes.Contains(value, []byte("http_403"))
+	}, 3*time.Second, 10*time.Millisecond)
+	keys, err = store.List(ctx, installed.PluginKey, "bps_account_block_v1", "account-", 100)
+	require.NoError(t, err)
+	require.Equal(t, []string{"account-42"}, keys)
+	assertBlockedOnly42()
+	upstreamStatus.Store(http.StatusOK)
+	_, _, forwardErr = forward(43, "unaffected-account")
+	require.NoError(t, forwardErr)
+	assertIdentity(nextCapture(), 43, "unaffected-account")
+
+	// Restart the actual installed subprocess and rebind the same host KV store.
+	plugin.kill()
+	host := newPluginHostServiceServer(installed.PluginKey, store, directory, scope)
+	plugin, err = startPluginRuntime(ctx, installed, 15*time.Second, socketDir, host)
+	require.NoError(t, err)
+	defer plugin.kill()
+	applyConfig()
+	// Host-service binding deliberately starts KV restoration asynchronously.
+	// Wait for the documented readiness signal before asserting restored data.
+	require.Eventually(t, func() bool {
+		status, statusErr := plugin.status(ctx)
+		if statusErr != nil {
+			return false
+		}
+		var snapshot map[string]json.RawMessage
+		if json.Unmarshal([]byte(status.GetStatusJson()), &snapshot) != nil {
+			return false
+		}
+		_, pending := snapshot["bps_account_persistence_error"]
+		return !pending
+	}, 5*time.Second, 10*time.Millisecond)
+	assertBlockedOnly42()
+	_, _, forwardErr = forward(42, "restart-client")
+	require.NoError(t, forwardErr)
+	require.Equal(t, "/v1/responses", nextCapture().Path, "only account 42 must use original host route after restart")
+	_, _, forwardErr = forward(43, "restart-other-client")
+	require.NoError(t, forwardErr)
+	assertIdentity(nextCapture(), 43, "restart-other-client")
+	assertNoExtraCapture()
+	require.NoError(t, plugin.checkHealth(ctx))
+	t.Log("signed subprocess verified: client identity passthrough and account credential isolation, legacy single/batch TestConfig rejected without credentials or HTTP, 429 header isolation, 403 switch and account-scoped KV restart persistence")
+}

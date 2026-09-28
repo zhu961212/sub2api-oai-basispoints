@@ -4,7 +4,13 @@
 
 [GitHub 仓库](https://github.com/zhu961212/sub2api-oai-basispoints) · [发布下载](https://github.com/zhu961212/sub2api-oai-basispoints/releases)
 
-当前版本：**0.6.7** · 插件 ID：**local.oai-basispoints**
+当前版本：**0.6.9** · 插件 ID：**local.oai-basispoints**
+
+支持官方 **Sub2API 0.2.8 和 0.2.9**，推荐 0.2.9；保持 Plugin Protocol / Transport API / UI Bridge v1，无需修改宿主。兼容性依据及测试边界见 [双版本兼容记录](docs/COMPATIBILITY-0.2.8-0.2.9.md)。
+
+**0.6.9 检测超时修复**：原生 XHigh 后台检测不再被旧单号 20 秒、整批 24 秒预算提前截断；每账号使用配置超时（默认 300 秒），批量按并发批次数计算总预算。页面优先后台任务并按服务端预算查询，查询结束后可继续查询同一任务，不自动重发。旧同步接口仍保留宿主 30 秒内的兼容边界。详见 [修复记录](docs/release-0.6.9-2026-09-27.md)。
+
+**0.6.8 检测修复**：修复原生 Codex 流在完成事件返回空 output 数组时丢失已完成答案的问题；原生探针使用已实测兼容的客户端身份，避免旧宿主版本标识被上游拒绝。按用户要求固定使用 gpt-6-astra + XHigh（xhigh），失败或跳过不改变路由。详见 [修复记录](docs/release-0.6.8-2026-09-27.md)。
 
 **0.6.7 发行内容**：手动及自动降智检测始终只请求原生 Codex；新增独立的自动检测与 BPS 切换开关，以及原生/BPS 请求时区跟随出口 IP 开关，两个开关均默认关闭。同时修复工具调用封装兼容性，将完整历史的内嵌图片计数上限从 20 放宽至 128，保留图片与文档共享的 32 MiB 预算，不删除或压缩历史图片。详见 [发行记录](docs/release-0.6.7-2026-09-27.md)、[自动检测规则](docs/AUTO-NATIVE-DEGRADATION.md) 和 [时区说明](docs/NATIVE-IP-TIMEZONE.md)。
 
@@ -29,7 +35,7 @@
 - 手动单号、“一键检测原生 Codex”和自动检测均使用该账号自己的令牌与代理，固定请求原生 Codex；已经走 BPS 的账号也检测原生，不使用 BPS responses_url 或模型映射。
 - 原生检测模型固定为 gpt-6-astra，无需配置，手动及自动检测使用同一模型。自动开关默认关闭，常规间隔默认 30 分钟，可设置为 5–1440 分钟；首次或新账号检测在约 5–30 秒后分散安排。
 - 待确认的降智或恢复在约 5 分钟后复测；连续两次有效结果一致才启用 BPS 或取消 BPS。失败、跳过、未检测及未完成确认的账号保留原选择或最后有效路由。
-- 自动批次最多 8 个账号，每批预算 24 秒；大目录按到期时间公平分批，24 秒不是整目录扫描上限。状态和路由持久化到插件 KV，重启恢复周期；自动与手动检测不会重叠。
+- 自动批次最多 8 个账号，大目录按到期时间公平分批；0.6.9 起每账号使用配置超时（默认 300 秒），单批另留 5 秒扫描余量，替代旧 24 秒预算。状态和路由持久化到插件 KV，重启恢复周期；自动与手动检测不会重叠。
 - 自动模式锁定账号手动勾选，列表显示后台有效路由；手动单号和批量仅显示结果。关闭自动并保存会取消在途自动检测、停止后续调度，保留最后有效路由，之后可手动重新选择并保存。
 - BPS 403 保护仍优先；封禁不阻止原生探针，原生 403 也不会停用 BPS。检测消耗额度，固定“苹果17”规则仍只是启发式辅助，不代表通用智力测评。
 
@@ -193,7 +199,7 @@
 
 ## 宿主要求
 
-清单要求 Sub2API **>=0.2.8 <0.3.0**，推荐版本为 0.2.8，Plugin Protocol、Transport API、UI Bridge 均为 1。该范围对应 Wei-Shaw/sub2api 的 0.2.8 版本线，其他 fork 的 2.8.12 不等同于 0.2.8。完整版本契约和已有实测范围见 [兼容说明](docs/COMPATIBILITY-0.2.8.md)。
+清单要求 Sub2API **>=0.2.8 <0.3.0**，已测试官方 **0.2.8 / 0.2.9**，推荐 0.2.9；Plugin Protocol、Transport API、UI Bridge 均为 1。其他 fork 的 2.8.12 不属于此版本范围。官方发布提交、版本契约和验证边界见 [双版本兼容说明](docs/COMPATIBILITY-0.2.8-0.2.9.md)。
 
 ## 开发环境
 
@@ -229,7 +235,7 @@ TestLive 系列属于可选真实上游测试，设置 BASISPOINTS_LIVE_TOKEN �
 
 ## GitHub 源码准备
 
-运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.7-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
+运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.9-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
 
 ## 构建、签名与验包
 
@@ -251,12 +257,12 @@ Linux：
 bash ./build.sh -signing-key ../basispoints-private/publisher.private -key-id my-publisher-v1
 ~~~
 
-构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.7.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
+构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.9.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
 
 显式传入配套公钥进行独立验包：
 
 ~~~powershell
-python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.7.s2plugin --public-key ../basispoints-private/publisher.public
+python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.9.s2plugin --require-signature --expected-key-id oai-basispoints-v1 --public-key ../basispoints-private/publisher.public
 ~~~
 
 校验器检查包内容、文件哈希及 manifest 原始字节的 Ed25519 签名。签名构建必须具备 Python 和与私钥同名的 .public 配套公钥；两种构建脚本均对实际输出执行强制验签，并核对 key_id。也可用上面的显式验签命令单独复查。
@@ -270,7 +276,7 @@ plugins:
     my-publisher-v1: BASE64_ED25519_PUBLIC_KEY
 ~~~
 
-在 Sub2API 插件管理页安装 0.6.7，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
+在 Sub2API 插件管理页安装 0.6.9，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
 
 ## 配置页与全选
 
@@ -320,7 +326,7 @@ Basis Points returned an unknown client tool absent from the active catalog
 
 该错误表示返回的调用无法匹配本轮客户端声明的工具目录。部分客户端的提示仍用 exec_command 固定示例，但本轮可能只声明 functions.exec 执行器。0.5.15 按实际目录生成调用格式指引，区分执行器与其内部 helper、自定义工具的原始 input 与中转信封中的 args。
 
-更新后需在宿主重新加载插件，确认运行版本为 0.6.7，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
+更新后需在宿主重新加载插件，确认运行版本为 0.6.9，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
 
 0.5.26 中，上游返回目录外或可识别但截断的单一末尾中转调用，并且本轮尚未向客户端发出工具时，最多追加一次带当前目录与拒绝原因的纠正请求。它沿用原账号、模型、历史和图片引用；错误工具不会执行。纠正后的结果仍须通过原有目录和参数校验，两次请求的用量合并记录。
 

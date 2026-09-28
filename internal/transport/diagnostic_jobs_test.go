@@ -264,7 +264,7 @@ func TestDiagnosticJobKeepsPreparedRequestParametersAfterProductionSave(t *testi
 		wantDeadline      time.Duration
 	}{
 		{name: "snapshot-shorter", snapshotSeconds: 10, productionSeconds: 300, wantDeadline: 10 * time.Second},
-		{name: "production-shorter", snapshotSeconds: 300, productionSeconds: 10, wantDeadline: degradationCheckTimeout},
+		{name: "production-shorter", snapshotSeconds: 300, productionSeconds: 10, wantDeadline: 300 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tr, _, _ := newDiagnosticTransport(t)
