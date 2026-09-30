@@ -269,7 +269,7 @@ func testBasisPointsSignedHostAccountIsolation(t *testing.T, ctx context.Context
 		require.True(t, ok, "request must retain device metadata")
 		require.Equal(t, device, metadata["device_id"])
 	}
-	assertSentError := func(accountID int64, code string) {
+	assertSentError := func(accountID int64, code string) *PluginTransportError {
 		t.Helper()
 		response, _, forwardErr := forward(accountID, "error-client")
 		require.Nil(t, response, "BPS status must not expose HTTP headers to the host")
@@ -279,6 +279,7 @@ func testBasisPointsSignedHostAccountIsolation(t *testing.T, ctx context.Context
 		require.True(t, transportErr.RequestSent, "the host must not replay a sent BPS request")
 		require.NotContains(t, transportErr.Message, "synthetic-upstream-secret")
 		require.NotContains(t, transportErr.Message, "do-not-forward")
+		return transportErr
 	}
 	assertBlockedOnly42 := func() {
 		t.Helper()
@@ -360,20 +361,13 @@ func testBasisPointsSignedHostAccountIsolation(t *testing.T, ctx context.Context
 	// The signed release keeps a fixed native diagnostic endpoint. Never call
 	// scoped or background diagnostics with synthetic identities here.
 
-	upstreamStatus.Store(http.StatusTooManyRequests)
-	assertSentError(42, "PLUGIN_RATE_LIMITED")
-	assertIdentity(nextCapture(), 42, "error-client")
-	keys, err := store.List(ctx, installed.PluginKey, "bps_account_block_v1", "account-", 100)
-	require.NoError(t, err)
-	require.Empty(t, keys, "429 must not disable an account")
-
 	// Turning 403 auto-disable off leaves the account eligible for another call.
 	config["bps_auto_disable_on_403"] = false
 	applyConfig()
 	upstreamStatus.Store(http.StatusForbidden)
 	assertSentError(42, "PLUGIN_UPSTREAM_REJECTED")
 	assertIdentity(nextCapture(), 42, "error-client")
-	keys, err = store.List(ctx, installed.PluginKey, "bps_account_block_v1", "account-", 100)
+	keys, err := store.List(ctx, installed.PluginKey, "bps_account_block_v1", "account-", 100)
 	require.NoError(t, err)
 	require.Empty(t, keys)
 	upstreamStatus.Store(http.StatusOK)
@@ -429,5 +423,26 @@ func testBasisPointsSignedHostAccountIsolation(t *testing.T, ctx context.Context
 	assertIdentity(nextCapture(), 43, "restart-other-client")
 	assertNoExtraCapture()
 	require.NoError(t, plugin.checkHealth(ctx))
-	t.Log("signed subprocess verified: client identity passthrough and account credential isolation, legacy single/batch TestConfig rejected without credentials or HTTP, 429 header isolation, 403 switch and account-scoped KV restart persistence")
+
+	// Run the 429 scenario last: a valid Retry-After intentionally survives
+	// unrelated configuration changes and must not contaminate the 403 cases.
+	// Account 43 is still eligible for BPS after account 42's persisted block.
+	upstreamStatus.Store(http.StatusTooManyRequests)
+	assertSentError(43, "PLUGIN_RATE_LIMITED")
+	assertIdentity(nextCapture(), 43, "error-client")
+	paused := assertSentError(43, "PLUGIN_RATE_LIMITED")
+	// RequestSent stays true as the host's no-replay barrier. The capture
+	// channel and explicit message establish that the paused call was not sent.
+	require.Contains(t, paused.Message, "this BPS request was not sent")
+	assertNoExtraCapture()
+	keys, err = store.List(ctx, installed.PluginKey, "bps_account_block_v1", "account-", 100)
+	require.NoError(t, err)
+	require.Equal(t, []string{"account-42"}, keys, "429 must not disable account 43")
+	upstreamStatus.Store(http.StatusOK)
+	_, _, forwardErr = forward(42, "backoff-unaffected-native")
+	require.NoError(t, forwardErr)
+	require.Equal(t, "/v1/responses", nextCapture().Path, "account 43's BPS pause must not affect account 42's original host route")
+	assertNoExtraCapture()
+	require.NoError(t, plugin.checkHealth(ctx))
+	t.Log("signed subprocess verified: client identity passthrough and account credential isolation, legacy single/batch TestConfig rejected without credentials or HTTP, 429 header isolation and no-send backoff, 403 switch and account-scoped KV restart persistence")
 }
