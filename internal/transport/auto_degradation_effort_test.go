@@ -21,7 +21,7 @@ func TestAutoDegradationEffortChangesDoNotCombineConfirmations(t *testing.T) {
 				cfg.ExcludedAccountIDs = []int64{7}
 				now := time.Now()
 				old := autoDegradationRecord{AccountID: 7, SelectionBase: autoSelectionBase(cfg),
-					Model: degradationModel(cfg), ReasoningEffort: previous, NativeTimezoneByIP: cfg.NativeTimezoneByIP,
+					Model: degradationModel(cfg), ReasoningEffort: previous,
 					Decided: true, BPSEnabled: status == "ok", PendingStatus: status, Consecutive: 1, CheckedAt: now}
 				result := degradationAccountResult{AccountID: 7, Status: status}
 				first := nextAutoDegradationRecord(cfg, old, result, now.Add(autoDegradationRetry))
@@ -49,7 +49,6 @@ func TestAutoDegradationEffortInterruptedLeasePersistsMigration(t *testing.T) {
 	for _, previous := range []string{"", "low"} {
 		t.Run(previous, func(t *testing.T) {
 			tr, host, _ := newAutoDetectionTestTransport(t)
-			tr.cfg.NativeTimezoneByIP = false
 			now := time.Now()
 			old := autoDegradationRecord{AccountID: 7, SelectionBase: autoSelectionBase(tr.cfg),
 				Model: degradationModel(tr.cfg), ReasoningEffort: previous,
@@ -98,7 +97,6 @@ func TestAutoDegradationEffortChangeReschedulesDistantRecord(t *testing.T) {
 	for _, previous := range []string{"", "low"} {
 		t.Run(previous, func(t *testing.T) {
 			tr, host, calls := newAutoDetectionTestTransport(t)
-			tr.cfg.NativeTimezoneByIP = false
 			host.fakeHost.accounts = []*pluginv1.AccountInfo{{Id: 7, Schedulable: true}}
 			old := autoDegradationRecord{AccountID: 7, SelectionBase: autoSelectionBase(tr.cfg),
 				Model: degradationModel(tr.cfg), ReasoningEffort: previous, Status: "degraded", Decided: true,

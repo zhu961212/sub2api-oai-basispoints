@@ -79,7 +79,7 @@ func (u *Uploader) uploadAttachment(ctx context.Context, client *http.Client, en
 		if ctx.Err() != nil {
 			return "", canceled(ctx.Err())
 		}
-		return "", fail(502, "attachment_transport", "Basis Points attachment upload transport failed")
+		return "", transportFailure(err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -94,7 +94,7 @@ func (u *Uploader) uploadAttachment(ctx context.Context, client *http.Client, en
 		if ctx.Err() != nil {
 			return "", canceled(ctx.Err())
 		}
-		return "", fail(502, "invalid_attachment_response", "Basis Points attachment upload returned an invalid response")
+		return "", responseReadFailure(err)
 	}
 	if len(raw) > maxResponseBytes {
 		return "", fail(502, "invalid_attachment_response", "Basis Points attachment upload returned an invalid response")

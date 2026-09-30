@@ -4,7 +4,14 @@
 
 [GitHub 仓库](https://github.com/zhu961212/sub2api-oai-basispoints) · [发布下载](https://github.com/zhu961212/sub2api-oai-basispoints/releases)
 
-当前版本：**0.6.10** · 插件 ID：**local.oai-basispoints**
+当前版本：**0.6.11** · 插件 ID：**local.oai-basispoints**
+
+2026-09-30 本地性能优化：改进突发请求的连接复用、复用流式读缓冲、减少请求内 JSON 复制开销；实测条件与验证边界见 [性能与并发记录](docs/PERFORMANCE-CONCURRENCY-2026-09-30.md)。同日 [BPS 实时模型核查](docs/BPS-MODELS-2026-09-30.md) 仍为六模型，新增 0、删除 0。本轮改动纳入 0.6.11，实际发布验证见 [发行记录](docs/release-0.6.11-2026-09-30.md)。
+
+最近三天错误的独立复核已补齐动态工具声明的强制调用路由和可信会话缓存键；
+统计依据、验证结果及本地构建边界见 [复核记录](docs/BPS-ERRORS-RECHECK-2026-09-30.md)。
+
+当前源码新增：托管联网搜索原生透传，以及 BPS 403 停用后每 6 小时自动复查。不需要配套宿主补丁；已纳入 0.6.11。使用方法、恢复条件及兼容边界见 [功能说明](docs/SEARCH-RECOVERY.md)。
 
 **0.6.10 模型错误隔离**：HTTP 404 且明确返回 model_not_found 的请求不再触发宿主账号／模型限流或冷却，覆盖 BPS 与原生透传。该次请求仍失败，同账号后续请求保持可用；详见 [发行记录](docs/release-0.6.10-2026-09-30.md) 与 [修复说明](docs/MODEL-NOT-FOUND-NO-COOLDOWN.md)。
 
@@ -14,7 +21,7 @@
 
 **0.6.8 检测修复**：修复原生 Codex 流在完成事件返回空 output 数组时丢失已完成答案的问题；原生探针使用已实测兼容的客户端身份，避免旧宿主版本标识被上游拒绝。按用户要求固定使用 gpt-6-astra + XHigh（xhigh），失败或跳过不改变路由。详见 [修复记录](docs/release-0.6.8-2026-09-27.md)。
 
-**0.6.7 发行内容**：手动及自动降智检测始终只请求原生 Codex；新增独立的自动检测与 BPS 切换开关，以及原生/BPS 请求时区跟随出口 IP 开关，两个开关均默认关闭。同时修复工具调用封装兼容性，将完整历史的内嵌图片计数上限从 20 放宽至 128，保留图片与文档共享的 32 MiB 预算，不删除或压缩历史图片。详见 [发行记录](docs/release-0.6.7-2026-09-27.md)、[自动检测规则](docs/AUTO-NATIVE-DEGRADATION.md) 和 [时区说明](docs/NATIVE-IP-TIMEZONE.md)。
+**0.6.7 发行内容**：手动及自动降智检测始终只请求原生 Codex；新增独立的自动检测与 BPS 切换开关，以及原生/BPS 请求时区跟随出口 IP 开关，两个开关均默认关闭。同时修复工具调用封装兼容性，将完整历史的内嵌图片计数上限从 20 放宽至 128，保留图片与文档共享的 32 MiB 预算，不删除或压缩历史图片。详见 [发行记录](docs/release-0.6.7-2026-09-27.md)、[自动检测规则](docs/AUTO-NATIVE-DEGRADATION.md) 和 [时区说明](docs/NATIVE-IP-TIMEZONE.md)。 其中请求时区功能已在 0.6.11 移除，上述开关仅描述历史版本。
 
 **0.6.6 发行内容**：接入 PDF/DOC/DOCX 原生附件，兼容文档渲染截图，并完成界面按钮到后端行为的逐项审计。修复结果、验证边界及安装步骤见 [发行记录](docs/release-0.6.6-2026-09-27.md) 和 [按钮审计](docs/AUDIT-0.6.6.md)。0.6.1 保持撤回。
 
@@ -237,7 +244,7 @@ TestLive 系列属于可选真实上游测试，设置 BASISPOINTS_LIVE_TOKEN �
 
 ## GitHub 源码准备
 
-运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.10-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
+运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.11-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
 
 ## 构建、签名与验包
 
@@ -259,12 +266,12 @@ Linux：
 bash ./build.sh -signing-key ../basispoints-private/publisher.private -key-id my-publisher-v1
 ~~~
 
-构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.10.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
+构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.11.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
 
 显式传入配套公钥进行独立验包：
 
 ~~~powershell
-python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.10.s2plugin --require-signature --expected-key-id oai-basispoints-v1 --public-key ../basispoints-private/publisher.public
+python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.11.s2plugin --require-signature --expected-key-id oai-basispoints-v1 --public-key ../basispoints-private/publisher.public
 ~~~
 
 校验器检查包内容、文件哈希及 manifest 原始字节的 Ed25519 签名。签名构建必须具备 Python 和与私钥同名的 .public 配套公钥；两种构建脚本均对实际输出执行强制验签，并核对 key_id。也可用上面的显式验签命令单独复查。
@@ -278,7 +285,7 @@ plugins:
     my-publisher-v1: BASE64_ED25519_PUBLIC_KEY
 ~~~
 
-在 Sub2API 插件管理页安装 0.6.10，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
+在 Sub2API 插件管理页安装 0.6.11，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
 
 ## 配置页与全选
 
@@ -288,7 +295,7 @@ plugins:
 
 - **新账号自动接入**：新模式使用 `auto_select_new_accounts=true` 和 `excluded_account_ids`，后台允许不在排除表中的账号。之后新增的账号即使未出现在已保存的 `account_ids` 快照中，也默认使用 BPS；界面读到新账号时自动勾选。
 - **手动排除**：取消某账号并保存后，排除决定持久保留，刷新、重开页面或添加其他账号不会重新勾上。
-- **请求时区跟随出口 IP（0.6.7）**：在“请求环境”区域启用独立开关，默认关闭，保存后生效。原生 Codex 业务、BPS 业务和原生降智检测均使用实际转发账号的同一代理向 ipapi.co 查询出口时区，成功缓存 6 小时、失败缓存 5 分钟，并调整环境上下文时区及相应日期。BPS 自定义 `responses_url` 同样生效，重试和工具修复沿用该时区；文件和图片上传本身、非 Codex 透传不注入。配置沿用旧字段名 `native_timezone_by_ip`，共同控制两类请求。关闭时不查询 IP，查询失败保留原请求；不保证改善降智。详见[请求时区说明](docs/NATIVE-IP-TIMEZONE.md)。
+- **请求时区功能已移除（0.6.11）**：不再查询出口 IP、修改或补充请求日期和时区。旧配置兼容加载后丢弃该字段，自动检测旧记录按安全迁移规则复测。详见 [升级说明](docs/NATIVE-IP-TIMEZONE.md)。
 - **403 自动停用**：开关对应 `bps_auto_disable_on_403`，默认开启，旧配置缺省时保留开启行为。关闭并保存后，新的 BPS 403 只让本次请求失败，不再自动停用账号；已有停用记录仍生效，需明确重新勾选账号并保存恢复。重新开启后，后续明确 403 恢复自动停用。
 - **全选列表账号**：一次勾选当前列表账号并移除这些账号的排除记录，保留列表外已有选择与排除记录；点击全选后仍需保存。
 - **主动账号检测（仅更新插件）**：当前源码的单号和一键检测均通过后台任务直连原生 Codex。单号不修改勾选；手动模式下，批量有完整可信结果时只更新本地勾选，失败、跳过及列表外账号保留原选择，点击保存后生效；自动模式下批量也仅显示结果。检测消耗真实请求额度。已有 BPS 403 停用不阻止原生检测，但检测与未保存的恢复勾选都不会解除 BPS 封禁。结果未确认时继续查询原任务，不自动重试。普通“测试配置”仍只做 TCP/TLS 连通性测试。
@@ -328,7 +335,7 @@ Basis Points returned an unknown client tool absent from the active catalog
 
 该错误表示返回的调用无法匹配本轮客户端声明的工具目录。部分客户端的提示仍用 exec_command 固定示例，但本轮可能只声明 functions.exec 执行器。0.5.15 按实际目录生成调用格式指引，区分执行器与其内部 helper、自定义工具的原始 input 与中转信封中的 args。
 
-更新后需在宿主重新加载插件，确认运行版本为 0.6.10，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
+更新后需在宿主重新加载插件，确认运行版本为 0.6.11，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
 
 0.5.26 中，上游返回目录外或可识别但截断的单一末尾中转调用，并且本轮尚未向客户端发出工具时，最多追加一次带当前目录与拒绝原因的纠正请求。它沿用原账号、模型、历史和图片引用；错误工具不会执行。纠正后的结果仍须通过原有目录和参数校验，两次请求的用量合并记录。
 

@@ -284,9 +284,10 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 	reads := make(chan readResult, 1)
 	stopReader := make(chan struct{})
 	readerDone := make(chan struct{})
+	buffer := acquireStreamReadBuffer()
 	go func() {
 		defer close(readerDone)
-		buf := make([]byte, 32<<10)
+		buf := buffer[:]
 		for {
 			select {
 			case <-stopReader:
@@ -309,6 +310,9 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 		// Closing the HTTP body unblocks Read on cancellation or Send failure.
 		_ = resp.Body.Close()
 		<-readerDone
+		// The reader can finish before its final data+EOF result is consumed.
+		// Recycle only here, after both reader and response processing finish.
+		releaseStreamReadBuffer(buffer)
 	}()
 	var ticker *time.Ticker
 	var heartbeat <-chan time.Time
@@ -536,7 +540,7 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 	// Once body bytes are visible, all upstream failures must terminate inside
 	// SSE. An Error frame at that point makes the host close the HTTP body with
 	// an error, hiding the actual cause behind a generic decoding failure.
-	fail := func(code, message string) error {
+	fail := func(code, message string, diagnostics ...string) error {
 		pending = nil
 		if sent > 0 {
 			failure := map[string]any{"code": code, "message": message}
@@ -545,6 +549,11 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 			// fails over, and replaces this diagnostic with a generic 502.
 			if code == "bps_service_rejected" || code == "invalid_tool_call" {
 				failure["type"] = "invalid_request_error"
+			}
+			if code == "invalid_tool_call" && len(diagnostics) > 0 {
+				if reason := protocol.ClientToolDiagnosticReason(diagnostics[0]); reason != "" {
+					failure["reason"] = reason
+				}
 			}
 			if err := sendJSON("response.failed", map[string]any{
 				"response": map[string]any{
@@ -563,7 +572,7 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 		var api *protocol.APIError
 		switch {
 		case errors.As(feedErr, &api):
-			return fail(api.Code(), api.Error())
+			return fail(api.Code(), api.Error(), api.DiagnosticReason())
 		case errors.Is(feedErr, invalid):
 			return fail("invalid_upstream_response", "Basis Points stream ended without a terminal response")
 		default:
@@ -616,7 +625,7 @@ func sendTransformedHTTPResponseStreamWithRepair(stream pluginv1.TransportPlugin
 		if result.err != nil {
 			var api *protocol.APIError
 			if errors.As(result.err, &api) {
-				return fail(api.Code(), api.Error())
+				return fail(api.Code(), api.Error(), api.DiagnosticReason())
 			}
 			return fail("upstream_read", safeUpstreamReadError(result.err))
 		}

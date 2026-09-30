@@ -38,9 +38,10 @@ type Transport struct {
 	hostConn        *grpc.ClientConn
 	accounts        accountCache
 	bpsAccounts     bpsAccountState
+	bpsRecovery     bpsRecoveryState
+	bpsRateBackoff  bpsRateLimitBackoff
 	diagnosticJobs  *diagnosticJobStore
 	autoDegradation autoDegradationState
-	nativeTimezone  *nativeTimezoneResolver
 	attachments     *attachments.Uploader
 	imageAdmission  imageRequestAdmission
 	// proxyClients 按账号代理 URL 复用独立的 Transport。此前每个请求都会
@@ -109,10 +110,12 @@ func (t *Transport) Shutdown() {
 	t.hostConn = nil
 	t.host = nil
 	t.bindBPSAccountStore(nil)
+	t.bindBPSRecovery(nil)
 	t.bindAutoDegradation(nil)
 	t.accounts.invalidate()
 	proxyClients := t.detachProxyClients()
 	t.mu.Unlock()
+	t.bpsRecovery.workers.Wait()
 	t.autoDegradation.workers.Wait()
 	t.diagnosticJobs.stop()
 	closeCachedProxyClients(proxyClients)
@@ -132,7 +135,11 @@ func newClient(cfg protocol.Config) *http.Client {
 		DialContext:       (&netDialer{}).DialContext,
 		ForceAttemptHTTP2: true,
 		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
-		MaxIdleConns:      100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second,
+		// Preserve a complete 64-request burst for both direct and cloned proxy
+		// transports. The old per-host limit of 20 discarded 44 warm sockets
+		// between bursts, forcing repeated TCP/TLS handshakes. This only raises
+		// idle reuse capacity; active requests remain unrestricted.
+		MaxIdleConns: 100, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second,
 	}}
 }
 
@@ -272,6 +279,7 @@ func (t *Transport) InitHostServices(ctx context.Context, r *pluginv1.InitHostSe
 	t.hostConn = conn
 	t.host = pluginv1.NewHostServiceClient(conn)
 	t.bindBPSAccountStore(t.host)
+	t.bindBPSRecovery(t.host)
 	t.bindAutoDegradation(t.host)
 	t.accounts.invalidate()
 	t.mu.Unlock()
@@ -486,6 +494,7 @@ func (t *Transport) ApplyConfig(ctx context.Context, r *pluginv1.ApplyConfigRequ
 		proxyClients = t.detachProxyClients()
 	}
 	t.configureAutoDegradation(t.cfg, c)
+	t.configureBPSRecovery(t.cfg, c)
 	t.cfg = c
 	t.mu.Unlock()
 	// 代理客户端绑定旧配置的超时/TLS 参数，应用新配置后必须丢弃旧缓存。
@@ -604,6 +613,13 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		return sendError(stream, "unsupported_account_type", "plugin only accepts OAuth accounts", false)
 	}
 
+	// Hosted search and explicit client-tool selection require native
+	// semantics. Route before BPS state, identity and attachment processing.
+	// Auto/none client tools continue to use the BPS relay.
+	if source, parseErr := protocol.RawObject(body); parseErr == nil && (protocol.RequiresNativeWebSearch(source) || protocol.RequiresNativeToolChoice(source)) {
+		return t.passthrough(stream, start, body, client, cfg)
+	}
+
 	// 自动模式下新增账号直接走 BPS，明确取消的账号原样透传。旧配置继续使用
 	// 白名单，直到配置页保存完成迁移；无需账号轮询或打开页面才能接入新 ID。
 	useBPS, selectionErr := t.automaticBPSSelection(cfg, start.GetAccountId())
@@ -651,9 +667,11 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 		return sendError(stream, "invalid_proxy", "proxy client is unavailable", false)
 	}
 	requestClient = withoutBPSRedirects(requestClient)
-	if start.GetMethod() == http.MethodPost && requestHeaders.Get("Content-Encoding") == "" {
-		body = t.applyAccountTimezoneBody(stream.Context(), cfg, start.GetAccountId(), proxyURL, requestClient, body, false)
+	backoffKey := bpsRateLimitScope(start.GetAccountId(), cfg.ResponsesURL, protocol.RequestedModel(body), proxyURL, requestHeaders)
+	if seconds := t.bpsRateBackoff.remainingSeconds(backoffKey, time.Now()); seconds > 0 {
+		return sendBasisPointsBackoff(stream, seconds)
 	}
+	requestClient = withBPSRateBackoff(requestClient, &t.bpsRateBackoff, backoffKey, cfg.ResponsesURL)
 	requestBody := body
 	var source map[string]any
 	imagesRewritten := false
@@ -855,12 +873,10 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	return sendHTTPResponse(stream, resp, responseBody, responseContentType)
 }
 
-// passthrough forwards to the host-selected upstream. The opt-in timezone
-// feature only updates the environment context of native Codex requests.
+// passthrough forwards to the host-selected upstream without changing its body.
 //
 // Unselected accounts, unsupported BPS models and restricted BPS accounts
-// retain the host URL, method, identity headers and response stream. The body
-// is unchanged unless the independent native timezone option is enabled;
+// retain the host URL, method, identity headers, body and response stream.
 // BPS headers, tool rewriting and response conversion never enter this path.
 // A confirmed HTTP 404 model_not_found is a request error, not account health.
 func (t *Transport) passthrough(stream pluginv1.TransportPlugin_ForwardServer, start *pluginv1.ForwardRequestStart, body []byte, client *http.Client, cfg protocol.Config) error {
@@ -901,7 +917,6 @@ func (t *Transport) passthrough(stream pluginv1.TransportPlugin_ForwardServer, s
 	if requestClient == nil {
 		return sendError(stream, "invalid_proxy", "proxy client is unavailable", false)
 	}
-	t.applyNativeTimezone(cfg, start.GetAccountId(), start.GetProxyUrl(), requestClient, req)
 	resp, err := requestClient.Do(req)
 	if err != nil {
 		return sendError(stream, "upstream_transport", safeTransportError(err), true)
@@ -1194,7 +1209,9 @@ func sendHTTPResponseStream(stream pluginv1.TransportPlugin_ForwardServer, resp 
 		return err
 	}
 	var received int64
-	buf := make([]byte, 32<<10)
+	buffer := acquireStreamReadBuffer()
+	defer releaseStreamReadBuffer(buffer)
+	buf := buffer[:]
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {

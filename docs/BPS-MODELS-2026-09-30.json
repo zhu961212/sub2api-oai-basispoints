@@ -1,0 +1,188 @@
+{
+  "scope": "One previously authorized OpenAI OAuth account and its configured proxy; identifiers omitted.",
+  "generation_requests": 0,
+  "directory_get_requests": 3,
+  "checks": [
+    {
+      "checked_at_utc": "2026-09-30T13:31:12.972240+00:00",
+      "method": "GET",
+      "path": "/basispoints/api/responses/access?include_models=true",
+      "status": 200,
+      "server_date": "Wed, 30 Sep 2026 13:31:10 GMT",
+      "bytes": 3462,
+      "allowed": true
+    },
+    {
+      "checked_at_utc": "2026-09-30T13:31:14.622820+00:00",
+      "method": "GET",
+      "path": "/basispoints/api/responses/models",
+      "status": 200,
+      "server_date": "Wed, 30 Sep 2026 13:31:11 GMT",
+      "bytes": 2476
+    },
+    {
+      "checked_at_utc": "2026-09-30T13:32:15.685181+00:00",
+      "method": "GET",
+      "path": "/basispoints/api/responses/models",
+      "status": 200,
+      "server_date": "Wed, 30 Sep 2026 13:32:12 GMT",
+      "bytes": 2476
+    }
+  ],
+  "model_catalog": {
+    "fields_present": [
+      "default_model",
+      "models",
+      "restricted_models",
+      "source"
+    ],
+    "default_model": "gpt-5.6-sol",
+    "source": "chatgpt",
+    "restricted_models": [],
+    "models": [
+      {
+        "id": "gpt-5.6-luna",
+        "label": "GPT-5.6 Luna",
+        "description": "",
+        "default_effort": "medium",
+        "free_preview": false,
+        "fields_present": [
+          "default_effort",
+          "description",
+          "efforts",
+          "free_preview",
+          "id",
+          "label"
+        ],
+        "context_metadata": {},
+        "efforts": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      {
+        "id": "gpt-5.6-terra",
+        "label": "GPT-5.6 Terra",
+        "description": "",
+        "default_effort": "medium",
+        "free_preview": false,
+        "fields_present": [
+          "default_effort",
+          "description",
+          "efforts",
+          "free_preview",
+          "id",
+          "label"
+        ],
+        "context_metadata": {},
+        "efforts": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      {
+        "id": "gpt-5.6-sol",
+        "label": "GPT-5.6 Sol",
+        "description": "",
+        "default_effort": "medium",
+        "free_preview": false,
+        "fields_present": [
+          "default_effort",
+          "description",
+          "efforts",
+          "free_preview",
+          "id",
+          "label"
+        ],
+        "context_metadata": {},
+        "efforts": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      {
+        "id": "gpt-6-astra",
+        "label": "GPT-6 Astra",
+        "description": "",
+        "default_effort": "medium",
+        "free_preview": false,
+        "fields_present": [
+          "default_effort",
+          "description",
+          "efforts",
+          "free_preview",
+          "id",
+          "label"
+        ],
+        "context_metadata": {},
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      {
+        "id": "gpt-6-luna",
+        "label": "GPT-6 Luna",
+        "description": "",
+        "default_effort": "medium",
+        "free_preview": false,
+        "fields_present": [
+          "default_effort",
+          "description",
+          "efforts",
+          "free_preview",
+          "id",
+          "label"
+        ],
+        "context_metadata": {},
+        "efforts": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      {
+        "id": "gpt-6-sol",
+        "label": "GPT-6 Sol",
+        "description": "",
+        "default_effort": "medium",
+        "free_preview": false,
+        "fields_present": [
+          "default_effort",
+          "description",
+          "efforts",
+          "free_preview",
+          "id",
+          "label"
+        ],
+        "context_metadata": {},
+        "efforts": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    ]
+  },
+  "comparison_to_2026_09_26": {
+    "added": [],
+    "removed": [],
+    "retained_catalog_metadata_equal": true
+  },
+  "context_limits": "The model catalog does not include context-window, input-token-limit, or output-token-limit fields."
+}

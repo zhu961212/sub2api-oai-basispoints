@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
+	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/attachments"
 	"github.com/wangyunjeff/sub2api-oai-basispoints/internal/protocol"
 )
 
@@ -47,7 +48,14 @@ func sendImageRelayError(stream pluginv1.TransportPlugin_ForwardServer, err erro
 	if status == http.StatusServiceUnavailable {
 		headers.Set("Retry-After", "1")
 	}
-	body := protocol.JSONBytes(map[string]any{"error": map[string]any{"message": err.Error(), "type": kind, "code": code, "param": nil}})
+	failure := map[string]any{"message": err.Error(), "type": kind, "code": code, "param": nil}
+	var attachmentErr *attachments.Error
+	if errors.As(err, &attachmentErr) {
+		if reason := attachmentErr.DiagnosticReason(); reason != "" {
+			failure["reason"] = reason
+		}
+	}
+	body := protocol.JSONBytes(map[string]any{"error": failure})
 	return sendHTTPResponse(stream, &http.Response{StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)), Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: headers}, body, "application/json")
 }
 

@@ -223,6 +223,9 @@ func cloneJSONValue(value any) any {
 	if value == nil {
 		return nil
 	}
+	if copy, ok := cloneCanonicalJSONValue(value, 0); ok {
+		return copy
+	}
 	raw, _ := json.Marshal(value)
 	var copy any
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -600,6 +603,22 @@ func explicitConversationKey(source map[string]any) string {
 	return ""
 }
 
+// upstreamPromptCacheKey preserves client hints and otherwise uses only the
+// account/conversation scope established by the host transport. Body aliases,
+// repeated input and response replay state cannot authorize a shared key.
+func upstreamPromptCacheKey(source map[string]any) string {
+	if explicit := explicitConversationKey(source); explicit != "" {
+		return explicit
+	}
+	if source["__bps_context_cache_disabled"] == true {
+		return ""
+	}
+	if scope := stringValue(source["__bps_session_scope"]); scope != "" {
+		return shortHash("bps/prompt-cache/v1/" + scope)
+	}
+	return ""
+}
+
 // nativeCallNamespace keeps the replay cache scoped to one conversation. Call IDs
 // such as "call_1" are commonly reused by different sessions; a global call-ID-only
 // cache can otherwise replay another user's native transport item.
@@ -794,7 +813,7 @@ func prepareResponsesBodyWithImages(source map[string]any, cfg Config, allowInli
 		"reasoning_effort":   reasoningEffortFromSource(source),
 		"context_management": contextManagement(source),
 	}
-	if cacheKey := explicitConversationKey(source); cacheKey != "" {
+	if cacheKey := upstreamPromptCacheKey(source); cacheKey != "" {
 		output["prompt_cache_key"] = cacheKey
 	}
 	metadata := map[string]any{}
@@ -1165,6 +1184,49 @@ func extractNativeClientToolCallFromItem(native, source map[string]any, remember
 	return call, reason == ""
 }
 
+// Classify only a rejected relay using the same bounded data parsers. The
+// original rejection message remains the repair predicate; diagnostics never
+// contain a tool name, argument, source snippet, or parser error string.
+func clientToolCallError(native map[string]any, message string) error {
+	err := &APIError{Status: 502, Kind: "invalid_tool_call", Message: message}
+	if message == malformedClientToolMessage {
+		err.DiagnosticCode = malformedRelayDiagnostic(native)
+	}
+	return err
+}
+
+func malformedRelayDiagnostic(native map[string]any) string {
+	if stringValue(native["type"]) != "function_call" || !isTransportName(stringValue(native["name"])) {
+		return "relay_tool_identity"
+	}
+	arguments := parseTransportArguments(native["arguments"])
+	if arguments == nil {
+		return "relay_outer_arguments"
+	}
+	envelope := decodeTransportCode(arguments["code"])
+	if envelope == nil {
+		return "relay_code_envelope"
+	}
+	for depth := 0; depth < 2 && isTransportName(recoveryEnvelopeName(envelope)); depth++ {
+		payload, ok := envelopePayload(envelope)
+		if !ok {
+			return "relay_nested_envelope"
+		}
+		arguments = parseTransportArguments(payload)
+		if arguments == nil {
+			return "relay_nested_envelope"
+		}
+		envelope = decodeTransportCode(arguments["code"])
+		if envelope == nil {
+			return "relay_nested_envelope"
+		}
+	}
+	if isTransportName(recoveryEnvelopeName(envelope)) {
+		return "relay_nested_envelope"
+	}
+	return "relay_tool_identity"
+}
+
 // Rejection reasons are static: never expose an upstream argument, custom
 // input, or untrusted tool name in client-visible transport diagnostics.
 func decodeNativeClientToolCallFromItem(native, source map[string]any, remember bool) (map[string]any, string) {
@@ -1303,7 +1365,7 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 		}
 		translated, reason := decodeNativeClientToolCallFromItem(item, source, false)
 		if reason != "" {
-			return nil, nil, false, fail(502, "invalid_tool_call", reason)
+			return nil, nil, false, clientToolCallError(item, reason)
 		}
 		translated["status"] = "completed"
 		replaced = append(replaced, translated)

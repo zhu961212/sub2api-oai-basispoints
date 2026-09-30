@@ -212,6 +212,9 @@ func canonicalHTTPToolFailure(payload map[string]any, event string) map[string]a
 		"object": "response", "status": "failed", "output": []any{},
 		"error": map[string]any{"type": "invalid_request_error", "code": "invalid_tool_call", "message": apiError.Message},
 	}
+	if reason := apiError.DiagnosticReason(); reason != "" {
+		relayObject(result["error"])["reason"] = reason
+	}
 	if nested == nil {
 		nested = payload
 	}

@@ -203,7 +203,7 @@ func MergeToolRepairResponse(source, original, repaired map[string]any) (map[str
 		tools++
 		call, reason := decodeNativeClientToolCallFromItem(item, source, false)
 		if reason != "" {
-			return nil, fail(502, "invalid_tool_call", reason)
+			return nil, clientToolCallError(item, reason)
 		}
 		expectedType := "function_call"
 		if expected.Type == "custom" {

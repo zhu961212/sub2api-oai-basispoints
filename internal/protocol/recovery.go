@@ -230,8 +230,15 @@ func repairEnvelopeStrings(raw string) string {
 		if ch == '"' {
 			quoted = !quoted
 		}
-		if quoted && (ch == '\n' || ch == '\r' || ch == '\t') {
+		// JSON forbids every control byte inside strings, not just line
+		// endings. Escaping the same byte preserves tool input exactly.
+		if quoted && ch < 0x20 {
 			switch ch {
+			default:
+				const hex = "0123456789abcdef"
+				out.WriteString("\\u00")
+				out.WriteByte(hex[ch>>4])
+				out.WriteByte(hex[ch&0x0f])
 			case '\n':
 				out.WriteString(`\n`)
 			case '\r':

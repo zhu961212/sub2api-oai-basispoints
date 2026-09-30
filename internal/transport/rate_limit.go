@@ -15,6 +15,13 @@ func sendBasisPointsRateLimit(stream pluginv1.TransportPlugin_ForwardServer) err
 	return sendError(stream, "PLUGIN_RATE_LIMITED", "Basis Points returned HTTP 429; retry later.", true)
 }
 
+// A prior real rejection supplied Retry-After. RequestSent deliberately keeps
+// the host from replaying this locally paused request against other accounts;
+// it is a replay barrier, not a claim that this new request reached BPS.
+func sendBasisPointsBackoff(stream pluginv1.TransportPlugin_ForwardServer, seconds int64) error {
+	return sendError(stream, "PLUGIN_RATE_LIMITED", fmt.Sprintf("A prior Basis Points request returned HTTP 429; this BPS request was not sent. Retry after %d seconds.", seconds), true)
+}
+
 // BPS access and quota decisions describe this service, not the host Codex
 // account. A sent transport error keeps the host from disabling that account.
 func sendBasisPointsAccountStatus(stream pluginv1.TransportPlugin_ForwardServer, status int) error {

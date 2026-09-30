@@ -312,7 +312,6 @@ button.account-check-button {
 }
 
 #bps-403-toggle[aria-pressed="true"],
-#native-timezone-toggle[aria-pressed="true"],
 #auto-degradation-toggle[aria-pressed="true"] {
   border-color: var(--ok-text);
   color: var(--ok-text);

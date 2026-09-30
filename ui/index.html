@@ -34,12 +34,6 @@
           <span id="auto-degradation-status" class="hint" role="status">自动检测已关闭</span>
         </fieldset>
 
-        <fieldset id="native-environment-fields" class="field group" disabled>
-          <legend class="name">请求环境</legend>
-          <button id="native-timezone-toggle" type="button" class="ghost" aria-pressed="false" aria-describedby="native-timezone-hint" disabled>请求时区跟随出口 IP：已关闭</button>
-          <span id="native-timezone-hint" class="hint">此开关只控制原生 Codex 和 BPS 业务请求的时区，独立于“自动检测与切换”，默认关闭，保存后生效。降智检测始终只请求原生 Codex，不检测 BPS；检测请求也遵循此时区设置。通过账号同一代理向 ipapi.co 查询，成功缓存 6 小时，失败后 5 分钟再试。关闭时不查询 IP；查询失败保留原请求，不保证改善降智。</span>
-        </fieldset>
-
         <fieldset id="account-fields" class="field group" disabled>
           <span class="name">走 Basis Points 的账号</span>
           <div class="actions account-actions">
@@ -47,7 +41,7 @@
             <button id="degradation-check-button" type="button" class="ghost" disabled>一键检测原生 Codex</button>
             <button id="bps-403-toggle" type="button" class="ghost" aria-pressed="true" aria-describedby="bps-403-hint" disabled>403 自动停用：已开启</button>
           </div>
-          <span id="bps-403-hint" class="hint">开启后，账号收到 BPS HTTP 403 时自动停用其 BPS 转发。切换后保存生效；关闭不会恢复已停用账号，恢复需重新勾选并保存。</span>
+          <span id="bps-403-hint" class="hint">开启后，账号收到 BPS HTTP 403 时自动停用其 BPS 转发，后续业务原生透传；每隔 6 小时通过该账号自己的凭据与代理检测封禁。确认不再返回 403 后解除停用，仍按已保存的模型和账号选择使用 BPS；网络失败保持停用。检测会消耗额度。切换开关后保存生效，关闭不会立即恢复已停用账号；也可重新勾选并保存手动恢复。</span>
           <div id="account-list" class="check-list"></div>
           <span id="account-hint" class="hint">新增账号自动勾选并使用 BPS；取消勾选会记住排除。旧配置保存一次即可启用，之后无需再次打开配置页。</span>
           <span id="account-check-hint" class="hint">正在读取宿主检测能力…</span>

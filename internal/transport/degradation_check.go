@@ -246,7 +246,6 @@ func (t *Transport) checkDegradationAccount(ctx context.Context, c protocol.Conf
 	// shared client between prepare and commit, but must not replace the
 	// diagnostic snapshot's timeout. The account/scan contexts still cap it.
 	requestClient.Timeout = time.Duration(c.TimeoutSeconds) * time.Second
-	t.applyNativeTimezone(c, accountID, proxyURL, requestClient, req)
 	resp, err := requestClient.Do(req)
 	if err != nil {
 		return "error", "", degradationReadError(ctx, err)

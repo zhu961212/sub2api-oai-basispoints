@@ -28,19 +28,46 @@ var errAutoDegradationStore = errors.New("automatic detection state is unavailab
 
 // Only routing decisions and timestamps are stored; never tokens or model output.
 type autoDegradationRecord struct {
-	NativeTimezoneByIP bool      `json:"native_timezone_by_ip"`
-	AccountID          int64     `json:"account_id"`
-	SelectionBase      string    `json:"selection_base"`
-	Model              string    `json:"model"`
-	ReasoningEffort    string    `json:"reasoning_effort"`
-	BPSEnabled         bool      `json:"bps_enabled"`
-	Decided            bool      `json:"decided"`
-	Status             string    `json:"status"`
-	CheckedAt          time.Time `json:"checked_at"`
-	NextCheckAt        time.Time `json:"next_check_at"`
-	InFlight           bool      `json:"in_flight"`
-	PendingStatus      string    `json:"pending_status"`
-	Consecutive        int       `json:"consecutive"`
+	AccountID       int64     `json:"account_id"`
+	SelectionBase   string    `json:"selection_base"`
+	Model           string    `json:"model"`
+	ReasoningEffort string    `json:"reasoning_effort"`
+	BPSEnabled      bool      `json:"bps_enabled"`
+	Decided         bool      `json:"decided"`
+	Status          string    `json:"status"`
+	CheckedAt       time.Time `json:"checked_at"`
+	NextCheckAt     time.Time `json:"next_check_at"`
+	InFlight        bool      `json:"in_flight"`
+	PendingStatus   string    `json:"pending_status"`
+	Consecutive     int       `json:"consecutive"`
+}
+
+// The retired setting is accepted only while decoding durable state. Results
+// collected with rewritten date/timezone context must not confirm a new probe.
+// Preserve the last decided route, but clear its pending sample and interrupted
+// lease; a zero deadline lets the scheduler perform a fresh, staggered check.
+// New records never serialize the retired field.
+func (r *autoDegradationRecord) UnmarshalJSON(data []byte) error {
+	type recordJSON autoDegradationRecord
+	var decoded recordJSON
+	legacy := struct {
+		*recordJSON
+		TimezoneByIP bool `json:"native_timezone_by_ip"`
+	}{recordJSON: &decoded}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	if legacy.TimezoneByIP {
+		// Do not sanitize a corrupt counter before the loader validates it.
+		if decoded.Consecutive < 0 || decoded.Consecutive > 2 {
+			return errAutoDegradationStore
+		}
+		decoded.PendingStatus, decoded.Consecutive = "", 0
+		decoded.InFlight = false
+		decoded.NextCheckAt = time.Time{}
+	}
+	*r = autoDegradationRecord(decoded)
+	return nil
 }
 
 type autoDegradationState struct {
@@ -114,7 +141,6 @@ func (t *Transport) bindAutoDegradation(host pluginv1.HostServiceClient) {
 func (t *Transport) configureAutoDegradation(old, next protocol.Config) {
 	if old.AutoDegradationEnabled == next.AutoDegradationEnabled &&
 		old.AutoDegradationIntervalMinutes == next.AutoDegradationIntervalMinutes &&
-		old.NativeTimezoneByIP == next.NativeTimezoneByIP &&
 		autoSelectionBase(old) == autoSelectionBase(next) {
 		return
 	}
@@ -156,7 +182,6 @@ func nextAutoDegradationRecord(c protocol.Config, old autoDegradationRecord, res
 	record := old
 	record.AccountID, record.SelectionBase, record.Model = result.AccountID, base, degradationModel(c)
 	record.ReasoningEffort = nativeDegradationReasoningEffort
-	record.NativeTimezoneByIP = c.NativeTimezoneByIP
 	record.BPSEnabled = current
 	record.Decided = old.Decided && old.SelectionBase == base
 	record.Status, record.CheckedAt = result.Status, now
@@ -177,7 +202,7 @@ func nextAutoDegradationRecord(c protocol.Config, old autoDegradationRecord, res
 	record.PendingStatus, record.Consecutive = result.Status, 1
 	if old.SelectionBase == base && old.Model == degradationModel(c) &&
 		old.ReasoningEffort == nativeDegradationReasoningEffort &&
-		old.NativeTimezoneByIP == c.NativeTimezoneByIP && old.PendingStatus == result.Status &&
+		old.PendingStatus == result.Status &&
 		!old.CheckedAt.IsZero() && now.Sub(old.CheckedAt) <= 2*autoDegradationRetry {
 		record.Consecutive = min(old.Consecutive+1, 2)
 	}
@@ -407,7 +432,7 @@ func (t *Transport) runAutoDegradation(ctx context.Context, host pluginv1.HostSe
 			due := r.NextCheckAt
 			if !exists || due.IsZero() || r.Model != degradationModel(cfg) ||
 				r.ReasoningEffort != nativeDegradationReasoningEffort ||
-				r.NativeTimezoneByIP != cfg.NativeTimezoneByIP || r.SelectionBase != base {
+				r.SelectionBase != base {
 				due = s.firstDue[id]
 				if due.IsZero() {
 					due = now.Add(time.Duration(5+id%26) * time.Second)
@@ -550,13 +575,11 @@ func (t *Transport) runAutomaticBatch(parent context.Context, host pluginv1.Host
 			lease.BPSEnabled, lease.Decided = cfg.HandlesAccount(id), false
 		}
 		if lease.SelectionBase != base || lease.Model != degradationModel(cfg) ||
-			lease.ReasoningEffort != nativeDegradationReasoningEffort ||
-			lease.NativeTimezoneByIP != cfg.NativeTimezoneByIP {
+			lease.ReasoningEffort != nativeDegradationReasoningEffort {
 			lease.PendingStatus, lease.Consecutive = "", 0
 		}
 		lease.SelectionBase, lease.Model, lease.InFlight = base, degradationModel(cfg), true
 		lease.ReasoningEffort = nativeDegradationReasoningEffort
-		lease.NativeTimezoneByIP = cfg.NativeTimezoneByIP
 		lease.NextCheckAt = time.Now().Add(time.Duration(cfg.AutoDegradationIntervalMinutes) * time.Minute)
 		if err := t.persistAutoDegradationRecord(ctx, host, generation, revision, lease); err != nil {
 			if ctx.Err() == nil {
@@ -606,6 +629,7 @@ func (t *Transport) autoDegradationStatusJSON(status string, cfg protocol.Config
 	snapshot := map[string]any{"enabled": cfg.AutoDegradationEnabled, "running": s.running, "ready": !s.bound || s.loaded, "interval_minutes": cfg.AutoDegradationIntervalMinutes, "last_run_at": autoStatusTime(s.lastRun), "next_run_at": autoStatusTime(s.nextRun), "error": s.storageError, "accounts": rows}
 	s.mu.Unlock()
 	for _, row := range rows {
+		row["configured_bps_enabled"] = row["bps_enabled"]
 		if t.isBPSAccountDisabled(row["account_id"].(int64), cfg) {
 			row["bps_enabled"] = false
 		}

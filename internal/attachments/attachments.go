@@ -30,12 +30,31 @@ type Error struct {
 	code    string
 	message string
 	cause   error
+	reason  string
 }
 
 func (e *Error) Error() string   { return e.message }
 func (e *Error) Unwrap() error   { return e.cause }
 func (e *Error) StatusCode() int { return e.status }
 func (e *Error) Code() string    { return e.code }
+
+// DiagnosticReason exposes only fixed transport classifications, never the
+// original error, URL, certificate, or account details. Invalid responses only
+// expose a classification when reading their body failed with a known cause.
+func (e *Error) DiagnosticReason() string {
+	if e == nil || (e.code != "attachment_transport" && e.code != "invalid_attachment_response") {
+		return ""
+	}
+	if e.code == "invalid_attachment_response" && e.reason == "generic" {
+		return ""
+	}
+	switch e.reason {
+	case "timeout", "dns", "tls", "dial", "connection_closed", "generic":
+		return e.reason
+	default:
+		return ""
+	}
+}
 
 func fail(status int, code, message string) error {
 	return &Error{status: status, code: code, message: message}

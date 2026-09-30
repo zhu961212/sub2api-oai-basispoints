@@ -21,8 +21,12 @@ func cacheBenchmarkCatalog() []any {
 }
 
 func BenchmarkProtocolCatalogCacheHit(b *testing.B) {
-	source := map[string]any{"session_id": b.Name(), "tools": cacheBenchmarkCatalog()}
+	source := map[string]any{"__bps_session_scope": b.Name(), "tools": cacheBenchmarkCatalog()}
 	rememberToolCatalog(source, source["tools"])
+	b.Cleanup(func() { toolCatalogCache.forget(cacheNamespaceForSource(source)) })
+	if tools, ok := rememberedToolCatalog(source).([]any); !ok || len(tools) != 64 {
+		b.Fatal("benchmark catalog cache did not warm up")
+	}
 	for _, parallel := range []bool{false, true} {
 		b.Run(fmt.Sprintf("parallel=%t", parallel), func(b *testing.B) {
 			b.ReportAllocs()
@@ -46,7 +50,12 @@ func BenchmarkProtocolNativeCacheHit(b *testing.B) {
 	native := sessionTestNative("fc_benchmark")
 	native["references"] = cacheBenchmarkCatalog()
 	rememberNativeCallInNamespace(namespace, native)
+	b.Cleanup(func() { nativeCallCache.forget(nativeCacheKey(namespace, "shared_call")) })
+	if got := rememberedNativeCallInNamespace(namespace, "shared_call"); got == nil {
+		b.Fatal("benchmark native cache did not warm up")
+	}
 	b.ReportAllocs()
+	b.ResetTimer()
 	for range b.N {
 		_ = rememberedNativeCallInNamespace(namespace, "shared_call")
 	}

@@ -122,9 +122,71 @@ func parseTransportArguments(value any) map[string]any {
 			}
 		}
 		if !valid {
-			return nil
+			decoded = recoverUnescapedTransportCode(raw)
+			if decoded == nil {
+				return nil
+			}
 		}
 		value = decoded
+	}
+	return nil
+}
+
+// Recover a missing serialization layer around code only when its contents
+// already form exactly one strict JSON envelope. Parse the surrounding object
+// again after quoting that exact slice; duplicates, trailing values, damaged
+// metadata, and ambiguous inner envelopes remain invalid. Never infer source
+// quotes or execute a wrapper, and keep the original native call for replay.
+func recoverUnescapedTransportCode(raw string) map[string]any {
+	if len(raw) > maxRecoveredEnvelopeBytes {
+		return nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	first, err := decoder.Token()
+	if err != nil || first != json.Delim('{') {
+		return nil
+	}
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok || seen[key] {
+			return nil
+		}
+		seen[key] = true
+		if key != "code" {
+			if _, err := strictRelayJSONToken(decoder, 1); err != nil {
+				return nil
+			}
+			continue
+		}
+		start := recoverySkipSpace(raw, int(decoder.InputOffset()))
+		if start == len(raw) || raw[start] != ':' {
+			return nil
+		}
+		start = recoverySkipSpace(raw, start+1)
+		if start == len(raw) || raw[start] != byte(34) {
+			return nil
+		}
+		inner := recoverySkipSpace(raw, start+1)
+		if inner == len(raw) || raw[inner] != '{' {
+			return nil
+		}
+		value, consumed, valid := relayJSONValue(raw[inner:], false)
+		if !valid || unambiguousEnvelope(objectValue(value)) == nil {
+			return nil
+		}
+		end := recoverySkipSpace(raw, inner+consumed)
+		if end == len(raw) || raw[end] != byte(34) {
+			return nil
+		}
+		fixed := raw[:start] + string(jsonBytes(raw[start+1:end])) + raw[end+1:]
+		decoded, _, valid := relayJSONValue(fixed, true)
+		if !valid {
+			return nil
+		}
+		return objectValue(decoded)
 	}
 	return nil
 }

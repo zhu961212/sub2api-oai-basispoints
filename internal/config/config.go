@@ -18,7 +18,7 @@ import (
 
 const (
 	// Version 是插件自身版本，必须与 manifest.json 的 version 完全一致。
-	Version = "0.6.10"
+	Version = "0.6.11"
 	// PluginID 必须与 manifest.json 的 id 完全一致。
 	PluginID = "local.oai-basispoints"
 	// Capability 是宿主当前唯一接受的传输能力标识。
@@ -85,9 +85,6 @@ type Config struct {
 	AutoDegradationManualRevision int64 `json:"auto_degradation_manual_revision"`
 	// Retained only to read legacy settings; Normalize always fixes this value.
 	DegradationCheckModel string `json:"degradation_check_model"`
-	// NativeTimezoneByIP adjusts native Codex and BPS request environment context using the forwarding account's exit timezone.
-	// The field and JSON key retain their original names for configuration compatibility.
-	NativeTimezoneByIP bool `json:"native_timezone_by_ip"`
 	// Diagnostic commands are temporary fields. Legacy saved configurations
 	// remain parseable, but only the request-scoped TestConfig bridge executes
 	// commands bound to an explicit account or caller-supplied bulk snapshot.
@@ -198,7 +195,15 @@ func Parse(raw []byte) (Config, error) {
 		}
 		decoder := json.NewDecoder(strings.NewReader(input))
 		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&c); err != nil {
+		// Accept the retired boolean only while reading old saved settings. It
+		// has no live Config field and is never emitted when saving or cloning.
+		// Decode directly so invalid types and unknown fields still fail, even
+		// when a later duplicate key would otherwise hide an invalid value.
+		migration := struct {
+			*Config
+			RetiredTimezoneByIP bool `json:"native_timezone_by_ip"`
+		}{Config: &c}
+		if err := decoder.Decode(&migration); err != nil {
 			return Config{}, fmt.Errorf("configuration JSON is invalid: %w", err)
 		}
 		var extra any

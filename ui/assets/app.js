@@ -37,7 +37,6 @@
     "auto_degradation_enabled",
     "auto_degradation_interval_minutes",
     "auto_degradation_manual_revision",
-    "native_timezone_by_ip",
     "max_response_bytes",
     "auth_mode",
     "tools_version_id",
@@ -57,7 +56,6 @@
   var autoSelectNewAccounts = false;
   var bpsAutoDisableOn403 = true;
   var autoDegradationEnabled = false;
-  var nativeTimezoneByIP = false;
   var autoDegradationStatus = null;
   var autoDegradationAccounts = new Map();
   var accountSelectionEdited = false;
@@ -87,6 +85,9 @@
   var lastResizeHeight = null;
   var statusInFlight = null;
   var bpsDisabledAccounts = new Map();
+  var bpsDisabledDetails = new Map();
+  var bpsAutomaticRecovery = false;
+  var bpsPreservesSelection = false;
   var pendingBpsReenabled = new Map();
 
   function id(name) {
@@ -131,11 +132,8 @@
     id("bps-403-toggle").disabled = locked;
     id("auto-degradation-fields").disabled = locked;
     id("auto-degradation-toggle").disabled = locked;
-    id("native-environment-fields").disabled = locked;
-    id("native-timezone-toggle").disabled = locked;
     renderBps403Toggle();
     renderAutoDegradation();
-    renderNativeTimezoneToggle();
     var degradationButton = id("degradation-check-button");
     var supported = supportsAccountChecks();
     var pendingCheck = hasPendingAccountCheck();
@@ -201,7 +199,17 @@
 
   function bpsAvailabilityLabel(account) {
     if (hasPendingBpsRestore(account.id)) return "BPS 待恢复（保存生效）";
-    if (bpsDisabledAccounts.has(account.id)) return "BPS 已禁用（HTTP 403）";
+    if (bpsDisabledAccounts.has(account.id)) {
+      var blocked = bpsDisabledDetails.get(account.id);
+      var label = "BPS 已禁用（HTTP 403）";
+      if (bpsAutomaticRecovery) {
+        label += " · 每 6 小时检测";
+        if (blocked && blocked.next_check_at) label += " · 下次：" + displayCheckTime(blocked.next_check_at);
+        if (blocked && blocked.check_status === "checking") label += " · 检测中";
+        if (blocked && ["identity_unavailable", "transport_error", "invalid_request", "invalid_response"].indexOf(blocked.check_status) >= 0) label += " · 上次检测失败，保持停用";
+      }
+      return label;
+    }
     var auto = autoDegradationAccounts.get(account.id);
     if (auto && autoDegradationStatus.ready !== false && (autoDegradationStatus.enabled || auto.managed)) {
       return (isSelected(account.id) ? "BPS 已启用" : "原生 Codex（BPS 未启用）") +
@@ -229,6 +237,9 @@
   }
 
   function applyBpsDisabledSelection() {
+    // Recovery is a runtime restriction overlay, not a manual route change.
+    // Keep the configured selection so a successful background probe resumes it.
+    if (bpsPreservesSelection) return;
     if (!bpsDisabledAccounts.size) return;
     var excluded = new Set(excludedIDs);
     var blocked = new Set();
@@ -244,17 +255,25 @@
   }
 
   function updateBpsDisabledAccounts(details) {
+    bpsAutomaticRecovery = !!(details.bps_recovery && details.bps_recovery.interval_hours === 6 &&
+      details.bps_recovery.preserves_selection === true);
+    // Once a runtime preserves selection, a missing/older status must never
+    // convert its temporary blocks into manual exclusions on an ordinary save.
+    if (bpsAutomaticRecovery) bpsPreservesSelection = true;
     if (!Array.isArray(details.bps_disabled_accounts) && !Array.isArray(details.bps_disabled_account_ids)) return;
     var next = new Map();
+    var nextDetails = new Map();
     configAccountIDs(details, "bps_disabled_account_ids").forEach(function (accountID) { next.set(accountID, ""); });
     (Array.isArray(details.bps_disabled_accounts) ? details.bps_disabled_accounts : []).forEach(function (entry) {
       if (!entry || !Number.isSafeInteger(entry.account_id) || entry.account_id <= 0) return;
       next.set(entry.account_id, validBpsBlockID(entry.block_id) ? entry.block_id : "");
+      nextDetails.set(entry.account_id, entry);
     });
     pendingBpsReenabled.forEach(function (blockID, accountID) {
       if (next.get(accountID) !== blockID) pendingBpsReenabled.delete(accountID);
     });
     bpsDisabledAccounts = next;
+    bpsDisabledDetails = nextDetails;
     applyBpsDisabledSelection();
   }
 
@@ -269,7 +288,7 @@
       if (includePendingRestores && hasPendingBpsRestore(accountID) && isSelected(accountID)) {
         acknowledgements[String(accountID)] = blockID;
         excluded.delete(accountID);
-      } else {
+      } else if (!bpsPreservesSelection) {
         excluded.add(accountID);
         blocked.add(accountID);
       }
@@ -336,27 +355,6 @@
     bpsAutoDisableOn403 = !bpsAutoDisableOn403;
     renderBps403Toggle();
     scheduleResize();
-  }
-
-  function renderNativeTimezoneToggle() {
-    var pending = nativeTimezoneByIP !== (loaded.native_timezone_by_ip === true);
-    var button = id("native-timezone-toggle");
-    button.textContent = "请求时区跟随出口 IP：" + (nativeTimezoneByIP ? "已开启" : "已关闭") + (pending ? "（待保存）" : "");
-    button.setAttribute("aria-pressed", String(nativeTimezoneByIP));
-  }
-
-  function toggleNativeTimezone(event) {
-    event.preventDefault();
-    if (!configReady || saving || loading || checking) return;
-    nativeTimezoneByIP = !nativeTimezoneByIP;
-    renderNativeTimezoneToggle();
-    scheduleResize();
-  }
-
-  function verifyNativeTimezonePolicy(config, expected) {
-    if ((config.native_timezone_by_ip === true) !== (expected.native_timezone_by_ip === true)) {
-      throw new Error("宿主返回的请求时区开关与提交内容不一致，请重新保存");
-    }
   }
 
   function automaticAccountSelectionLocked() {
@@ -434,7 +432,10 @@
     var excluded = new Set(excludedIDs);
     autoDegradationAccounts.forEach(function (entry, accountID) {
       if (!autoDegradationStatus.enabled && entry.managed !== true) return;
-      if (entry.bps_enabled) { selected.add(accountID); excluded.delete(accountID); }
+      if (bpsPreservesSelection && bpsDisabledAccounts.has(accountID) && typeof entry.configured_bps_enabled !== "boolean") return;
+      var configured = bpsPreservesSelection && typeof entry.configured_bps_enabled === "boolean"
+        ? entry.configured_bps_enabled : entry.bps_enabled;
+      if (configured) { selected.add(accountID); excluded.delete(accountID); }
       else { selected.delete(accountID); excluded.add(accountID); }
     });
     selectedIDs = Array.from(selected);
@@ -556,6 +557,10 @@
     return selectedIDSet.has(accountID);
   }
 
+  function isEffectivelySelected(accountID) {
+    return isSelected(accountID) && (!bpsDisabledAccounts.has(accountID) || hasPendingBpsRestore(accountID));
+  }
+
   function isSelectableAccount(account) {
     return account && Number.isSafeInteger(account.id) && account.id > 0;
   }
@@ -602,7 +607,7 @@
       return isSelectableAccount(account) &&
         (!bpsDisabledAccounts.has(account.id) || !!bpsDisabledAccounts.get(account.id));
     });
-    var allSelected = selectable.length > 0 && selectable.every(function (account) { return isSelected(account.id); });
+    var allSelected = selectable.length > 0 && selectable.every(function (account) { return isEffectivelySelected(account.id); });
     var button = id("select-all-button");
     button.disabled = !configReady || saving || loading || checking || automaticAccountSelectionLocked() || !selectable.length;
     button.textContent = allSelected ? "已全选列表账号" : "全选列表账号";
@@ -619,9 +624,9 @@
     accounts.forEach(function (account) {
       if (bpsDisabledAccounts.has(account.id) && !bpsDisabledAccounts.get(account.id)) return;
       if (isSelectableAccount(account)) visibleIDs.add(account.id);
-      if (isSelectableAccount(account) && !isSelected(account.id)) {
+      if (isSelectableAccount(account) && !isEffectivelySelected(account.id)) {
         if (bpsDisabledAccounts.has(account.id)) pendingBpsReenabled.set(account.id, bpsDisabledAccounts.get(account.id));
-        selectedIDs.push(account.id);
+        if (!isSelected(account.id)) selectedIDs.push(account.id);
         selectedIDSet.add(account.id);
       }
     });
@@ -636,7 +641,7 @@
       var check = accountChecks[account.id];
       return [account.id, accountDisplayName(account), !!account.schedulable, account.status || "",
         isSelected(account.id), check ? check.status : "", check ? check.detail : "",
-        bpsDisabledAccounts.get(account.id), hasPendingBpsRestore(account.id), automaticAccountSelectionLocked(),
+        bpsDisabledAccounts.get(account.id), bpsDisabledDetails.get(account.id), bpsAutomaticRecovery, hasPendingBpsRestore(account.id), automaticAccountSelectionLocked(),
         autoDegradationStatus && autoDegradationStatus.enabled, autoDegradationStatus && autoDegradationStatus.ready, autoDegradationAccounts.get(account.id)];
     }));
   }
@@ -670,12 +675,12 @@
       var box = document.createElement("input");
       box.type = "checkbox";
       box.value = String(account.id);
-      box.checked = isSelected(account.id);
+      box.checked = isEffectivelySelected(account.id);
       box.indeterminate = automaticAccountSelectionLocked() && (!autoDegradationStatus || autoDegradationStatus.ready === false || !autoDegradationAccounts.has(account.id));
       box.disabled = automaticAccountSelectionLocked() || (bpsDisabledAccounts.has(account.id) && !bpsDisabledAccounts.get(account.id));
       box.addEventListener("change", function () {
         if (!configReady || saving || loading || checking || automaticAccountSelectionLocked()) {
-          box.checked = isSelected(account.id);
+          box.checked = isEffectivelySelected(account.id);
           return;
         }
         accountSelectionEdited = true;
@@ -694,7 +699,9 @@
       var availability = document.createElement("span");
       availability.className = "account-availability" + (bpsDisabledAccounts.has(account.id) ? " bps-disabled" : "");
       availability.textContent = "#" + account.id + " · " + bpsAvailabilityLabel(account);
-      if (bpsDisabledAccounts.has(account.id)) availability.title = "仅停用此账号的 BPS 转发，宿主账号保留。重新勾选并保存可尝试恢复；开启自动停用时，再次收到 BPS 403 会重新停用。";
+      if (bpsDisabledAccounts.has(account.id)) availability.title = "仅停用此账号的 BPS 转发，宿主账号保留。" +
+        (bpsAutomaticRecovery ? "每 6 小时检测封禁，确认不再返回 403 后按保存的选择恢复；检测网络失败保持停用。" : "") +
+        "重新勾选并保存可手动恢复；开启自动停用时，再次收到 BPS 403 会重新停用。";
       copy.appendChild(text);
       copy.appendChild(availability);
       label.appendChild(box);
@@ -734,12 +741,14 @@
   function renderAccountHint() {
     updateAccountActions();
     var hint = id("account-hint");
-    var count = selectedIDs.length;
+    var count = selectedIDs.filter(isEffectivelySelected).length;
     if (automaticAccountSelectionLocked()) {
       hint.textContent = (!autoDegradationStatus || autoDegradationStatus.ready === false
         ? "正在获取后台有效路由，勾选状态待同步；"
         : "自动检测管理账号路由，当前 " + count + " 个账号使用 BPS；列表显示后台实际状态，") +
-        "手动勾选已锁定。关闭自动并保存后可手动编辑，最后有效路由会保留。BPS 403 停用保护仍有效，自动检测不会解除封禁；恢复封禁请先关闭自动并保存，再重新勾选账号保存。";
+        "手动勾选已锁定。关闭自动并保存后可手动编辑，最后有效路由会保留。BPS 403 停用保护仍有效；" +
+        (bpsAutomaticRecovery ? "独立的 BPS 封禁检测每 6 小时执行，确认不再返回 403 后解除停用，按当前路由选择恢复。" :
+          "尚未确认 BPS 定时恢复能力，可关闭自动并保存后重新勾选账号，保存手动恢复。");
       return;
     }
     hint.textContent =
@@ -750,7 +759,8 @@
           ? "尚未成功获取账号目录，暂时保留旧白名单；获取目录后保存一次即可启用新增账号自动使用 BPS。"
           : "请保存一次以启用新增账号自动使用 BPS，之后无需再次打开配置页。"));
     if (bpsDisabledAccounts.size) {
-      hint.textContent += " " + bpsDisabledAccounts.size + " 个账号因一次 BPS HTTP 403 已停用 BPS，宿主账号仍保留；重新勾选并保存可恢复。";
+      hint.textContent += " " + bpsDisabledAccounts.size + " 个账号因一次 BPS HTTP 403 已停用 BPS，宿主账号仍保留；" +
+        (bpsAutomaticRecovery ? "已保存的账号选择保留，每 6 小时检测，确认不再返回 403 后按选择恢复；也可重新勾选并保存。" : "重新勾选并保存可恢复。");
     }
   }
 
@@ -800,7 +810,6 @@
     });
     config.account_ids = selectedIDs.length ? selectedIDs.slice() : [];
     config.bps_auto_disable_on_403 = bpsAutoDisableOn403;
-    config.native_timezone_by_ip = nativeTimezoneByIP;
     readAutoDegradationSettings(config);
     var revision = autoDegradationSettings(loaded).revision;
     if (!Number.isSafeInteger(revision) || revision < 0) {
@@ -913,8 +922,6 @@
     autoSelectNewAccounts = loaded.auto_select_new_accounts === true || selectedIDs.length === 0;
     bpsAutoDisableOn403 = loaded.bps_auto_disable_on_403 !== false;
     autoDegradationEnabled = loaded.auto_degradation_enabled === true;
-    nativeTimezoneByIP = loaded.native_timezone_by_ip === true;
-    renderNativeTimezoneToggle();
     accountSelectionEdited = false;
     pendingManualAccountSelection = null;
     var autoSettings = autoDegradationSettings(loaded);
@@ -1078,7 +1085,6 @@
   function verifySavedConfig(config, expected, readBack) {
     verifyBpsPolicies(config, expected);
     verifyAutoDegradation(config, expected);
-    verifyNativeTimezonePolicy(config, expected);
     var prefix = readBack ? "重新读取的" : "宿主返回的";
     var suffix = readBack ? "，请重试或检查宿主日志" : "";
     if (!sameAccountPolicy(config, expected)) {
@@ -1239,7 +1245,6 @@
     id("select-all-button").addEventListener("click", selectAllAccounts);
     id("bps-403-toggle").addEventListener("click", toggleBps403);
     id("auto-degradation-toggle").addEventListener("click", toggleAutoDegradation);
-    id("native-timezone-toggle").addEventListener("click", toggleNativeTimezone);
     var degradationButton = id("degradation-check-button");
     if (degradationButton) {
       degradationButton.addEventListener("click", handleDegradationCheck);

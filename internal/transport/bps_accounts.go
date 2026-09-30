@@ -30,10 +30,16 @@ const (
 var errBPSAccountStore = errors.New("Basis Points account restrictions are not ready in host storage")
 
 type bpsAccountRecord struct {
-	AccountID  int64  `json:"account_id"`
-	BlockID    string `json:"block_id"`
-	Reason     string `json:"reason"`
-	HTTPStatus int    `json:"http_status"`
+	AccountID        int64     `json:"account_id"`
+	BlockID          string    `json:"block_id"`
+	Reason           string    `json:"reason"`
+	HTTPStatus       int       `json:"http_status"`
+	BlockedAt        time.Time `json:"blocked_at,omitempty"`
+	CheckedAt        time.Time `json:"last_check_at,omitempty"`
+	NextCheckAt      time.Time `json:"next_check_at,omitempty"`
+	RecoveredBlockID string    `json:"recovered_block_id,omitempty"`
+	RecoveredAt      time.Time `json:"recovered_at,omitempty"`
+	CheckStatus      string    `json:"check_status,omitempty"`
 }
 
 // This state belongs to the transport rather than Config. ApplyConfig never
@@ -191,7 +197,8 @@ func (t *Transport) disableBPSAccount(ctx context.Context, id int64) {
 	}
 	var random [16]byte
 	_, _ = rand.Read(random[:])
-	record := bpsAccountRecord{AccountID: id, BlockID: hex.EncodeToString(random[:]), Reason: bpsAccountFailureReason, HTTPStatus: 403}
+	now := time.Now()
+	record := bpsAccountRecord{AccountID: id, BlockID: hex.EncodeToString(random[:]), Reason: bpsAccountFailureReason, HTTPStatus: 403, BlockedAt: now, NextCheckAt: now.Add(bpsRecoveryInterval), CheckStatus: "waiting"}
 	s := &t.bpsAccounts
 	s.mu.Lock()
 	s.initLocked()
@@ -200,6 +207,7 @@ func (t *Transport) disableBPSAccount(ctx context.Context, id int64) {
 	epoch := s.epoch
 	s.mu.Unlock()
 	t.mu.RUnlock()
+	t.wakeBPSRecovery()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -251,7 +259,7 @@ func (t *Transport) persistBPSAccount(ctx context.Context, id int64, epoch uint6
 	defer func() { <-stripe }()
 	s.mu.RLock()
 	record, exists := s.records[id]
-	host, current, dirty := s.host, s.epoch, s.dirty[id]
+	host, current, dirty, revision := s.host, s.epoch, s.dirty[id], s.revisions[id]
 	s.mu.RUnlock()
 	if current != epoch || !exists || !dirty {
 		return
@@ -275,7 +283,7 @@ func (t *Transport) persistBPSAccount(ctx context.Context, id int64, epoch uint6
 		s.writeError = bpsAccountWriteFailure
 		return
 	}
-	if s.records[id].BlockID == record.BlockID {
+	if s.records[id].BlockID == record.BlockID && s.revisions[id] == revision {
 		delete(s.dirty, id)
 	}
 	if len(s.dirty) == 0 {
@@ -305,7 +313,11 @@ func (t *Transport) isBPSAccountDisabled(id int64, cfg protocol.Config) bool {
 	t.bpsAccounts.mu.RLock()
 	record, exists := t.bpsAccounts.records[id]
 	t.bpsAccounts.mu.RUnlock()
-	return exists && record.BlockID != cfg.BPSReenabledAccounts[strconv.FormatInt(id, 10)]
+	return exists && bpsRecordBlocked(record, cfg)
+}
+
+func bpsRecordBlocked(record bpsAccountRecord, cfg protocol.Config) bool {
+	return record.BlockID != record.RecoveredBlockID && record.BlockID != cfg.BPSReenabledAccounts[strconv.FormatInt(record.AccountID, 10)]
 }
 
 // The caller may reject or bypass BPS while a connected store has not loaded.
@@ -327,8 +339,8 @@ func (t *Transport) bpsAccountStatusJSON(baseJSON string, cfg protocol.Config) s
 	s := &t.bpsAccounts
 	s.mu.RLock()
 	records := make([]bpsAccountRecord, 0, len(s.records))
-	for id, record := range s.records {
-		if record.BlockID != cfg.BPSReenabledAccounts[strconv.FormatInt(id, 10)] {
+	for _, record := range s.records {
+		if bpsRecordBlocked(record, cfg) {
 			records = append(records, record)
 		}
 	}
@@ -347,10 +359,11 @@ func (t *Transport) bpsAccountStatusJSON(baseJSON string, cfg protocol.Config) s
 	summaries := make([]map[string]any, 0, len(records))
 	for _, record := range records {
 		ids = append(ids, record.AccountID)
-		summaries = append(summaries, map[string]any{"account_id": record.AccountID, "block_id": record.BlockID, "reason": record.Reason, "http_status": record.HTTPStatus})
+		summaries = append(summaries, map[string]any{"account_id": record.AccountID, "block_id": record.BlockID, "reason": record.Reason, "http_status": record.HTTPStatus, "blocked_at": autoStatusTime(record.BlockedAt), "last_check_at": autoStatusTime(record.CheckedAt), "next_check_at": autoStatusTime(record.NextCheckAt), "check_status": record.CheckStatus})
 	}
 	base["bps_disabled_account_ids"], _ = json.Marshal(ids)
 	base["bps_disabled_accounts"], _ = json.Marshal(summaries)
+	base["bps_recovery"], _ = json.Marshal(t.bpsRecoveryStatus())
 	if persistenceError != "" {
 		base["bps_account_persistence_error"], _ = json.Marshal(persistenceError)
 	} else {
@@ -450,6 +463,8 @@ func loadBPSAccountRecords(ctx context.Context, host pluginv1.HostServiceClient)
 					if json.Unmarshal(response.Value, &record) != nil || record.AccountID != id || record.Reason != bpsAccountFailureReason || record.HTTPStatus != 403 || len(record.BlockID) != 32 {
 						readError = errBPSAccountStore
 					} else if _, err := hex.DecodeString(record.BlockID); err != nil {
+						readError = errBPSAccountStore
+					} else if record.RecoveredBlockID != "" && (record.RecoveredBlockID != record.BlockID || record.RecoveredAt.IsZero()) {
 						readError = errBPSAccountStore
 					}
 				}

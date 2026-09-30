@@ -15,7 +15,7 @@ const htmlSource = fs.readFileSync(path.join(root, "ui/index.html"), "utf8");
 const modelIDs = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const modelCatalogIDs = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna"];
 const defaultModels = ["gpt-6-astra", "gpt-5.6-sol"];
-const defaultAutoDegradation = { auto_degradation_enabled: false, auto_degradation_interval_minutes: 30, auto_degradation_manual_revision: 0, native_timezone_by_ip: false };
+const defaultAutoDegradation = { auto_degradation_enabled: false, auto_degradation_interval_minutes: 30, auto_degradation_manual_revision: 0 };
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const deferred = () => {
   let resolve;
@@ -128,8 +128,6 @@ function createPage(options = {}) {
     "auto-degradation-toggle": "button",
     "auto-degradation-interval": "input",
     "auto-degradation-status": "span",
-    "native-environment-fields": "fieldset",
-    "native-timezone-toggle": "button",
     "degradation-result": "div",
     "account-check-hint": "span",
     "diagnostic-task-status": "span",
@@ -145,8 +143,6 @@ function createPage(options = {}) {
   ids["config-form"].appendChild(ids["account-fields"]);
   ids["config-form"].appendChild(ids["model-fields"]);
   ids["config-form"].appendChild(ids["auto-degradation-fields"]);
-  ids["config-form"].appendChild(ids["native-environment-fields"]);
-  ids["native-environment-fields"].appendChild(ids["native-timezone-toggle"]);
   for (const id of ["auto-degradation-toggle", "auto-degradation-interval", "auto-degradation-status"]) {
     ids["auto-degradation-fields"].appendChild(ids[id]);
   }
@@ -258,7 +254,6 @@ function createPage(options = {}) {
     degradationCheck: () => ids["degradation-check-button"].click(),
     toggle403: () => ids["bps-403-toggle"].click(),
     toggleAutoDegradation: () => ids["auto-degradation-toggle"].click(),
-    toggleNativeTimezone: () => ids["native-timezone-toggle"].click(),
     checkAccount: (accountID) => {
       const button = accountRow(accountID).button;
       assert.ok(button, "Account #" + accountID + " must have its own diagnostic button");
@@ -270,88 +265,59 @@ function createPage(options = {}) {
   };
 }
 
-test("request timezone toggle defaults off and saves its legacy key independently of automatic diagnostics", async () => {
-  const page = createPage({ scoped: true, store: { config: { account_ids: [1], auto_degradation_enabled: true, auto_degradation_manual_revision: 12 } } });
-  await flush();
-  assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "false");
-  assert.equal(page.ids["native-timezone-toggle"].textContent, "请求时区跟随出口 IP：已关闭");
-  assert.ok(htmlSource.includes('<legend class="name">请求环境</legend>'));
-  assert.match(htmlSource, /此开关只控制原生 Codex 和 BPS 业务请求的时区，独立于“自动检测与切换”/);
-  assert.match(htmlSource, /降智检测始终只请求原生 Codex，不检测 BPS/);
-  assert.match(htmlSource, /ipapi.co.*6 小时.*5 分钟/);
-  assert.match(htmlSource, /关闭时不查询 IP.*失败保留原请求/);
-  assert.match(htmlSource, /不保证改善降智/);
-  page.toggleNativeTimezone();
-  assert.match(page.ids["native-timezone-toggle"].textContent, /已开启.*待保存/);
-  assert.equal(page.calls.save.length, 0);
-  assert.equal(page.calls.test, 0);
-  page.pollStatus();
-  await flush();
-  assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "true");
-  page.checkAccount(1);
-  await flush();
-  assert.equal(page.calls.scoped[0].native_timezone_by_ip, true, "The manual diagnostic uses the current explicit form choice");
-  assert.equal(page.calls.save.length, 0);
-  page.save();
-  await flush();
-  assert.match(page.ids["form-hint"].textContent, /已保存/);
-  assert.equal(page.store.config.native_timezone_by_ip, true);
-  assert.equal(page.store.config.auto_degradation_enabled, true);
-  assert.equal(page.store.config.auto_degradation_manual_revision, 12);
-  assert.deepEqual(page.store.config.account_ids, [1]);
-  const reopened = createPage({ store: page.store });
-  await flush();
-  assert.equal(reopened.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "true");
-  reopened.toggleNativeTimezone();
-  reopened.save();
-  await flush();
-  assert.equal(reopened.store.config.native_timezone_by_ip, false);
-  assert.equal(reopened.store.config.auto_degradation_enabled, true);
-  assert.equal(reopened.store.config.auto_degradation_manual_revision, 12);
-});
-
-test("request timezone setting must survive save acknowledgement and verification", async t => {
-  for (const phase of ["save", "load"]) {
-    await t.test(phase, async () => {
-      const page = createPage({
-        save: (config, store) => { store.config = clone(config); return Promise.resolve(phase === "save" ? { ...config, native_timezone_by_ip: false } : config); },
-        load: (count, store) => Promise.resolve(count > 1 && phase === "load" ? { ...store.config, native_timezone_by_ip: false } : clone(store.config)),
-      });
+test("retired timezone controls are absent and legacy settings are omitted from saves and diagnostics", async t => {
+  assert.doesNotMatch(htmlSource, /native-timezone|native-environment-fields|请求时区跟随出口 IP|ipapi\.co/);
+  assert.doesNotMatch(appSource, /native_timezone_by_ip|nativeTimezoneByIP|NativeTimezone/);
+  for (const legacy of [undefined, false, true, null]) {
+    await t.test(String(legacy), async () => {
+      const config = { account_ids: [1], auto_degradation_enabled: true, auto_degradation_manual_revision: 12 };
+      if (legacy !== undefined) config.native_timezone_by_ip = legacy;
+      const page = createPage({ scoped: true, store: { config } });
       await flush();
-      page.toggleNativeTimezone();
+      assert.equal(page.ids["native-timezone-toggle"], undefined);
+      assert.equal(page.ids["native-environment-fields"], undefined);
+      page.checkAccount(1);
+      await flush();
+      assert.equal(page.calls.scoped.length, 1);
+      assert.equal(Object.hasOwn(page.calls.scoped[0], "native_timezone_by_ip"), false);
+      assert.equal(page.calls.save.length, 0);
       page.save();
       await flush();
-      assert.doesNotMatch(page.ids["form-hint"].textContent, /已保存/);
-      assert.match(page.ids["form-hint"].textContent, /请求时区开关.*不一致/);
-      assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "true");
-      assert.equal(page.ids["native-timezone-toggle"].disabled, false);
+      assert.match(page.ids["form-hint"].textContent, /已保存/);
+      assert.equal(Object.hasOwn(page.calls.save[0], "native_timezone_by_ip"), false);
+      assert.equal(Object.hasOwn(page.store.config, "native_timezone_by_ip"), false);
+      assert.equal(page.store.config.auto_degradation_enabled, true);
+      assert.equal(page.store.config.auto_degradation_manual_revision, 12);
+      assert.deepEqual(page.store.config.account_ids, [1]);
+      const reopened = createPage({ store: page.store });
+      await flush();
+      assert.equal(reopened.ids["native-timezone-toggle"], undefined);
+      reopened.save();
+      await flush();
+      assert.equal(Object.hasOwn(reopened.calls.save[0], "native_timezone_by_ip"), false);
+      assert.equal(reopened.store.config.auto_degradation_manual_revision, 12);
     });
   }
 });
 
-test("request timezone toggle stays locked while loading saving and verifying", async () => {
-  const initial = deferred();
-  const saving = deferred();
-  const verification = deferred();
-  const page = createPage({ load: number => number === 1 ? initial.promise : verification.promise, save: () => saving.promise });
-  await flush();
-  page.ids["native-timezone-toggle"].emit("click");
-  assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "false");
-  initial.resolve({ account_ids: [1], native_timezone_by_ip: false });
-  await flush();
-  page.toggleNativeTimezone();
-  page.save();
-  assert.equal(page.ids["native-environment-fields"].disabled, true);
-  page.ids["native-timezone-toggle"].emit("click");
-  assert.equal(page.ids["native-timezone-toggle"].getAttribute("aria-pressed"), "true");
-  saving.resolve(clone(page.calls.save[0]));
-  await flush();
-  assert.equal(page.ids["native-timezone-toggle"].disabled, true);
-  verification.resolve(clone(page.calls.save[0]));
-  await flush();
-  assert.equal(page.ids["native-timezone-toggle"].disabled, false);
-  assert.equal(page.ids["native-environment-fields"].disabled, false);
-  assert.match(page.ids["form-hint"].textContent, /已保存/);
+test("legacy timezone returned by the host cannot revive the removed save field", async t => {
+  for (const phase of ["save", "load"]) {
+    await t.test(phase, async () => {
+      const page = createPage({
+        save: (config, store) => { store.config = clone(config); return Promise.resolve(phase === "save" ? { ...config, native_timezone_by_ip: true } : config); },
+        load: (count, store) => Promise.resolve(count > 1 && phase === "load" ? { ...store.config, native_timezone_by_ip: true } : clone(store.config)),
+      });
+      await flush();
+      page.save();
+      await flush();
+      assert.match(page.ids["form-hint"].textContent, /已保存/);
+      page.save();
+      await flush();
+      assert.equal(page.calls.save.length, 2);
+      assert.ok(page.calls.save.every(config => !Object.hasOwn(config, "native_timezone_by_ip")));
+      assert.equal(Object.hasOwn(page.store.config, "native_timezone_by_ip"), false);
+    });
+  }
 });
 
 test("automatic native diagnostics default off and settings survive saving and reopening", async () => {
@@ -1543,6 +1509,144 @@ test("host-normalized null exclusions are accepted when the submitted exclusion 
 
 const bpsBlockA = "a".repeat(32);
 const bpsBlockB = "b".repeat(32);
+
+function recoveryStatus(blocks = [], accounts) {
+  const result = bpsStatus(blocks, accounts);
+  const details = JSON.parse(result.status_json);
+  details.bps_recovery = { interval_hours: 6, preserves_selection: true };
+  details.bps_disabled_accounts.forEach(entry => { entry.next_check_at = "2026-09-30T18:00:00Z"; entry.check_status = "waiting"; });
+  result.status_json = JSON.stringify(details);
+  return result;
+}
+
+test("automatic BPS recovery preserves configured selection during unrelated saves and resumes only selected accounts", async () => {
+  const status = recoveryStatus([[2, bpsBlockA], [3, bpsBlockB]]);
+  const page = createPage({ status, store: { config: { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3] } } });
+  await flush();
+  assert.deepEqual(page.selected(), [1]);
+  assert.match(page.accountRow(2).availability.textContent, /每 6 小时检测.*下次/);
+  assert.match(page.ids["account-hint"].textContent, /已保存的账号选择保留/);
+  page.checkModel("gpt-6-sol", true);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1, 2]);
+  assert.deepEqual(page.store.config.excluded_account_ids, [3]);
+  assert.ok(!page.store.config.bps_reenabled_accounts);
+  assert.deepEqual(page.selected(), [1]);
+  const saves = page.calls.save.length;
+  Object.assign(status, recoveryStatus());
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 2]);
+  assert.equal(page.calls.save.length, saves);
+});
+
+test("missing recovery capability after a failed or downgraded status cannot turn a runtime block into a manual exclusion", async () => {
+  const current = recoveryStatus([[2, bpsBlockA]]);
+  const old = bpsStatus([[2, bpsBlockA]]);
+  const page = createPage({ store: { config: { account_ids: [1, 2], auto_select_new_accounts: true, excluded_account_ids: [3] } },
+    getStatus: count => count === 1 ? Promise.resolve(clone(current)) : count === 2 ? Promise.reject(new Error("status unavailable")) : Promise.resolve(clone(old)) });
+  await flush();
+  assert.deepEqual(page.selected(), [1]);
+  page.pollStatus();
+  await flush();
+  assert.match(page.ids["version-line"].textContent, /status unavailable/);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1, 2]);
+  assert.deepEqual(page.store.config.excluded_account_ids, [3]);
+  assert.doesNotMatch(page.accountRow(2).availability.textContent, /每 6 小时检测/);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1, 2]);
+  assert.deepEqual(page.store.config.excluded_account_ids, [3]);
+});
+
+test("automatic recovery needs both interval and selection-preservation markers", async () => {
+  const status = recoveryStatus([[2, bpsBlockA]]);
+  const details = JSON.parse(status.status_json);
+  delete details.bps_recovery.preserves_selection;
+  status.status_json = JSON.stringify(details);
+  const page = createPage({ status });
+  await flush();
+  assert.doesNotMatch(page.accountRow(2).availability.textContent, /每 6 小时检测/);
+});
+
+test("recovery status keeps an automatic managed route baseline separate from the blocked overlay", async () => {
+  const status = recoveryStatus([[2, bpsBlockA]]);
+  const details = JSON.parse(status.status_json);
+  details.auto_degradation = { enabled: false, ready: true, accounts: [
+    { account_id: 1, managed: true, bps_enabled: false, configured_bps_enabled: false },
+    { account_id: 2, managed: true, bps_enabled: false, configured_bps_enabled: true },
+    { account_id: 3, managed: true, bps_enabled: false, configured_bps_enabled: false },
+  ] };
+  status.status_json = JSON.stringify(details);
+  const page = createPage({ status });
+  await flush();
+  assert.deepEqual(page.selected(), []);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [2]);
+  assert.deepEqual(page.store.config.excluded_account_ids, [1, 3]);
+  details.bps_disabled_accounts = [];
+  details.bps_disabled_account_ids = [];
+  details.auto_degradation.accounts[1].bps_enabled = true;
+  status.status_json = JSON.stringify(details);
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [2]);
+});
+
+test("legacy account whitelist migration preserves a temporarily blocked selected account", async () => {
+  const status = recoveryStatus([[2, bpsBlockA]]);
+  const page = createPage({ status, store: { config: { account_ids: [1, 2] } } });
+  await flush();
+  assert.deepEqual(page.selected(), [1]);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1, 2]);
+  assert.deepEqual(page.store.config.excluded_account_ids, [3]);
+  assert.equal(page.store.config.auto_select_new_accounts, true);
+});
+
+test("automatic recovery still permits exact versioned manual restoration and cancellation", async () => {
+  const status = recoveryStatus([[2, bpsBlockA]]);
+  const page = createPage({ status });
+  await flush();
+  page.check(2, true);
+  assert.match(page.accountRow(2).availability.textContent, /待恢复/);
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 2, 3]);
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.bps_reenabled_accounts, { 2: bpsBlockA });
+  Object.assign(status, recoveryStatus([[2, bpsBlockB]]));
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+  page.check(2, true);
+  page.check(2, false);
+  page.save();
+  await flush();
+  assert.ok(page.store.config.excluded_account_ids.includes(2));
+  assert.equal(page.store.config.bps_reenabled_accounts[2], bpsBlockA);
+  Object.assign(status, recoveryStatus());
+  page.pollStatus();
+  await flush();
+  assert.deepEqual(page.selected(), [1, 3]);
+});
+
+test("select all records restores even when recovery preserves underlying selected IDs", async () => {
+  const page = createPage({ status: recoveryStatus([[1, bpsBlockA], [2, bpsBlockB]]) });
+  await flush();
+  assert.deepEqual(page.selected(), [3]);
+  page.selectAll();
+  page.save();
+  await flush();
+  assert.deepEqual(page.store.config.account_ids, [1, 2, 3]);
+  assert.deepEqual(page.store.config.bps_reenabled_accounts, { 1: bpsBlockA, 2: bpsBlockB });
+});
 function bpsStatus(blocks = [], accounts = [{ id: 1, schedulable: true }, { id: 2, schedulable: true }, { id: 3, schedulable: true }]) {
   return { healthy: true, status_json: JSON.stringify({
     accounts, bps_disabled_account_ids: blocks.map(([accountID]) => accountID),

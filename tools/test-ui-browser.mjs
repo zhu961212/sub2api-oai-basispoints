@@ -79,7 +79,7 @@ const driver = String.raw`
     const width = document.documentElement.clientWidth;
     if (document.documentElement.scrollWidth > width + 1 || document.body.scrollWidth > width + 1)
       throw new Error('Page overflows horizontally at ' + width + 'px');
-    for (const element of document.querySelectorAll('.account-name, .account-availability, #degradation-result > span, #bps-403-toggle, #auto-degradation-toggle, #auto-degradation-fields input, #native-timezone-toggle')) {
+    for (const element of document.querySelectorAll('.account-name, .account-availability, #degradation-result > span, #bps-403-toggle, #auto-degradation-toggle, #auto-degradation-fields input')) {
       const bounds = element.getBoundingClientRect();
       if (bounds.left < -1 || bounds.right > width + 1 || element.scrollWidth > element.clientWidth + 1)
         throw new Error('Account name, diagnostic result or policy control overflows at ' + width + 'px');
@@ -114,26 +114,14 @@ const driver = String.raw`
       const autoToggle = document.getElementById('auto-degradation-toggle');
       const autoInterval = document.getElementById('auto-degradation-interval');
       const fixedNativeModel = document.getElementById('degradation-fixed-model');
-      const timezoneToggle = document.getElementById('native-timezone-toggle');
-      if (!timezoneToggle || timezoneToggle.disabled || timezoneToggle.type !== 'button' || timezoneToggle.getAttribute('aria-pressed') !== 'false')
-        throw new Error('Request timezone toggle is missing, locked, or not default-off');
-      const timezoneHelp = document.getElementById('native-timezone-hint').textContent;
-      if (timezoneToggle.textContent !== '请求时区跟随出口 IP：已关闭' ||
-          document.querySelector('#native-environment-fields legend').textContent !== '请求环境' ||
-          !timezoneHelp.includes('此开关只控制原生 Codex 和 BPS 业务请求的时区，独立于“自动检测与切换”') ||
-          !timezoneHelp.includes('降智检测始终只请求原生 Codex，不检测 BPS') ||
-          !timezoneHelp.includes('检测请求也遵循此时区设置'))
-        throw new Error('Request timezone copy does not describe both native and BPS scope');
+      if (document.querySelector('#native-timezone-toggle, #native-timezone-hint, #native-environment-fields'))
+        throw new Error('Retired timezone controls are still visible');
       if (!autoToggle || autoToggle.disabled || autoToggle.type !== 'button' || autoToggle.getAttribute('aria-pressed') !== 'false' ||
           !autoInterval || autoInterval.value !== '30' || autoInterval.min !== '5' || autoInterval.max !== '1440' ||
           document.getElementById('degradation-check-model') || !fixedNativeModel ||
           !fixedNativeModel.textContent.includes('原生检测固定使用 gpt-6-astra'))
         throw new Error('Native automatic diagnostic defaults or controls are incorrect');
       if (stage === 'select') {
-        timezoneToggle.click();
-        if (timezoneToggle.getAttribute('aria-pressed') !== 'true' || !timezoneToggle.textContent.includes('待保存') || autoToggle.getAttribute('aria-pressed') !== 'false')
-          throw new Error('Request timezone toggle did not remain independent or show its pending state');
-        timezoneToggle.click();
         autoToggle.click();
         if (autoToggle.getAttribute('aria-pressed') !== 'true' || !autoToggle.textContent.includes('待保存') ||
             !document.getElementById('select-all-button').disabled || Array.from(document.querySelectorAll('#account-list input')).some(box => !box.disabled))
@@ -179,7 +167,7 @@ const driver = String.raw`
       }
       function assertBusy(before) {
         for (const controlID of ['save-button', 'retry-button', 'select-all-button', 'degradation-check-button',
-          'bps-403-toggle', 'account-fields', 'model-fields', 'native-timezone-toggle', 'native-environment-fields']) {
+          'bps-403-toggle', 'account-fields', 'model-fields']) {
           if (!document.getElementById(controlID).disabled) throw new Error('Diagnostic did not lock ' + controlID);
         }
         if (Array.from(document.querySelectorAll('.account-check-button')).some((button) => !button.disabled))
@@ -360,7 +348,7 @@ const host = `
   const defaultModels = ['gpt-6-astra', 'gpt-5.6-sol'];
   const subset = ['gpt-6-sol', 'gpt-5.6-luna'];
   let config = { account_ids: [], enabled_models: defaultModels,
-    timeout_seconds: 123, auth_mode: 'chatgpt', rewrite_tools: false, degradation_check_model: 'gpt-5.4-mini' };
+    timeout_seconds: 123, auth_mode: 'chatgpt', rewrite_tools: false, degradation_check_model: 'gpt-5.4-mini', native_timezone_by_ip: true };
   let frame;
   let token;
   let stage;
@@ -512,6 +500,8 @@ const host = `
       scopedTestCount++;
       if (scopedTestCount > 5) return void finish(false, { error: 'An extra scoped request bypassed the busy lock' });
       const snapshot = data.config;
+      if (Object.hasOwn(snapshot, 'native_timezone_by_ip'))
+        return void finish(false, { error: 'Scoped diagnostic retained the removed timezone setting' });
       const single = scopedTestCount <= 2;
       const targets = single ? [accountIDs[scopedTestCount === 1 ? 1 : 0]] : accountIDs;
       const expectedSelection = scopedTestCount <= 3 ? [accountIDs[0], accountIDs[1], accountIDs[3]] : [accountIDs[1], accountIDs[2], accountIDs[3]];
@@ -553,6 +543,8 @@ const host = `
         return void finish(false, { error: 'Paused account diagnostics must never save configuration' });
       if ('degradation_check_model' in data.config)
         return void finish(false, { error: 'Saving configuration retained a retired diagnostic model override' });
+      if (Object.hasOwn(data.config, 'native_timezone_by_ip'))
+        return void finish(false, { error: 'Saving configuration retained the removed timezone setting' });
       if (data.config.timeout_seconds !== 123 || data.config.auth_mode !== 'chatgpt' || data.config.rewrite_tools !== false)
         return void finish(false, { error: 'Saving account selection overwrote unrelated configuration' });
       if (stage === 'scoped' && (data.config.degradation_check === true ||

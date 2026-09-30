@@ -45,6 +45,25 @@ type APIError struct {
 	Status  int
 	Kind    string
 	Message string
+	// DiagnosticCode is a static classification, never upstream argument text.
+	DiagnosticCode string
+}
+
+// ClientToolDiagnosticReason admits only fixed relay stages into client errors.
+func ClientToolDiagnosticReason(value string) string {
+	switch value {
+	case "relay_outer_arguments", "relay_code_envelope", "relay_nested_envelope", "relay_tool_identity":
+		return value
+	default:
+		return ""
+	}
+}
+
+func (e *APIError) DiagnosticReason() string {
+	if e == nil || e.Kind != "invalid_tool_call" {
+		return ""
+	}
+	return ClientToolDiagnosticReason(e.DiagnosticCode)
 }
 
 func (e *APIError) Error() string {

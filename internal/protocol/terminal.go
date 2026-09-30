@@ -123,7 +123,7 @@ func ResponseTerminalError(terminal ResponseTerminal, payload map[string]any) er
 			if message != malformedClientToolMessage && message != unknownClientToolMessage {
 				message = "Basis Points returned an invalid client tool call"
 			}
-			return fail(502, "invalid_tool_call", message)
+			return &APIError{Status: 502, Kind: "invalid_tool_call", Message: message, DiagnosticCode: ClientToolDiagnosticReason(stringValue(failure["reason"]))}
 		}
 		if stringValue(failure["code"]) == "upstream_cancelled" {
 			terminal = TerminalCancelled
@@ -159,12 +159,21 @@ func NormalizeClientToolFailure(payload map[string]any, event string) bool {
 			if message := stringValue(object["message"]); message != "" {
 				failure["message"] = message
 			}
+			if reason := ClientToolDiagnosticReason(stringValue(object["reason"])); reason != "" {
+				failure["reason"] = reason
+			}
 			object["error"] = failure
 			changed = true
 		}
 		if stringValue(failure["code"]) == "invalid_tool_call" && stringValue(failure["type"]) != "invalid_request_error" {
 			failure["type"] = "invalid_request_error"
 			changed = true
+		}
+		if stringValue(failure["code"]) == "invalid_tool_call" {
+			if reason, exists := failure["reason"]; exists && ClientToolDiagnosticReason(stringValue(reason)) == "" {
+				delete(failure, "reason")
+				changed = true
+			}
 		}
 	}
 	return changed
@@ -231,6 +240,16 @@ func NormalizeResponseFailure(payload map[string]any, terminal ResponseTerminal)
 	}
 	if stringValue(failure["code"]) == "invalid_tool_call" {
 		failure["type"] = "invalid_request_error"
+		reason := ClientToolDiagnosticReason(stringValue(failure["reason"]))
+		delete(failure, "reason")
+		for _, candidate := range []map[string]any{upstream, payload} {
+			if reason == "" {
+				reason = ClientToolDiagnosticReason(stringValue(candidate["reason"]))
+			}
+		}
+		if reason != "" {
+			failure["reason"] = reason
+		}
 	}
 	response["error"] = failure
 	return "response.failed"
