@@ -19,6 +19,7 @@ class SourceExportBoundaryTests(unittest.TestCase):
                      "docs/使用说明.md", "docs/host-patches/sub2api-0.2.8-config-test-scoped.patch",
                      "tools/host-diagnostic-integration/diagnostic_jobs_host_test.go.txt",
                      "tools/host-relay-integration/relay_scope_host_test.go.txt",
+                     "tools/host-relay-integration/model_not_found_host_test.go.txt",
                      "tools/host-relay-integration/signed_package_host_test.go.txt",
                      "tools/host-relay-integration/signed_release_host_test.go.txt",
                      "internal/attachments/testdata/sample.pdf",
@@ -41,6 +42,7 @@ class SourceExportBoundaryTests(unittest.TestCase):
         fixtures = (
             "tools/host-diagnostic-integration/diagnostic_jobs_host_test.go.txt",
             "tools/host-relay-integration/relay_scope_host_test.go.txt",
+            "tools/host-relay-integration/model_not_found_host_test.go.txt",
             "tools/host-relay-integration/signed_package_host_test.go.txt",
             "tools/host-relay-integration/signed_release_host_test.go.txt",
         )

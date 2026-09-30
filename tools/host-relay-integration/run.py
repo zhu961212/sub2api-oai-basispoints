@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--host-source', required=True, type=Path)
     parser.add_argument('--go', default='go')
     parser.add_argument('--expected-host-version', default='0.2.8')
+    parser.add_argument('--suite', choices=['relay-scope', 'model-not-found'], default='relay-scope')
     args = parser.parse_args()
     here = Path(__file__).resolve().parent
     host = args.host_source.resolve() / 'backend'
@@ -33,9 +34,16 @@ def main():
         'internal/service/openai_gateway_passthrough.go',
         'internal/service/openai_gateway_response_handling.go',
         'internal/handler/openai_gateway_handler.go',
+        'internal/service/ratelimit_service.go',
+        'internal/service/plugin_runtime.go',
+        'internal/service/openai_upstream_transport_error.go',
     ]]
     before = {str(path): digest(path) for path in watched}
-    target = host / 'internal/service/zz_basispoints_relay_scope_integration_test.go'
+    fixture, test_pattern = {
+        'relay-scope': ('relay_scope_host_test.go.txt', '^TestBasispointsRelayScope'),
+        'model-not-found': ('model_not_found_host_test.go.txt', '^TestBasispointsModelNotFound'),
+    }[args.suite]
+    target = host / ('internal/service/zz_basispoints_' + args.suite.replace('-', '_') + '_integration_test.go')
     if target.exists():
         parser.error(f'overlay target must not exist: {target}')
     build = here.parent.parent / 'build'
@@ -46,9 +54,9 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix='host-relay-scope-', dir=build) as scratch:
             overlay = Path(scratch) / 'overlay.json'
-            overlay.write_text(json.dumps({'Replace': {str(target): str(here / 'relay_scope_host_test.go.txt')}}), encoding='utf-8')
+            overlay.write_text(json.dumps({'Replace': {str(target): str(here / fixture)}}), encoding='utf-8')
             command = [args.go, 'test', '-mod=readonly', '-overlay', str(overlay),
-                       '-count=1', '-timeout=120s', '-run', '^TestBasispointsRelayScope',
+                       '-count=1', '-timeout=120s', '-run', test_pattern,
                        '-v', './internal/service']
             print('+ ' + ' '.join(command), flush=True)
             subprocess.run(command, cwd=host, env=env, check=True)
@@ -56,7 +64,7 @@ def main():
         after = {str(path): digest(path) for path in watched}
         if after != before or target.exists():
             raise RuntimeError('host source changed during the overlay suite')
-    print(f'PASS: actual host {version} classifiers and SSE readers; watched host files unchanged.')
+    print(f'PASS: actual host {version}, suite {args.suite}; watched host files unchanged.')
 
 
 if __name__ == '__main__':

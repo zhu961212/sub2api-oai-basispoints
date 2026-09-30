@@ -12,14 +12,14 @@ import (
 )
 
 // HTTP error responses take a different path through the host than failures
-// inside a successful SSE transport. Capture only a proven tool-protocol
-// failure before retrying it or allowing that path to replace its diagnostic.
+// inside a successful SSE transport. Capture only a proven request-scoped
+// failure before retrying it or allowing that path to change account state.
 // The limit is no larger than the minimum configurable response limit.
 const httpToolFailureProbeLimit = 64 << 10
 
 const httpToolFailureProbeTimeout = time.Second
 
-type basisPointsHTTPToolFailureBody struct {
+type httpRequestFailureBody struct {
 	io.ReadCloser
 	response map[string]any
 }
@@ -38,6 +38,10 @@ func captureBasisPointsHTTPToolFailure(resp *http.Response) bool {
 }
 
 func captureBasisPointsHTTPToolFailureWithin(resp *http.Response, timeout time.Duration) bool {
+	return captureHTTPFailureWithin(resp, timeout, canonicalHTTPToolFailure)
+}
+
+func captureHTTPFailureWithin(resp *http.Response, timeout time.Duration, classify func(map[string]any, string) map[string]any) bool {
 	if resp == nil || resp.Body == nil || resp.StatusCode < 400 || resp.StatusCode > 599 ||
 		resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 {
 		return false
@@ -71,7 +75,7 @@ func captureBasisPointsHTTPToolFailureWithin(resp *http.Response, timeout time.D
 		stopProbe()
 		if response != nil {
 			_ = original.Close()
-			resp.Body = &basisPointsHTTPToolFailureBody{
+			resp.Body = &httpRequestFailureBody{
 				ReadCloser: io.NopCloser(bytes.NewReader(protocol.JSONBytes(response))),
 				response:   response,
 			}
@@ -100,7 +104,7 @@ func captureBasisPointsHTTPToolFailureWithin(resp *http.Response, timeout time.D
 		}
 		object, err := protocol.RawObject(raw)
 		if err == nil {
-			response = canonicalHTTPToolFailure(object, "error")
+			response = classify(object, "error")
 		}
 		return response != nil
 	}
@@ -114,7 +118,7 @@ func captureBasisPointsHTTPToolFailureWithin(resp *http.Response, timeout time.D
 		if err != nil {
 			return stop
 		}
-		response = canonicalHTTPToolFailure(object, event.event)
+		response = classify(object, event.event)
 		if response != nil {
 			return stop
 		}

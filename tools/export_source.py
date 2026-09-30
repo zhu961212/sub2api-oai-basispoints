@@ -21,6 +21,7 @@ SOURCE_FIXTURES = {
     "internal/attachments/testdata/sample.docx",
     "tools/host-diagnostic-integration/diagnostic_jobs_host_test.go.txt",
     "tools/host-relay-integration/relay_scope_host_test.go.txt",
+    "tools/host-relay-integration/model_not_found_host_test.go.txt",
     "tools/host-relay-integration/signed_package_host_test.go.txt",
     "tools/host-relay-integration/signed_release_host_test.go.txt",
 }

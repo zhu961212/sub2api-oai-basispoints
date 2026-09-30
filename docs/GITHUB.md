@@ -6,7 +6,7 @@
 
 ## 已准备的源码包
 
-在项目根目录运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.9-github-source.zip 和配套 SHA-256。脚本从当前工作区导出源码，包含尚未提交的新文件；不会复制 .git、build、dist、发布密钥、常见凭据文件或本地缓存。解压包后，以内层项目目录作为仓库根目录。
+在项目根目录运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.10-github-source.zip 和配套 SHA-256。脚本从当前工作区导出源码，包含尚未提交的新文件；不会复制 .git、build、dist、发布密钥、常见凭据文件或本地缓存。解压包后，以内层项目目录作为仓库根目录。
 
 README、插件清单介绍、配置页和本文均包含 **交流群：1107265919**；GitHub 仓库 About 或 Release 介绍也可填写：
 
@@ -106,12 +106,12 @@ git push -u origin main
 
 ## 6. 发布安装包
 
-源码上传与安装包发布分开进行。需要发布 0.6.9 时：
+源码上传与安装包发布分开进行。需要发布 0.6.10 时：
 
 1. 确认源码、manifest.source.json 版本、测试结果和发布记录一致。
 2. 按 [README](../README.md) 生成签名安装包，用配套公钥独立验包。
-3. 在 GitHub Releases 为审核后的提交创建 v0.6.9 标签和 Release。
-4. 上传 .s2plugin 与配套 .s2plugin.sha256，正文参考 [0.6.9 发布记录](release-0.6.9-2026-09-27.md)。
+3. 在 GitHub Releases 为审核后的提交创建 v0.6.10 标签和 Release。
+4. 上传 .s2plugin 与配套 .s2plugin.sha256，正文参考 [0.6.10 发布记录](release-0.6.10-2026-09-30.md)。
 5. 沿用 oai-basispoints-v1 key_id 与原发布公钥。绝不发布私钥。
 
 发布前使用 --require-signature --expected-key-id oai-basispoints-v1 和原公钥独立验签。正文记录原生检测、自动切换和请求时区功能，并区分正式签名包验收与本地原生诊断测试构建，并列出实际测试结果和包哈希。不要把本地插件修复表述为解除上游使用政策 403。真实 OAuth/BPS 会话与生产部署须单独验收。

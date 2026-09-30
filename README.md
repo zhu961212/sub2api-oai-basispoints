@@ -4,7 +4,9 @@
 
 [GitHub 仓库](https://github.com/zhu961212/sub2api-oai-basispoints) · [发布下载](https://github.com/zhu961212/sub2api-oai-basispoints/releases)
 
-当前版本：**0.6.9** · 插件 ID：**local.oai-basispoints**
+当前版本：**0.6.10** · 插件 ID：**local.oai-basispoints**
+
+**0.6.10 模型错误隔离**：HTTP 404 且明确返回 model_not_found 的请求不再触发宿主账号／模型限流或冷却，覆盖 BPS 与原生透传。该次请求仍失败，同账号后续请求保持可用；详见 [发行记录](docs/release-0.6.10-2026-09-30.md) 与 [修复说明](docs/MODEL-NOT-FOUND-NO-COOLDOWN.md)。
 
 支持官方 **Sub2API 0.2.8 和 0.2.9**，推荐 0.2.9；保持 Plugin Protocol / Transport API / UI Bridge v1，无需修改宿主。兼容性依据及测试边界见 [双版本兼容记录](docs/COMPATIBILITY-0.2.8-0.2.9.md)。
 
@@ -235,7 +237,7 @@ TestLive 系列属于可选真实上游测试，设置 BASISPOINTS_LIVE_TOKEN �
 
 ## GitHub 源码准备
 
-运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.9-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
+运行 python -X utf8 tools/export_source.py，生成 dist/sub2api-oai-basispoints-0.6.10-github-source.zip 及 SHA-256 文件。源码包包含当前源码、测试、CI 和文档，不包含 Git 历史、构建产物或发布密钥。解压后按 [GitHub 上传说明](docs/GITHUB.md) 上传。
 
 ## 构建、签名与验包
 
@@ -257,12 +259,12 @@ Linux：
 bash ./build.sh -signing-key ../basispoints-private/publisher.private -key-id my-publisher-v1
 ~~~
 
-构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.9.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
+构建脚本明确跳过 TestLive。默认生成 Windows/Linux amd64 包：dist/local.oai-basispoints-0.6.10.s2plugin。build/ 和 dist/ 为本地生成目录，不随源码上传。无签名参数时会生成未签名包，仅用于允许未签名插件的本地调试。
 
 显式传入配套公钥进行独立验包：
 
 ~~~powershell
-python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.9.s2plugin --require-signature --expected-key-id oai-basispoints-v1 --public-key ../basispoints-private/publisher.public
+python -X utf8 tools/verify_package.py dist/local.oai-basispoints-0.6.10.s2plugin --require-signature --expected-key-id oai-basispoints-v1 --public-key ../basispoints-private/publisher.public
 ~~~
 
 校验器检查包内容、文件哈希及 manifest 原始字节的 Ed25519 签名。签名构建必须具备 Python 和与私钥同名的 .public 配套公钥；两种构建脚本均对实际输出执行强制验签，并核对 key_id。也可用上面的显式验签命令单独复查。
@@ -276,7 +278,7 @@ plugins:
     my-publisher-v1: BASE64_ED25519_PUBLIC_KEY
 ~~~
 
-在 Sub2API 插件管理页安装 0.6.9，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
+在 Sub2API 插件管理页安装 0.6.10，打开配置页选择模型和账号并保存，再配置灰度并启用插件。主动检测无需宿主补丁；升级后请重新打开配置页。详细步骤见 [使用说明](docs/使用说明.md)。
 
 ## 配置页与全选
 
@@ -326,7 +328,7 @@ Basis Points returned an unknown client tool absent from the active catalog
 
 该错误表示返回的调用无法匹配本轮客户端声明的工具目录。部分客户端的提示仍用 exec_command 固定示例，但本轮可能只声明 functions.exec 执行器。0.5.15 按实际目录生成调用格式指引，区分执行器与其内部 helper、自定义工具的原始 input 与中转信封中的 args。
 
-更新后需在宿主重新加载插件，确认运行版本为 0.6.9，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
+更新后需在宿主重新加载插件，确认运行版本为 0.6.10，再重新发起请求。若目录只声明 functions.exec，执行器内部的 helper 必须通过该执行器调用，不能独立作为中继目标。自定义工具使用原始文本参数，插件再还原为客户端调用。
 
 0.5.26 中，上游返回目录外或可识别但截断的单一末尾中转调用，并且本轮尚未向客户端发出工具时，最多追加一次带当前目录与拒绝原因的纠正请求。它沿用原账号、模型、历史和图片引用；错误工具不会执行。纠正后的结果仍须通过原有目录和参数校验，两次请求的用量合并记录。
 

@@ -773,8 +773,11 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	if err != nil {
 		return sendError(stream, "upstream_transport", safeTransportError(err), true)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	observeBPSStatus(resp.StatusCode)
+	if captureUpstreamModelNotFound(resp) {
+		return sendError(stream, "PLUGIN_MODEL_NOT_FOUND", upstreamModelNotFoundMessage, true)
+	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		return sendError(stream, "upstream_redirect", "Basis Points returned an unexpected HTTP redirect", true)
 	}
@@ -784,7 +787,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 	// The host also derives account health from quota headers and errors
 	// inside HTTP 200 streams. Isolate only the BPS response before any
 	// image conversion or optional response transformation can expose it.
-	httpToolFailure, capturedToolFailure := resp.Body.(*basisPointsHTTPToolFailureBody)
+	httpToolFailure, capturedToolFailure := resp.Body.(*httpRequestFailureBody)
 	if err := prepareBasisPointsResponse(resp, cfg.MaxResponseBytes, observeBPSStatus); err != nil {
 		return sendError(stream, errorCode(err), safeError(err), true)
 	}
@@ -859,6 +862,7 @@ func (t *Transport) Forward(stream pluginv1.TransportPlugin_ForwardServer) error
 // retain the host URL, method, identity headers and response stream. The body
 // is unchanged unless the independent native timezone option is enabled;
 // BPS headers, tool rewriting and response conversion never enter this path.
+// A confirmed HTTP 404 model_not_found is a request error, not account health.
 func (t *Transport) passthrough(stream pluginv1.TransportPlugin_ForwardServer, start *pluginv1.ForwardRequestStart, body []byte, client *http.Client, cfg protocol.Config) error {
 	target := strings.TrimSpace(start.GetUrl())
 	if target == "" {
@@ -902,7 +906,10 @@ func (t *Transport) passthrough(stream pluginv1.TransportPlugin_ForwardServer, s
 	if err != nil {
 		return sendError(stream, "upstream_transport", safeTransportError(err), true)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+	if captureUpstreamModelNotFound(resp) {
+		return sendError(stream, "PLUGIN_MODEL_NOT_FOUND", upstreamModelNotFoundMessage, true)
+	}
 	return sendHTTPResponseStream(stream, resp, cfg.MaxResponseBytes)
 }
 

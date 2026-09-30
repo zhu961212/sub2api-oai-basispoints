@@ -1,0 +1,131 @@
+// Test-only overlay; the host sources remain unchanged.
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/config"
+	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+)
+
+type bpsModelNotFoundRepo struct {
+	AccountRepository
+	model, rate, temp, extra, accountError int
+}
+
+func (r *bpsModelNotFoundRepo) SetModelRateLimit(context.Context, int64, string, time.Time, ...string) error {
+	r.model++
+	return nil
+}
+func (r *bpsModelNotFoundRepo) SetRateLimited(context.Context, int64, time.Time) error {
+	r.rate++
+	return nil
+}
+func (r *bpsModelNotFoundRepo) SetTempUnschedulable(context.Context, int64, time.Time, string) error {
+	r.temp++
+	return nil
+}
+func (r *bpsModelNotFoundRepo) UpdateExtra(context.Context, int64, map[string]any) error {
+	r.extra++
+	return nil
+}
+func (r *bpsModelNotFoundRepo) SetError(context.Context, int64, string) error {
+	r.accountError++
+	return nil
+}
+
+func bpsModelNotFoundGateway() (*OpenAIGatewayService, *bpsModelNotFoundRepo, *Account) {
+	repo := &bpsModelNotFoundRepo{}
+	limits := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	svc := &OpenAIGatewayService{accountRepo: repo, rateLimitService: limits}
+	limits.SetAccountRuntimeBlocker(svc)
+	account := &Account{ID: 306, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	return svc, repo, account
+}
+
+func TestBasispointsModelNotFoundRaw404ReproducesCooldown(t *testing.T) {
+	svc, repo, account := bpsModelNotFoundGateway()
+	failure := map[string]any{"code": "model_not_found", "type": "invalid_request_error", "message": "The model 'gpt-6-astra-degrade2-luna-1p-codexswic-ev3' does not exist or you do not have access to it."}
+	body, err := json.Marshal(map[string]any{"error": failure, "detail": map[string]any{"error": map[string]any{"error": failure}, "upstream_status": 404}})
+	require.NoError(t, err)
+	require.True(t, svc.rateLimitService.HandleUpstreamModelNotFound(context.Background(), account, "gpt-6-astra", http.StatusNotFound, body))
+	require.Equal(t, 1, repo.model, "original HTTP response must reproduce the model cooldown")
+}
+
+type bpsModelNotFoundServer struct {
+	pluginv1.UnimplementedTransportPluginServer
+}
+
+func (bpsModelNotFoundServer) Forward(stream grpc.BidiStreamingServer[pluginv1.ForwardRequest, pluginv1.ForwardResponse]) error {
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return stream.Send(&pluginv1.ForwardResponse{Frame: &pluginv1.ForwardResponse_Error{Error: &pluginv1.ForwardResponseError{
+		Code: "PLUGIN_MODEL_NOT_FOUND", RequestSent: true,
+		Message: "Upstream rejected the requested model (HTTP 404 model_not_found); the model does not exist or is not available for this request",
+	}}})
+}
+
+func TestBasispointsModelNotFoundPluginFrameKeepsAccountAvailable(t *testing.T) {
+	listener := bufconn.Listen(1 << 20)
+	server := grpc.NewServer()
+	pluginv1.RegisterTransportPluginServer(server, bpsModelNotFoundServer{})
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	t.Cleanup(func() { server.Stop(); _ = listener.Close(); <-done })
+	conn, err := grpc.NewClient("passthrough:///model-not-found-test",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return listener.DialContext(ctx) }))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	runtime := &pluginRuntime{api: pluginv1.NewTransportPluginClient(conn), done: make(chan struct{})}
+	for _, passthrough := range []bool{false, true} {
+		svc, repo, account := bpsModelNotFoundGateway()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for attempt := 0; attempt < 3; attempt++ {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.invalid/v1/responses", strings.NewReader("{}"))
+			require.NoError(t, err)
+			response, err := runtime.roundTrip(ctx, req, "", account)
+			require.Nil(t, response, "no HTTP headers or body may enter account error handling")
+			var pluginErr *PluginTransportError
+			require.ErrorAs(t, err, &pluginErr)
+			require.Equal(t, "PLUGIN_MODEL_NOT_FOUND", pluginErr.Code)
+			require.True(t, pluginErr.RequestSent)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			result := svc.handleOpenAIUpstreamTransportError(ctx, c, account, err, passthrough)
+			require.Same(t, err, result)
+			var failover *UpstreamFailoverError
+			require.False(t, errors.As(result, &failover), "request failure must not rotate the account pool")
+			require.False(t, svc.ReportOpenAIAccountScheduleResult(account, "gpt-6-astra", false, nil, result))
+			require.False(t, svc.ObserveOpenAIAccountHealthFailure(ctx, account, result))
+		}
+		require.Zero(t, repo.model)
+		require.Zero(t, repo.rate)
+		require.Zero(t, repo.temp)
+		require.Zero(t, repo.extra)
+		require.Zero(t, repo.accountError)
+		require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	}
+}

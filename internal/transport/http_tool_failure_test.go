@@ -73,7 +73,7 @@ func TestHTTPToolFailureCompleteSSEDoesNotWaitForEOF(t *testing.T) {
 			if body.reads != 1 || body.afterData != 0 || body.closes != 1 {
 				t.Fatalf("read beyond terminal or failed to close: reads=%d tail=%d closes=%d", body.reads, body.afterData, body.closes)
 			}
-			captured, ok := resp.Body.(*basisPointsHTTPToolFailureBody)
+			captured, ok := resp.Body.(*httpRequestFailureBody)
 			if !ok || captured.response["status"] != "failed" {
 				t.Fatal("missing marked canonical failure")
 			}
@@ -100,7 +100,7 @@ func TestHTTPToolFailureFragmentedUnicodeAndMetadata(t *testing.T) {
 			if !captureBasisPointsHTTPToolFailure(resp) {
 				t.Fatal("fragmented Unicode/metadata prevented capture")
 			}
-			marked := resp.Body.(*basisPointsHTTPToolFailureBody)
+			marked := resp.Body.(*httpRequestFailureBody)
 			if marked.response["model"] != "m中文" || body.afterData != 0 || body.closes != 1 {
 				t.Fatal("fragmented metadata changed bytes or read past terminal")
 			}
