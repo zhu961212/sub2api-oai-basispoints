@@ -15,7 +15,7 @@
 
 **0.6.10 模型错误隔离**：HTTP 404 且明确返回 model_not_found 的请求不再触发宿主账号／模型限流或冷却，覆盖 BPS 与原生透传。该次请求仍失败，同账号后续请求保持可用；详见 [发行记录](docs/release-0.6.10-2026-09-30.md) 与 [修复说明](docs/MODEL-NOT-FOUND-NO-COOLDOWN.md)。
 
-支持官方 **Sub2API 0.2.8 和 0.2.9**，推荐 0.2.9；保持 Plugin Protocol / Transport API / UI Bridge v1，无需修改宿主。兼容性依据及测试边界见 [双版本兼容记录](docs/COMPATIBILITY-0.2.8-0.2.9.md)。
+支持官方 **Sub2API 0.2.8、0.2.9 和 0.2.11**，推荐 0.2.11；保持 Plugin Protocol / Transport API / UI Bridge v1，无需修改宿主。兼容性依据及测试边界见 [0.2.11 兼容记录](docs/COMPATIBILITY-0.2.11.md)。
 
 **0.6.9 检测超时修复**：原生 XHigh 后台检测不再被旧单号 20 秒、整批 24 秒预算提前截断；每账号使用配置超时（默认 300 秒），批量按并发批次数计算总预算。页面优先后台任务并按服务端预算查询，查询结束后可继续查询同一任务，不自动重发。旧同步接口仍保留宿主 30 秒内的兼容边界。详见 [修复记录](docs/release-0.6.9-2026-09-27.md)。
 
@@ -208,7 +208,7 @@
 
 ## 宿主要求
 
-清单要求 Sub2API **>=0.2.8 <0.3.0**，已测试官方 **0.2.8 / 0.2.9**，推荐 0.2.9；Plugin Protocol、Transport API、UI Bridge 均为 1。其他 fork 的 2.8.12 不属于此版本范围。官方发布提交、版本契约和验证边界见 [双版本兼容说明](docs/COMPATIBILITY-0.2.8-0.2.9.md)。
+清单要求 Sub2API **>=0.2.8 <0.3.0**，已测试官方 **0.2.8 / 0.2.9 / 0.2.11**，推荐 0.2.11；Plugin Protocol、Transport API、UI Bridge 均为 1。其他 fork 的 2.8.12 不属于此版本范围。官方发布提交、版本契约和验证边界见 [0.2.11 兼容说明](docs/COMPATIBILITY-0.2.11.md)。
 
 ## 开发环境
 

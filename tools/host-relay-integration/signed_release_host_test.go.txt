@@ -30,7 +30,7 @@ func TestBasisPointsSignedReleaseOfficialHostInstall(t *testing.T) {
 	require.NotEmpty(t, packagePath)
 	require.NotEmpty(t, publicKeyPath)
 	require.NotEmpty(t, expectedVersion)
-	require.Contains(t, []string{"0.2.8", "0.2.9"}, hostVersion)
+	require.Contains(t, []string{"0.2.8", "0.2.9", "0.2.11"}, hostVersion)
 	publicKey, err := os.ReadFile(publicKeyPath)
 	require.NoError(t, err)
 	packageFile, err := os.Open(packagePath)
@@ -50,7 +50,7 @@ func TestBasisPointsSignedReleaseOfficialHostInstall(t *testing.T) {
 	require.True(t, installed.Compatibility.Compatible)
 	require.True(t, installed.Compatibility.Tested)
 	require.Equal(t, hostVersion, installed.Compatibility.CurrentSub2API)
-	for _, testedHost := range []string{"0.2.8", "0.2.9"} {
+	for _, testedHost := range []string{"0.2.8", "0.2.9", "0.2.11"} {
 		compatibility := EvaluatePluginCompatibility(installed.Manifest, PluginHostInfo{Version: testedHost, BuildType: "release"})
 		require.True(t, compatibility.Compatible)
 		require.True(t, compatibility.Tested)
@@ -61,7 +61,7 @@ func TestBasisPointsSignedReleaseOfficialHostInstall(t *testing.T) {
 		require.False(t, compatibility.Compatible)
 		require.Equal(t, "incompatible", compatibility.Status)
 	}
-	t.Logf("official host %s: trusted signature; installer accepted; both declared versions tested; out-of-range versions rejected", hostVersion)
+	t.Logf("official host %s: trusted signature; installer accepted; all declared versions tested; out-of-range versions rejected", hostVersion)
 	require.Equal(t, PluginStateDisabled, installed.State)
 	require.FileExists(t, installed.BinaryPath)
 	require.FileExists(t, filepath.Join(installed.InstallPath, installed.Manifest.UI.Entrypoint))

@@ -20,6 +20,7 @@ import zipfile
 OFFICIAL_HOSTS = {
     '0.2.8': 'fd80b08c90b55edcad5b00171b53f08721d30da1',
     '0.2.9': '4c00df2e0183e2c70b7fa8ba45914205e36aad0c',
+    '0.2.11': '96f4c115c9749078f90cbf210a01d39baf3f53b6',
 }
 
 
