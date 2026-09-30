@@ -381,7 +381,11 @@ func nativeCallMatchesClientItem(native, client map[string]any, specs map[string
 	}
 	toolName := recoveryEnvelopeName(inner)
 	clientName := clientToolKey(client)
-	if len(specs) > 0 {
+	// A historical call is not a new tool authorization. Exact names still
+	// identify it after revocation or a conflicting live declaration; require
+	// the active index only when resolving a presentation alias. Arguments and
+	// IDs below must continue to match before replaying the cached envelope.
+	if toolName != clientName && len(specs) > 0 {
 		nativeSpec, nativeOK := resolveClientTool(specs, toolName)
 		clientSpec, clientOK := resolveClientTool(specs, clientName)
 		if !nativeOK || !clientOK || nativeSpec.Key != clientSpec.Key {
@@ -782,17 +786,18 @@ func prepareResponsesBodyWithImages(source map[string]any, cfg Config, allowInli
 		return nil, err
 	}
 	freezeToolCatalog(source)
+	catalogSource, rawInput := promptToolContext(source)
 	cacheNamespace := nativeCallNamespace(source)
-	inputItems := translateInputItemsInNamespace(source["input"], clientToolSpecs(source), cacheNamespace)
+	inputItems := translateInputItemsInNamespace(rawInput, clientToolSpecs(source), cacheNamespace)
 	historyRoot := conversationFingerprint(inputItems)
 	prologue := []any{}
 	if instructions := stringValue(source["instructions"]); instructions != "" {
 		prologue = append(prologue, messageItem("developer", instructions))
 	}
-	// 工具目录紧跟 instructions 前置，让整段请求前缀保持字节稳定，
-	// 上游的 prompt cache 才能逐轮复用（目录放到末尾会把可复用前缀压缩到首字节）。
-	prologue = append(prologue, messageItem("developer", clientToolProtocolInstructions(source)))
-	if note := RequestCapabilityInstructions(source); note != "" {
+	// Keep the initial catalog in the reusable prologue. Later discoveries
+	// remain at their original input positions instead of rewriting history.
+	prologue = append(prologue, messageItem("developer", clientToolProtocolInstructions(catalogSource)))
+	if note := RequestCapabilityInstructions(catalogSource); note != "" {
 		prologue = append(prologue, messageItem("developer", note))
 	}
 	if structuredInstructions != "" {

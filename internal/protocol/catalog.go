@@ -20,29 +20,34 @@ func additionalRequestTools(source map[string]any) []any {
 	}
 	var result []any
 	for _, value := range items {
-		item := objectValue(value)
-		if item == nil {
-			continue
+		result = append(result, requestItemToolDeclarations(value)...)
+	}
+	return result
+}
+
+// Request preparation and prompt history must recognize exactly the same
+// discovery records. Returned declarations never alias the source request.
+func requestItemToolDeclarations(value any) []any {
+	item := objectValue(value)
+	if item == nil {
+		return nil
+	}
+	typeName := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
+	if typeName != "additional_tools" && typeName != "tool_search_output" {
+		return nil
+	}
+	if typeName == "tool_search_output" {
+		if status, exists := item["status"]; exists && strings.ToLower(strings.TrimSpace(stringValue(status))) != "completed" {
+			return nil
 		}
-		typeName := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
-		if typeName != "additional_tools" && typeName != "tool_search_output" {
-			continue
-		}
-		if typeName == "tool_search_output" {
-			if status, exists := item["status"]; exists {
-				if strings.ToLower(strings.TrimSpace(stringValue(status))) != "completed" {
-					continue
-				}
-			}
-		}
-		tools, ok := item["tools"].([]any)
-		if !ok || len(tools) == 0 {
-			continue
-		}
-		for _, tool := range tools {
-			if objectValue(tool) == nil {
-				continue
-			}
+	}
+	tools, ok := item["tools"].([]any)
+	if !ok {
+		return nil
+	}
+	result := make([]any, 0, len(tools))
+	for _, tool := range tools {
+		if objectValue(tool) != nil {
 			result = append(result, cloneJSONValue(tool))
 		}
 	}
